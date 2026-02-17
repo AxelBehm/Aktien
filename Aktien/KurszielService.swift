@@ -1,0 +1,2263 @@
+//
+//  KurszielService.swift
+//  Aktien
+//
+//  Created by Axel Behm on 28.01.26.
+//
+
+import Foundation
+
+/// Quelle des Kursziels – für Anzeige "Y" (Yahoo), "F" (finanzen.net), "A" (OpenAI), "C" (CSV), "M" (FMP), "S" (Snippet)
+enum KurszielQuelle: String {
+    case yahoo = "Y"
+    case finanzenNet = "F"
+    case openAI = "A"
+    case csv = "C"
+    case fmp = "M"
+    /// Fonds-Fallback: erster Betrag aus Suchmaschinen-Snippet (DuckDuckGo)
+    case suchmaschine = "S"
+}
+
+struct KurszielInfo {
+    let kursziel: Double
+    let datum: Date?
+    /// Durchschnitt Spalte 4 (z. B. Abstand), falls aus Tabelle ermittelt
+    let spalte4Durchschnitt: Double?
+    /// Quelle: Y = Yahoo, F = finanzen.net
+    let quelle: KurszielQuelle
+    /// Währung aus Quelldaten (EUR/USD), für Anzeige
+    let waehrung: String?
+    /// Hoch-/Niedrigziel, Analystenanzahl (FMP)
+    let kurszielHigh: Double?
+    let kurszielLow: Double?
+    let kurszielAnalysten: Int?
+    
+    init(kursziel: Double, datum: Date?, spalte4Durchschnitt: Double?, quelle: KurszielQuelle, waehrung: String?, kurszielHigh: Double? = nil, kurszielLow: Double? = nil, kurszielAnalysten: Int? = nil) {
+        self.kursziel = kursziel
+        self.datum = datum
+        self.spalte4Durchschnitt = spalte4Durchschnitt
+        self.quelle = quelle
+        self.waehrung = waehrung
+        self.kurszielHigh = kurszielHigh
+        self.kurszielLow = kurszielLow
+        self.kurszielAnalysten = kurszielAnalysten
+    }
+}
+
+class KurszielService {
+    
+    // Debug-Modus
+    static var debugMode = true
+    static var debugLog: [String] = []
+    
+    static func clearDebugLog() {
+        debugLog = []
+    }
+    
+    static func getDebugLog() -> [String] {
+        return debugLog
+    }
+    
+    private static func debug(_ message: String) {
+        if debugMode {
+            let timestamp = DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium)
+            debugLog.append("[\(timestamp)] \(message)")
+            print("[KurszielService] \(message)")
+        }
+    }
+    
+    private static let usTicker = Set(["AAPL", "MSFT", "AMZN", "GOOGL", "TSLA", "META"])
+    /// UK-Aktien (LSE), FMP liefert GBP – werden in EUR umgerechnet
+    private static let gbpTicker = Set(["GLEN", "HSBC", "BP", "SHEL", "VOD", "AZN", "GSK", "ULVR", "DGE", "RIO", "BHP", "NG", "LLOY", "BARC", "STAN"])
+    
+    /// Ruft Kursziel direkt für eine WKN oder URL ab (für Testzwecke)
+    static func fetchKurszielByWKN(_ wkn: String) async -> KurszielInfo? {
+        clearDebugLog()
+        guard !wkn.isEmpty else { 
+            debug("❌ WKN/URL ist leer")
+            return nil 
+        }
+        var wknOrUrl = wkn.trimmingCharacters(in: .whitespaces)
+        if wknOrUrl.hasPrefix("https://") || wknOrUrl.hasPrefix("http://") {
+            let ohneProtokoll = wknOrUrl.hasPrefix("https://") ? String(wknOrUrl.dropFirst(8)) : String(wknOrUrl.dropFirst(7))
+            if !ohneProtokoll.contains("."), ohneProtokoll.count <= 12, ohneProtokoll.allSatisfy({ $0.isNumber || $0.isLetter }) {
+                wknOrUrl = ohneProtokoll
+                debug("   📌 Als WKN interpretiert: \(wknOrUrl)")
+            }
+        }
+        
+        // Prüfe ob es eine vollständige URL ist
+        if wknOrUrl.hasPrefix("http://") || wknOrUrl.hasPrefix("https://") {
+            debug("🔍 Starte Kursziel-Suche für URL: \(wknOrUrl)")
+            if wknOrUrl.contains("financialmodelingprep.com") {
+                if let info = await fetchKurszielFromFMPURL(wknOrUrl) {
+                    debug("✅ FMP Erfolg: Kursziel = \(info.kursziel) \(info.waehrung ?? "EUR")")
+                    return info
+                }
+                debug("❌ FMP: Kein Kursziel aus Response")
+                return nil
+            }
+            if let info = await fetchKurszielFromURLWithTab(wknOrUrl) {
+                debug("✅ Erfolg: Kursziel = \(info.kursziel) €")
+                return info
+            }
+            debug("❌ Kein Kursziel gefunden")
+            return nil
+        }
+        
+        debug("🔍 Starte Kursziel-Suche für WKN: \(wknOrUrl)")
+        
+        // Testroutine: OpenAI zuerst
+        debug("1️⃣ Versuche OpenAI für WKN: \(wknOrUrl)")
+        if let info = await fetchKurszielVonOpenAI(wkn: wknOrUrl) {
+            debug("✅ Erfolg: Kursziel = \(info.kursziel) \(info.waehrung ?? "EUR")")
+            return info
+        }
+        debug("❌ Kein Kursziel gefunden")
+        
+        debug("2️⃣ Versuche finanzen.net/kursziele/\(wknOrUrl)")
+        if let info = await fetchKurszielVonFinanzenNetKursziele(wkn: wknOrUrl) {
+            debug("✅ Erfolg: Kursziel = \(info.kursziel) €")
+            return info
+        }
+        debug("❌ Kein Kursziel gefunden")
+        
+        debug("3️⃣ Versuche finanzen.net/aktien/\(wknOrUrl)")
+        if let info = await fetchKurszielVonFinanzenNet(wkn: wknOrUrl) {
+            debug("✅ Erfolg: Kursziel = \(info.kursziel) €")
+            return info
+        }
+        debug("❌ Kein Kursziel gefunden")
+        
+        debug("4️⃣ Versuche finanzen.net Suche für \(wknOrUrl)")
+        if let info = await fetchKurszielVonFinanzenNetSearch(wkn: wknOrUrl) {
+            debug("✅ Erfolg: Kursziel = \(info.kursziel) \(info.waehrung ?? "EUR")")
+            return info
+        }
+        
+        debug("❌ Keine Methode erfolgreich für WKN \(wknOrUrl)")
+        return nil
+    }
+    
+    /// Ruft Kursziel für eine Aktie basierend auf WKN, ISIN und Bezeichnung ab
+    static func fetchKursziel(for aktie: Aktie) async -> KurszielInfo? {
+        return await withTimeout(seconds: 20) {
+            let refPrice = aktie.kurs ?? aktie.einstandskurs
+            let slug = slugFromBezeichnung(aktie.bezeichnung)
+            
+            debug("🔍 Starte Kursziel-Suche für: \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
+            if let ref = refPrice {
+                debug("📊 Referenzkurs: \(ref) €")
+            }
+            debug("🔗 Slug: \(slug)")
+            
+            // 0. CSV-Datei (iCloud Documents/kursziele.csv) – Format: Wertpapier;Kursziel_EUR
+            debug("0️⃣ Versuche kursziele.csv für \(aktie.bezeichnung)")
+            if let info = fetchKurszielVonCSV(bezeichnung: aktie.bezeichnung) {
+                debug("   → Gefunden: \(info.kursziel) € (CSV)")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+            debug("   ❌ Kein Eintrag in CSV")
+            
+            // 1. FMP (Symbol oder search-isin per ISIN) – wenn API-Key hinterlegt
+            debug("1️⃣ Versuche FMP für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
+            if let info = await fetchKurszielFromFMP(for: aktie) {
+                debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (FMP)")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+            debug("   ❌ Kein Kursziel von FMP")
+            
+            // 1b. Nur für Fonds: Snippet früh (vor OpenAI/finanzen.net/Yahoo – spart Zeit, da diese für Fonds meist leer)
+            if istFonds(aktie) {
+                debug("1b️⃣ [Fonds] Versuche Suchsnippet (DuckDuckGo) für \(aktie.bezeichnung)")
+                if let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
+                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (Snippet)")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                }
+                debug("   ❌ Kein Betrag im Snippet")
+            }
+            
+            // 2. OpenAI (benötigt API-Key in Einstellungen)
+            debug("2️⃣ Versuche OpenAI für \(aktie.bezeichnung) (WKN: \(aktie.wkn))")
+            if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR")")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+            debug("   ❌ Kein Kursziel gefunden")
+            
+            // 3. finanzen.net Kursziel-Seite – Slug-URL (wie Testroutine, gleiche URL = gleiches Ergebnis)
+            // Ohne Plausibilitätsprüfung, damit identisch zur Testroutine (finanzen.net/kursziele/rheinmetall)
+            let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
+            for slugVersuch in slugKandidaten {
+                guard !slugVersuch.isEmpty else { continue }
+                debug("3️⃣ Versuche finanzen.net/kursziele/\(slugVersuch)")
+                if let info = await fetchKurszielVonFinanzenNetKursziele(slug: slugVersuch) {
+                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (wie Testroutine)")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                } else {
+                    debug("   ❌ Kein Kursziel gefunden")
+                }
+            }
+            
+            // 4. finanzen.net mit WKN
+            debug("4️⃣ Versuche finanzen.net/kursziele/\(aktie.wkn)")
+            if let info = await fetchKurszielVonFinanzenNetKursziele(wkn: aktie.wkn) {
+                debug("   → Gefunden: \(info.kursziel) €")
+                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                    debug("   ✅ Plausibilitätsprüfung bestanden")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                } else {
+                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen (Referenz: \(refPrice?.description ?? "keine"))")
+                }
+            } else {
+                debug("   ❌ Kein Kursziel gefunden")
+            }
+            
+            // finanzen.net Aktien-Seite
+            debug("4️⃣ Versuche finanzen.net/aktien/\(aktie.wkn)")
+            if let info = await fetchKurszielVonFinanzenNet(wkn: aktie.wkn) {
+                debug("   → Gefunden: \(info.kursziel) €")
+                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                    debug("   ✅ Plausibilitätsprüfung bestanden")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                } else {
+                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                }
+            } else {
+                debug("   ❌ Kein Kursziel gefunden")
+            }
+            
+            // 5. finanzen.net Suchseite
+            debug("5️⃣ Versuche finanzen.net Suche für \(aktie.wkn)")
+            if let info = await fetchKurszielVonFinanzenNetSearch(wkn: aktie.wkn) {
+                debug("   → Gefunden: \(info.kursziel) €")
+                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                    debug("   ✅ Plausibilitätsprüfung bestanden")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                } else {
+                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                }
+            } else {
+                debug("   ❌ Kein Kursziel gefunden")
+            }
+            
+            // 6. ariva.de mit Firmen-Slug (Slug-URLs für finanzen.net bereits in Schritt 3)
+            if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty {
+                debug("6️⃣ Versuche ariva.de/\(ersterSlug)-aktie/kursziele")
+                if let info = await fetchKurszielVonAriva(slug: ersterSlug) {
+                    debug("   → Gefunden: \(info.kursziel) €")
+                    if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                        debug("   ✅ Plausibilitätsprüfung bestanden")
+                        return await kurszielZuEUR(info: info, aktie: aktie)
+                    } else {
+                        debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                    }
+                } else {
+                    debug("   ❌ Kein Kursziel gefunden")
+                }
+            }
+            
+            // 7. Yahoo Finance – per Suchbegriff Ticker ermitteln (WKN/ISIN funktionieren oft nicht)
+            let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
+            debug("7️⃣ Versuche Yahoo Finance mit Suchbegriff: \(searchTerm ?? aktie.bezeichnung)")
+            if let ticker = await fetchYahooTicker(searchTerm: searchTerm ?? aktie.bezeichnung) {
+                debug("   → Ticker gefunden: \(ticker)")
+                if let info = await fetchKurszielVonYahoo(symbol: ticker) {
+                    debug("   → Gefunden: \(info.kursziel) €")
+                    if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                        debug("   ✅ Plausibilitätsprüfung bestanden")
+                        return await kurszielZuEUR(info: info, aktie: aktie)
+                    } else {
+                        debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                    }
+                } else {
+                    debug("   ❌ Kein Kursziel gefunden")
+                }
+            } else {
+                debug("   ❌ Kein Ticker gefunden")
+            }
+            
+            // 8. Yahoo mit WKN/ISIN als Fallback
+            debug("8️⃣ Versuche Yahoo Finance mit WKN: \(aktie.wkn)")
+            if let info = await fetchKurszielVonYahoo(symbol: aktie.wkn) {
+                debug("   → Gefunden: \(info.kursziel) €")
+                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                    debug("   ✅ Plausibilitätsprüfung bestanden")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                } else {
+                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                }
+            } else {
+                debug("   ❌ Kein Kursziel gefunden")
+            }
+            
+            debug("9️⃣ Versuche Yahoo Finance mit ISIN: \(aktie.isin)")
+            if let info = await fetchKurszielVonYahoo(symbol: aktie.isin) {
+                debug("   → Gefunden: \(info.kursziel) €")
+                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                    debug("   ✅ Plausibilitätsprüfung bestanden")
+                    return await kurszielZuEUR(info: info, aktie: aktie)
+                } else {
+                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                }
+            } else {
+                debug("   ❌ Kein Kursziel gefunden")
+            }
+            
+            debug("❌ Keine Methode erfolgreich")
+            return nil
+        }
+    }
+    
+    /// true wenn Gattung "Fonds" enthält (nur für Fonds wird der Snippet-Fallback genutzt)
+    private static func istFonds(_ aktie: Aktie) -> Bool {
+        aktie.gattung.localizedCaseInsensitiveContains("Fonds")
+    }
+    
+    /// URL für Snippet-Suche (DuckDuckGo) – zum Anzeigen/Öffnen in der UI
+    static func snippetSuchergebnisURL(for aktie: Aktie) -> URL? {
+        let query = (aktie.isin + " Kursziel").addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? (aktie.isin + " Kursziel")
+        return URL(string: "https://html.duckduckgo.com/html/?q=\(query)")
+    }
+    
+    /// Snippet-Test für Fonds (öffentlich, für Test-Sheet)
+    static func fetchKurszielFromSnippet(for aktie: Aktie) async -> KurszielInfo? {
+        clearDebugLog()
+        debug("━━━ Snippet-Test (DuckDuckGo): \(aktie.bezeichnung) ━━━")
+        guard let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) else { return nil }
+        return await kurszielZuEUR(info: info, aktie: aktie)
+    }
+    
+    /// Fonds-Fallback: DuckDuckGo HTML-Suche, erster Betrag mit €/$/EUR im Snippet. Gekapselt, nur für Fonds.
+    private static func fetchKurszielVonSuchmaschinenSnippet(aktie: Aktie) async -> KurszielInfo? {
+        let query = (aktie.isin + " Kursziel").addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? (aktie.isin + " Kursziel")
+        guard let url = URL(string: "https://html.duckduckgo.com/html/?q=\(query)") else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = 8
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let html = String(data: data, encoding: .utf8) else { return nil }
+            // Erste ~100 Zeilen Text (Tags entfernt, grob)
+            let text = html
+                .replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
+                .replacingOccurrences(of: "&nbsp;", with: " ")
+                .replacingOccurrences(of: "&#x27;", with: "'")
+            let lines = text.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let relevant = Array(lines.prefix(120)).joined(separator: " ")
+            // Erster Betrag mit €, $ oder EUR
+            if let (betrag, waehrung) = erstesBetragMitWaehrung(in: relevant) {
+                debug("   📄 Snippet-Betrag: \(betrag) \(waehrung)")
+                return KurszielInfo(kursziel: betrag, datum: Date(), spalte4Durchschnitt: nil, quelle: .suchmaschine, waehrung: waehrung)
+            }
+        } catch {
+            debug("   ❌ Snippet-Abruf Fehler: \(error.localizedDescription)")
+        }
+        return nil
+    }
+    
+    /// Findet ersten Betrag mit €, $ oder EUR im Text. Rückgabe: (Double, "EUR"/"USD")
+    private static func erstesBetragMitWaehrung(in text: String) -> (Double, String)? {
+        // Muster: 282,78 EUR | 366,49 € | 50.00 $ | 1.234,56 EUR
+        let patterns: [(String, String)] = [
+            (#"(\d{1,6}[.,]\d{2})\s*€"#, "EUR"),
+            (#"(\d{1,6}[.,]\d{2})\s*EUR"#, "EUR"),
+            (#"(\d{1,6}[.,]\d{2})\s*\$"#, "USD"),
+            (#"(\d{1,3}(?:\.\d{3})*,\d{2})\s*[€$]?"#, "EUR"),
+            (#"(\d{1,3}(?:,\d{3})*\.\d{2})\s*\$"#, "USD")
+        ]
+        for (pattern, waehrung) in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern),
+               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+               let range = Range(match.range(at: 1), in: text) {
+                let numStr = String(text[range])
+                if let d = parseBetragAusSnippet(numStr), d > 0, d < 1_000_000 {
+                    return (d, waehrung)
+                }
+            }
+        }
+        return nil
+    }
+    
+    /// Parst "282,78" oder "1.234,56" oder "50.00" zu Double
+    private static func parseBetragAusSnippet(_ s: String) -> Double? {
+        var cleaned = s.trimmingCharacters(in: .whitespaces)
+        if cleaned.contains(".") && cleaned.contains(",") {
+            cleaned = cleaned.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+        } else if cleaned.contains(",") {
+            cleaned = cleaned.replacingOccurrences(of: ",", with: ".")
+        }
+        return Double(cleaned)
+    }
+    
+    /// Suchbegriff für Yahoo (z.B. "Amazon.com Inc" -> "Amazon")
+    private static func yahooSearchTerm(from bezeichnung: String) -> String? {
+        var cleaned = bezeichnung
+            .replacingOccurrences(of: " inc.", with: "")
+            .replacingOccurrences(of: " inc", with: "")
+            .replacingOccurrences(of: " ag", with: "")
+            .replacingOccurrences(of: " se", with: "")
+            .trimmingCharacters(in: .whitespaces)
+        if let dotIndex = cleaned.firstIndex(of: ".") {
+            cleaned = String(cleaned[..<dotIndex])
+        }
+        let parts = cleaned.split(separator: " ")
+        return parts.first.map(String.init)
+    }
+    
+    /// Ermittelt Yahoo-Ticker über Such-API (z.B. "Amazon" -> "AMZN")
+    private static func fetchYahooTicker(searchTerm: String) async -> String? {
+        guard !searchTerm.isEmpty else { return nil }
+        let query = searchTerm.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? searchTerm
+        let urlString = "https://query1.finance.yahoo.com/v1/finance/search?q=\(query)&quotesCount=5"
+        
+        guard let url = URL(string: urlString) else { return nil }
+        
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = 5.0
+            
+            let (data, _) = try await URLSession.shared.data(for: request)
+            
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let quotes = json["quotes"] as? [[String: Any]] {
+                for quote in quotes {
+                    if let symbol = quote["symbol"] as? String,
+                       let quoteType = quote["quoteType"] as? String,
+                       quoteType == "EQUITY",
+                       !symbol.contains(".") || symbol.hasSuffix(".DE") || symbol.hasSuffix(".F") {
+                        return symbol
+                    }
+                }
+            }
+        } catch { }
+        
+        return nil
+    }
+    
+    /// Liefert Slug-Kandidaten für Suche – voller Slug + Kurzform (z.B. "eli_lilly" für finanzen.net)
+    /// finanzen.net nutzt oft kurze Slugs: "eli_lilly" statt "eli_lilly_and_company"
+    /// Slug-Kandidaten für finanzen.net – verkürzte Begriffe (z.B. „Rheinmetall“ statt „Rheinmetall AG“) funktionieren oft besser
+    static func slugKandidaten(from bezeichnung: String) -> [String] {
+        let voll = slugFromBezeichnung(bezeichnung)
+        guard !voll.isEmpty else { return [] }
+        let stopWords = ["and", "the", "of", "&", "und", "der", "die", "das"]
+        let woerter = voll.split(separator: "_").map(String.init)
+        var kurzeWoerter: [String] = []
+        for w in woerter {
+            if stopWords.contains(w.lowercased()) { continue }
+            kurzeWoerter.append(w)
+            if kurzeWoerter.count >= 2 { break }  // Max. 2 bedeutungstragende Wörter
+        }
+        let kurz = kurzeWoerter.joined(separator: "_")
+        let erstesWort = kurzeWoerter.first ?? ""
+        var kandidaten: [String] = [voll]
+        if kurz != voll && !kurz.isEmpty { kandidaten.append(kurz) }
+        if !erstesWort.isEmpty && !kandidaten.contains(erstesWort) { kandidaten.append(erstesWort) }
+        return kandidaten
+    }
+    
+    /// Erstellt URL-Slug aus Firmenbezeichnung (z.B. "SAP SE" -> "sap_se", "Volkswagen AG VZ" -> "volkswagen_vz")
+    /// Öffentlich für Verwendung in UI (z.B. Test-URL aus Bezeichnung bauen)
+    static func slugFromBezeichnung(_ bezeichnung: String) -> String {
+        var slug = bezeichnung
+            .lowercased()
+            .replacingOccurrences(of: "ä", with: "ae")
+            .replacingOccurrences(of: "ö", with: "oe")
+            .replacingOccurrences(of: "ü", with: "ue")
+            .replacingOccurrences(of: "ß", with: "ss")
+        
+        // Firmenrechtsformen entfernen (als Wort, nicht nur am Ende)
+        for suffix in [" ag ", " se ", " gmbh ", " kg ", " co. ", " inc. ", " plc "] {
+            slug = slug.replacingOccurrences(of: suffix, with: " ")
+        }
+        // Auch am Ende
+        for suffix in [" ag", " se", " gmbh", " kg", " inc", " inc.", " co", " co."] {
+            if slug.hasSuffix(suffix) {
+                slug = String(slug.dropLast(suffix.count))
+            }
+        }
+        
+        // Mehrfache Leerzeichen zusammenführen
+        while slug.contains("  ") {
+            slug = slug.replacingOccurrences(of: "  ", with: " ")
+        }
+        slug = slug.trimmingCharacters(in: .whitespaces)
+        
+        // "amazon.com" -> "amazon" (Teil vor dem Punkt für Domains)
+        if let dotIndex = slug.firstIndex(of: ".") {
+            slug = String(slug[..<dotIndex])
+        }
+        
+        slug = slug
+            .replacingOccurrences(of: " ", with: "_")
+            .replacingOccurrences(of: "-", with: "_")
+            .filter { $0.isLetter || $0.isNumber || $0 == "_" }
+        
+        return slug
+    }
+    
+    /// Prüft ob ein Kursziel plausibel ist (filtert z.B. 0,50€ oder 19,77€ bei Amazon ~197€)
+    private static func isValidKursziel(_ kursziel: Double, referencePrice: Double?) -> Bool {
+        guard kursziel >= 1.0 else { return false }
+        
+        if let ref = referencePrice, ref > 0 {
+            // Kursziel muss mind. 20 % des aktuellen Kurses sein (verhindert 19,77 bei 197€)
+            guard kursziel >= ref * 0.2 else { return false }
+            // Kursziel sollte nicht mehr als 50x des aktuellen Kurses sein
+            guard kursziel <= ref * 50 else { return false }
+        }
+        
+        return true
+    }
+    
+    /// Helper: Timeout für async Tasks
+    private static func withTimeout<T>(seconds: TimeInterval, operation: @escaping () async -> T?) async -> T? {
+        await withTaskGroup(of: T?.self) { group in
+            group.addTask {
+                await operation()
+            }
+            
+            group.addTask {
+                try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                return nil
+            }
+            
+            let result = await group.next()
+            group.cancelAll()
+            return result ?? nil
+        }
+    }
+    
+    /// Ruft Kursziel von Yahoo Finance ab (inoffizielle API)
+    private static func fetchKurszielVonYahoo(symbol: String) async -> KurszielInfo? {
+        // Yahoo Finance verwendet normalerweise Ticker-Symbole
+        // Für deutsche Aktien: Versuche verschiedene Formate
+        let symbols = [
+            symbol,
+            "\(symbol).DE",  // Deutsche Börse
+            "\(symbol).F",   // Frankfurt
+            "\(symbol).XETRA" // XETRA
+        ]
+        
+        let baseURLs = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
+        
+        for ticker in symbols {
+            for baseURL in baseURLs {
+                let urlString = "\(baseURL)/v10/finance/quoteSummary/\(ticker)?modules=financialData"
+                
+                guard let url = URL(string: urlString) else { continue }
+                
+                do {
+                    var request = URLRequest(url: url)
+                    request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+                    request.timeoutInterval = 10.0
+                    
+                    let (data, response) = try await URLSession.shared.data(for: request)
+                    
+                    guard let httpResponse = response as? HTTPURLResponse,
+                          httpResponse.statusCode == 200 else { continue }
+                    
+                    if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                       let quoteSummary = json["quoteSummary"] as? [String: Any],
+                       let result = quoteSummary["result"] as? [[String: Any]],
+                       let firstResult = result.first,
+                       let financialData = firstResult["financialData"] as? [String: Any] {
+                        
+                        if let targetMeanPrice = financialData["targetMeanPrice"] as? [String: Any],
+                           let raw = targetMeanPrice["raw"] as? Double {
+                            return KurszielInfo(kursziel: raw, datum: Date(), spalte4Durchschnitt: nil, quelle: .yahoo, waehrung: "USD")
+                        }
+                        if let targetHighPrice = financialData["targetHighPrice"] as? [String: Any],
+                           let raw = targetHighPrice["raw"] as? Double {
+                            return KurszielInfo(kursziel: raw, datum: Date(), spalte4Durchschnitt: nil, quelle: .yahoo, waehrung: "USD")
+                        }
+                    }
+                } catch {
+                    continue
+                }
+            }
+        }
+        
+        // Fallback: Versuche Web Scraping
+        return await fetchKurszielVonYahooWeb(symbol: symbol)
+    }
+    
+    /// Fallback: Versucht Kursziel von Yahoo Finance Web-Seite zu scrapen
+    private static func fetchKurszielVonYahooWeb(symbol: String) async -> KurszielInfo? {
+        // Yahoo Finance URL für deutsche Aktien (oft mit .DE oder .F Suffix)
+        let urlString = "https://finance.yahoo.com/quote/\(symbol)"
+        
+        guard let url = URL(string: urlString) else { return nil }
+        
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+            request.timeoutInterval = 10.0 // 10 Sekunden Timeout
+            
+            let (data, _) = try await URLSession.shared.data(for: request)
+            
+            if let html = String(data: data, encoding: .utf8) {
+                // Suche nach "target" oder "price target" im HTML
+                // Dies ist eine vereinfachte Suche - für robustere Lösung würde man HTML-Parser verwenden
+                if let (kursziel, spalte4, waehrung) = parseKurszielFromHTML(html) {
+                    return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: spalte4, quelle: .yahoo, waehrung: waehrung ?? "USD")
+                }
+            }
+        } catch {
+            print("Fehler beim Abrufen von Yahoo Finance: \(error)")
+        }
+        
+        return nil
+    }
+    
+    /// Ruft Kursziel von finanzen.net ab (mit Firmen-Slug aus Bezeichnung)
+    private static func fetchKurszielVonFinanzenNet(slug: String) async -> KurszielInfo? {
+        // finanzen.net/kursziele/{slug} – dedizierte Kursziel-Seite
+        let urlString = "https://www.finanzen.net/kursziele/\(slug)"
+        return await fetchKurszielFromURL(urlString)
+    }
+    
+    /// Ruft Kursziel von finanzen.net ab (mit WKN – Aktien-Seite)
+    private static func fetchKurszielVonFinanzenNet(wkn: String) async -> KurszielInfo? {
+        let url = "https://www.finanzen.net/aktien/\(wkn)"
+        debug("   📡 HTTP GET: \(url)")
+        let result = await fetchKurszielFromURL(url)
+        if let info = result {
+            debug("   ✅ Kursziel geparst: \(info.kursziel) €")
+        } else {
+            debug("   ❌ Kein Kursziel aus HTML geparst")
+        }
+        return result
+    }
+    
+    /// Ruft Kursziel von finanzen.net ab (Kursziel-Seite mit Slug, z.B. rheinmetall)
+    /// Versucht auch Unterstrich→Bindestrich (finanzen.net nutzt oft Bindestriche)
+    private static func fetchKurszielVonFinanzenNetKursziele(slug: String) async -> KurszielInfo? {
+        var urls = ["https://www.finanzen.net/kursziele/\(slug)"]
+        if slug.contains("_") {
+            urls.append("https://www.finanzen.net/kursziele/\(slug.replacingOccurrences(of: "_", with: "-"))")
+        }
+        for urlString in urls {
+            debug("   📡 HTTP GET: \(urlString)")
+            if let info = await fetchKurszielFromURL(urlString) { return info }
+        }
+        return nil
+    }
+    
+    /// Ruft Kursziel von finanzen.net ab (Kursziel-Seite mit WKN)
+    private static func fetchKurszielVonFinanzenNetKursziele(wkn: String) async -> KurszielInfo? {
+        // Versuche verschiedene URLs für finanzen.net
+        let urls = [
+            "https://www.finanzen.net/kursziele/\(wkn)",  // Direkte Kursziel-Seite
+            "https://www.finanzen.net/aktien/\(wkn)/kursziele",  // Alternative URL
+            "https://www.finanzen.net/aktien/\(wkn)#news-analysen"  // Mit Tab-Anker
+        ]
+        
+        for url in urls {
+            debug("   📡 HTTP GET: \(url)")
+            if let info = await fetchKurszielFromURLWithTab(url) {
+                debug("   ✅ Kursziel geparst: \(info.kursziel) €")
+                return info
+            }
+        }
+        
+        debug("   ❌ Kein Kursziel aus HTML geparst")
+        return nil
+    }
+    
+    /// Ruft Kursziel ausschließlich von finanzen.net ab (für Einzeltest mit Debug). Versucht Slug, WKN, Aktien-Seite, Suche.
+    static func fetchKurszielFromFinanzenNet(for aktie: Aktie) async -> KurszielInfo? {
+        clearDebugLog()
+        debug("━━━ finanzen.net EINZELTEST: \(aktie.bezeichnung) ━━━")
+        debug("   WKN: \(aktie.wkn), ISIN: \(aktie.isin)")
+        let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
+        for slugVersuch in slugKandidaten {
+            guard !slugVersuch.isEmpty else { continue }
+            debug("   Versuche Slug: finanzen.net/kursziele/\(slugVersuch)")
+            if let info = await fetchKurszielVonFinanzenNetKursziele(slug: slugVersuch) {
+                debug("   ✅ Gefunden via Slug \(slugVersuch)")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+        }
+        if !aktie.wkn.trimmingCharacters(in: .whitespaces).isEmpty {
+            debug("   Versuche WKN: finanzen.net/kursziele/\(aktie.wkn)")
+            if let info = await fetchKurszielVonFinanzenNetKursziele(wkn: aktie.wkn) {
+                debug("   ✅ Gefunden via WKN")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+            debug("   Versuche finanzen.net/aktien/\(aktie.wkn)")
+            if let info = await fetchKurszielVonFinanzenNet(wkn: aktie.wkn) {
+                debug("   ✅ Gefunden via Aktien-Seite")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+            debug("   Versuche finanzen.net Suche")
+            if let info = await fetchKurszielVonFinanzenNetSearch(wkn: aktie.wkn) {
+                debug("   ✅ Gefunden via Suche")
+                return await kurszielZuEUR(info: info, aktie: aktie)
+            }
+        }
+        debug("   ❌ Kein Kursziel von finanzen.net")
+        return nil
+    }
+    
+    /// URLs für finanzen.net-Test (Slug + WKN)
+    static func finanzenNetBefehlForDisplay(for aktie: Aktie) -> [String] {
+        var urls: [String] = []
+        let slugs = slugKandidaten(from: aktie.bezeichnung)
+        for s in slugs where !s.isEmpty {
+            urls.append("https://www.finanzen.net/kursziele/\(s)")
+        }
+        if !aktie.wkn.trimmingCharacters(in: .whitespaces).isEmpty {
+            urls.append("https://www.finanzen.net/kursziele/\(aktie.wkn)")
+            urls.append("https://www.finanzen.net/aktien/\(aktie.wkn)")
+        }
+        return urls
+    }
+    
+    /// Ruft Kursziel von finanzen.net ab (Suchseite mit WKN – leitet oft zur Aktienseite weiter)
+    private static func fetchKurszielVonFinanzenNetSearch(wkn: String) async -> KurszielInfo? {
+        let searchURL = "https://www.finanzen.net/suchergebnis.asp?frmAktiensucheTextfeld=\(wkn)"
+        debug("   📡 HTTP GET: \(searchURL)")
+        let result = await fetchKurszielFromURL(searchURL)
+        if let info = result {
+            debug("   ✅ Kursziel geparst: \(info.kursziel) €")
+        } else {
+            debug("   ❌ Kein Kursziel aus HTML geparst")
+        }
+        return result
+    }
+    
+    /// Kursziele aus CSV – iCloud Documents/kursziele.csv (Format: Wertpapier;Kursziel_EUR, Trennzeichen ;)
+    static let kurszieleCSVFilename = "kursziele.csv"
+    
+    /// FMP (Financial Modeling Prep) API-Key
+    static let fmpAPIKeyKey = "FMP_API_Key"
+    static var fmpAPIKey: String? {
+        get { UserDefaults.standard.string(forKey: fmpAPIKeyKey)?.trimmingCharacters(in: .whitespaces) }
+        set { UserDefaults.standard.set(newValue, forKey: fmpAPIKeyKey) }
+    }
+    
+    /// WKN → FMP-Symbol. FMP nutzt generell keine .DE-Suffixe – alle deutschen Werte ohne .DE
+    private static let fmpSymbolByWKN: [String: String] = [
+        "716460": "SAP", "723610": "SIE", "519000": "ALV", "648300": "ADS",
+        "604700": "BAS", "703000": "RHM", "710000": "DTE", "556520": "VOW3",
+        "575200": "BMW", "623100": "BAYN", "843002": "HEN3", "823212": "MBG",
+        "659990": "AM3D", "625409": "PUM", "514000": "DB", "801440": "CBK",
+        "517010": "IFX", "587590": "1COV", "521380": "DB1", "520000": "PAH3",
+        "865985": "AAPL", "881809": "MSFT", "906866": "AMZN", "883121": "GOOGL",
+        "A0YEDG": "TSLA", "A1JWVX": "META",
+        "A0D9U0": "VOW3", "A0B4X7": "PAH3",
+        "766400": "EOAN", "606214": "CON", "555750": "LHA",
+        "A1J0VJ": "GLEN"
+    ]
+    
+    /// WKN aus deutscher ISIN (DE0007164600 → 716460)
+    private static func wknFromGermanISIN(_ isin: String) -> String? {
+        let s = isin.trimmingCharacters(in: .whitespaces).uppercased()
+        guard s.hasPrefix("DE"), s.count >= 11, s.dropFirst(2).allSatisfy({ $0.isNumber }) else { return nil }
+        return String(s.dropFirst(5).prefix(6))
+    }
+    
+    /// FMP-Symbol aus WKN/ISIN/Bezeichnung ableiten
+    private static func fmpSymbol(for aktie: Aktie) -> String? {
+        let wkn = aktie.wkn.trimmingCharacters(in: .whitespaces)
+        let wknNorm = wkn.isEmpty ? nil : wkn
+        let wknAusIsin = wknFromGermanISIN(aktie.isin)
+        for candidate in [wknNorm, wknAusIsin].compactMap({ $0 }) {
+            if let sym = fmpSymbolByWKN[candidate] { return sym }
+        }
+        if aktie.isin.hasPrefix("US"), let ticker = usIsinToTicker[String(aktie.isin.prefix(12))] { return ticker }
+        let slug = slugFromBezeichnung(aktie.bezeichnung)
+        if slug == "sap" { return "SAP" }
+        if slug == "siemens" { return "SIE" }
+        if slug == "allianz" { return "ALV" }
+        if slug == "adidas" { return "ADS" }
+        if slug == "basf" { return "BAS" }
+        if slug == "rheinmetall" { return "RHM" }
+        if slug == "deutsche telekom" || slug == "telekom" { return "DTE" }
+        if slug == "volkswagen" || slug == "vw" { return "VOW3" }
+        if slug == "bmw" { return "BMW" }
+        if slug == "bayer" { return "BAYN" }
+        if slug == "henkel" { return "HEN3" }
+        if slug == "mercedes" || slug == "daimler" { return "MBG" }
+        if slug == "puma" { return "PUM" }
+        if slug == "am3d" { return "AM3D" }
+        if slug == "deutsche bank" { return "DB" }
+        if slug == "commerzbank" { return "CBK" }
+        if slug == "infineon" { return "IFX" }
+        if slug == "covestro" { return "1COV" }
+        if slug == "deutsche börse" { return "DB1" }
+        if slug == "porsche" { return "PAH3" }
+        if slug == "glencore" { return "GLEN" }
+        if slug == "apple" { return "AAPL" }
+        if slug == "microsoft" { return "MSFT" }
+        if slug == "amazon" { return "AMZN" }
+        if slug == "alphabet" || slug == "google" { return "GOOGL" }
+        if slug == "tesla" { return "TSLA" }
+        if slug == "meta" || slug == "facebook" { return "META" }
+        return nil
+    }
+    
+    private static let usIsinToTicker: [String: String] = [
+        "US0378331005": "AAPL", "US5949181045": "MSFT", "US0231351067": "AMZN",
+        "US02079K3059": "GOOGL", "US88160R1014": "TSLA", "US30303M1027": "META"
+    ]
+    
+    /// API-Key aus gespeichertem Wert extrahieren (URL mit apikey= oder reiner Key)
+    private static func fmpExtractAPIKey() -> String? {
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        if let range = raw.range(of: "apikey=") {
+            let nachKey = String(raw[range.upperBound...])
+            let keyEnd = nachKey.firstIndex(of: "&") ?? nachKey.endIndex
+            let key = String(nachKey[..<keyEnd]).trimmingCharacters(in: .whitespaces)
+            return key.isEmpty ? nil : key
+        }
+        return raw
+    }
+    
+    /// FMP search-isin API: ISIN → Symbol. Global (US, DE, JE, …). Nur wenn API-Key hinterlegt.
+    private static func fmpSymbolFromSearchISIN(isin: String) async -> String? {
+        let isinNorm = isin.trimmingCharacters(in: .whitespaces).uppercased()
+        guard isinNorm.count >= 12 else { return nil }
+        guard let apiKey = fmpExtractAPIKey() else { return nil }
+        let isin12 = String(isinNorm.prefix(12))
+        guard let url = URL(string: "https://financialmodelingprep.com/stable/search-isin?isin=\(isin12)&apikey=\(apiKey)") else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try? JSONSerialization.jsonObject(with: data)
+            if let arr = json as? [[String: Any]], let first = arr.first {
+                if let sym = first["symbol"] as? String, !sym.isEmpty { return sym }
+                if let sym = first["ticker"] as? String, !sym.isEmpty { return sym }
+            }
+            if let obj = json as? [String: Any], let sym = (obj["symbol"] ?? obj["ticker"]) as? String, !sym.isEmpty { return sym }
+        } catch {
+            debug("   ⚠️ FMP search-isin \(isin12): \(error.localizedDescription)")
+        }
+        return nil
+    }
+    
+    /// Bulk-Abruf FMP Price Target – eine API-Anfrage für alle Aktien. Rückgabe: [WKN: KurszielInfo]
+    /// Bei forceOverwrite: auch Aktien mit bestehendem Kursziel (z. B. aus CSV) abfragen.
+    static func fetchKurszieleBulkFMP(aktien: [Aktie], forceOverwrite: Bool = false) async -> [String: KurszielInfo] {
+        debug("━━━ FMP BULK START ━━━")
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            debug("   ❌ FMP: FMP-Feld leer (API-Key oder komplette URL eintragen)")
+            return [:]
+        }
+        let toFetch = aktien.filter { forceOverwrite ? !$0.kurszielManuellGeaendert : (!$0.kurszielManuellGeaendert && $0.kursziel == nil) }
+        debug("   📋 FMP: \(toFetch.count) Aktien ohne Kursziel (von \(aktien.count) gesamt)")
+        var symbolToWKN: [String: String] = [:]
+        var symbols: [String] = []
+        var ohneMapping: [(name: String, wkn: String, isin: String)] = []
+        for a in toFetch {
+            if let sym = fmpSymbol(for: a), !symbols.contains(sym) {
+                symbols.append(sym)
+                symbolToWKN[sym] = a.wkn
+            } else {
+                ohneMapping.append((a.bezeichnung, a.wkn, a.isin))
+            }
+        }
+        // Fehlende Symbole über FMP search-isin (ISIN → Symbol) ermitteln, wenn API-Key hinterlegt
+        if fmpExtractAPIKey() != nil {
+            var resolvedWKN: Set<String> = []
+            for m in ohneMapping {
+                guard m.isin.trimmingCharacters(in: .whitespaces).count >= 12 else { continue }
+                if let sym = await fmpSymbolFromSearchISIN(isin: m.isin) {
+                    if !symbols.contains(sym) {
+                        symbols.append(sym)
+                        symbolToWKN[sym] = m.wkn
+                    }
+                    resolvedWKN.insert(m.wkn)
+                    debug("   ✅ FMP search-isin: \(m.isin) → \(sym) (\(m.name))")
+                }
+            }
+            ohneMapping = ohneMapping.filter { !resolvedWKN.contains($0.wkn) }
+        }
+        if !ohneMapping.isEmpty {
+            debug("   ⚠️ FMP: Kein Symbol für \(ohneMapping.count) Aktien (WKN/ISIN nicht in Mapping):")
+            for m in ohneMapping.prefix(5) {
+                debug("      – \(m.name) (WKN: \(m.wkn), ISIN: \(m.isin))")
+            }
+            if ohneMapping.count > 5 { debug("      … und \(ohneMapping.count - 5) weitere") }
+        }
+        guard !symbols.isEmpty else {
+            debug("   ❌ FMP: Keine Symbole zum Abruf – alle Aktien ohne WKN-Mapping")
+            return [:]
+        }
+        // Bei doppelten WKN (z. B. gleiche Aktie in mehreren Depots) erste Aktie pro WKN verwenden
+        let wknToAktie: [String: Aktie] = Dictionary(aktien.map { ($0.wkn, $0) }, uniquingKeysWith: { first, _ in first })
+        let fmpNurTest = false // Test: nur 1 Aufruf – auf true setzen zum Testen
+        let symbolsToFetch = fmpNurTest ? Array(symbols.prefix(1)) : symbols
+        if fmpNurTest {
+            debug("   🧪 FMP TEST: Nur 1 Aufruf (\(symbolsToFetch.first ?? "?")), danach in Routine einbauen")
+        }
+        debug("   📡 FMP: \(symbolsToFetch.count) Symbole – Einzelabruf (price-target-consensus)")
+        debug("   🔗 URL: Befehl wie eingegeben, nur Symbol getauscht. USD/GBP→EUR: CSV-Devisenkurs (USD) oder Frankfurter-API.")
+        var result: [String: KurszielInfo] = [:]
+        for (idx, sym) in symbolsToFetch.enumerated() {
+            guard let wkn = symbolToWKN[sym] else { continue }
+            guard let url = fmpURLForRequest(symbol: sym) else { continue }
+            debug("   📡 FMP [\(idx + 1)/\(symbolsToFetch.count)]: \(sym)")
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 30
+                request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+                let (data, response) = try await URLSession.shared.data(for: request)
+                if let http = response as? HTTPURLResponse {
+                    debug("   📥 FMP \(sym) HTTP Status: \(http.statusCode)")
+                }
+                let json = try? JSONSerialization.jsonObject(with: data)
+                if let errDict = json as? [String: Any] {
+                    let errMsg = errDict["Error Message"] as? String
+                        ?? errDict["error"] as? String
+                        ?? errDict["message"] as? String
+                        ?? errDict["errors"] as? String
+                    if let msg = errMsg, !msg.isEmpty {
+                        debug("   ❌ FMP \(sym): \(msg)")
+                        if idx == 0 {
+                            debug("   💡 Prüfe: API-Key in Einstellungen, Free-Plan-Limit")
+                        }
+                        continue
+                    }
+                }
+                var item: [String: Any]?
+                if let arr = json as? [[String: Any]] { item = arr.first }
+                else if let obj = json as? [String: Any] { item = obj }
+                guard let it = item, let parsed = parseFMPConsensusItem(it, symbol: sym) else {
+                    debug("   ⚠️ FMP \(sym): Keine Daten")
+                    continue
+                }
+                let istUSD = usTicker.contains(sym)
+                let istGBP = gbpTicker.contains(sym)
+                var consensus = parsed.consensus
+                var high = parsed.high
+                var low = parsed.low
+                var rate: Double = 1.0
+                if istUSD {
+                    rate = wknToAktie[wkn]?.devisenkurs ?? 0
+                    if rate <= 0 { rate = await fetchUSDtoEURRate() }
+                    else { debug("   💱 FMP \(sym): USD→EUR mit CSV-Devisenkurs \(rate)") }
+                    consensus = parsed.consensus * rate
+                    high = parsed.high.map { $0 * rate }
+                    low = parsed.low.map { $0 * rate }
+                } else if istGBP {
+                    rate = await fetchGBPtoEURRate()
+                    consensus = parsed.consensus * rate
+                    high = parsed.high.map { $0 * rate }
+                    low = parsed.low.map { $0 * rate }
+                }
+                let info = KurszielInfo(kursziel: consensus, datum: parsed.datum, spalte4Durchschnitt: nil, quelle: .fmp, waehrung: "EUR", kurszielHigh: high, kurszielLow: low, kurszielAnalysten: parsed.analysts)
+                result[wkn] = info
+                let umrechnung = istUSD ? " (aus USD × \(rate))" : (istGBP ? " (aus GBP × \(rate))" : "")
+                debug("   ✅ FMP: \(sym) → Consensus \(String(format: "%.2f", consensus)) EUR\(umrechnung) | High \(high.map { String(format: "%.2f", $0) } ?? "–") | Low \(low.map { String(format: "%.2f", $0) } ?? "–") | Analysten \(parsed.analysts.map { "\($0)" } ?? "–")")
+            } catch {
+                debug("   ❌ FMP \(sym): \(error.localizedDescription)")
+            }
+            if idx < symbolsToFetch.count - 1 {
+                try? await Task.sleep(nanoseconds: 300_000_000) // 0,3 s Pause zwischen Abrufen (Rate-Limit)
+            }
+        }
+        debug("━━━ FMP ENDE: \(result.count) Kursziele gefunden ━━━")
+        return result
+    }
+    
+    /// OpenAI API-Key – zuerst aus iCloud-Datei (openai_key.txt), sonst aus Einstellungen
+    static let openAIAPIKeyKey = "OpenAI_API_Key"
+    static let openAIICloudFilename = "openai_key.txt"
+    static var openAIAPIKey: String? {
+        get {
+            if let fromFile = openAIAPIKeyFromICloudFile() { return openAICleanKey(fromFile) }
+            if let fromStore = UserDefaults.standard.string(forKey: openAIAPIKeyKey) { return openAICleanKey(fromStore) }
+            return nil
+        }
+        set {
+            guard let v = newValue, !v.isEmpty else {
+                UserDefaults.standard.removeObject(forKey: openAIAPIKeyKey)
+                return
+            }
+            UserDefaults.standard.set(openAICleanKey(v) ?? v, forKey: openAIAPIKeyKey)
+        }
+    }
+    
+    /// Bereinigt API-Key: BOM, Leerzeichen, Zeilenumbrüche entfernen; „k-proj“ → „sk-proj“ falls kopierfehler
+    private static func openAICleanKey(_ raw: String) -> String? {
+        var key = raw
+            .replacingOccurrences(of: "\u{FEFF}", with: "")
+            .trimmingCharacters(in: CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\0\r\n\t")))
+        key = key.filter { !$0.isNewline && !$0.isWhitespace }.trimmingCharacters(in: .whitespaces)
+        if key.isEmpty { return nil }
+        if key.hasPrefix("k-proj-") && !key.hasPrefix("sk-proj-") {
+            key = "s" + key
+            debug("   🔧 API-Key: fehlendes 's' ergänzt (k-proj → sk-proj)")
+        }
+        return key
+    }
+    
+    /// URL für kursziele.csv – iCloud Documents (primär) oder App Documents (Fallback)
+    static func kurszieleCSVURL() -> URL? {
+        if let container = FileManager.default.url(forUbiquityContainerIdentifier: nil) {
+            return container.appendingPathComponent("Documents").appendingPathComponent(kurszieleCSVFilename)
+        }
+        return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(kurszieleCSVFilename)
+    }
+    
+    /// Liest Kursziel aus kursziele.csv – Spalten: Wertpapier;Kursziel_EUR. Match nach Bezeichnung (Slug/erster Wort).
+    static func fetchKurszielVonCSV(bezeichnung: String) -> KurszielInfo? {
+        guard let url = kurszieleCSVURL(), FileManager.default.fileExists(atPath: url.path) else { return nil }
+        try? FileManager.default.startDownloadingUbiquitousItem(at: url)
+        guard let data = try? Data(contentsOf: url),
+              let csv = String(data: data, encoding: .utf8) else { return nil }
+        let bezeichnungSlug = slugFromBezeichnung(bezeichnung)
+        let erstesWort = bezeichnung.split(separator: " ").first.map(String.init) ?? ""
+        let lines = csv.components(separatedBy: .newlines)
+        guard lines.count >= 2 else { return nil }
+        for line in lines.dropFirst() {
+            let cols = line.components(separatedBy: ";")
+            guard cols.count >= 2 else { continue }
+            let wertpapier = cols[0].trimmingCharacters(in: .whitespaces)
+            let kurszielStr = cols[1].trimmingCharacters(in: .whitespaces).replacingOccurrences(of: ",", with: ".")
+            guard let kursziel = Double(kurszielStr), kursziel > 0 else { continue }
+            let wertpapierSlug = slugFromBezeichnung(wertpapier)
+            if wertpapierSlug == bezeichnungSlug { return KurszielInfo(kursziel: kursziel, datum: nil, spalte4Durchschnitt: nil, quelle: .csv, waehrung: "EUR") }
+            if !wertpapierSlug.isEmpty && bezeichnungSlug.contains(wertpapierSlug) { return KurszielInfo(kursziel: kursziel, datum: nil, spalte4Durchschnitt: nil, quelle: .csv, waehrung: "EUR") }
+            if !wertpapierSlug.isEmpty && wertpapierSlug.contains(bezeichnungSlug) { return KurszielInfo(kursziel: kursziel, datum: nil, spalte4Durchschnitt: nil, quelle: .csv, waehrung: "EUR") }
+            if wertpapier.lowercased() == bezeichnung.lowercased() { return KurszielInfo(kursziel: kursziel, datum: nil, spalte4Durchschnitt: nil, quelle: .csv, waehrung: "EUR") }
+            if erstesWort.lowercased() == wertpapier.lowercased() { return KurszielInfo(kursziel: kursziel, datum: nil, spalte4Durchschnitt: nil, quelle: .csv, waehrung: "EUR") }
+        }
+        return nil
+    }
+    
+    /// Schreibt oder ergänzt eine Zeile in kursziele.csv (iCloud Documents). Erstellt Datei falls nicht vorhanden.
+    static func appendKurszielToCSV(bezeichnung: String, kursziel: Double) {
+        guard let url = kurszieleCSVURL() else { return }
+        let fileManager = FileManager.default
+        if let container = fileManager.url(forUbiquityContainerIdentifier: nil) {
+            let docsDir = container.appendingPathComponent("Documents")
+            if !fileManager.fileExists(atPath: docsDir.path) {
+                try? fileManager.createDirectory(at: docsDir, withIntermediateDirectories: true)
+            }
+        }
+        var lines: [String] = []
+        var headerExists = false
+        if fileManager.fileExists(atPath: url.path),
+           let data = try? Data(contentsOf: url),
+           let existing = String(data: data, encoding: .utf8) {
+            lines = existing.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            headerExists = lines.first?.contains("Wertpapier") ?? false
+        }
+        if !headerExists { lines.insert("Wertpapier;Kursziel_EUR", at: 0) }
+        let newLine = "\(bezeichnung);\(String(format: "%.2f", kursziel))"
+        let slug = slugFromBezeichnung(bezeichnung)
+        var found = false
+        for i in 1..<lines.count {
+            let cols = lines[i].components(separatedBy: ";")
+            if cols.count >= 1, slugFromBezeichnung(cols[0]) == slug {
+                lines[i] = newLine
+                found = true
+                break
+            }
+        }
+        if !found { lines.append(newLine) }
+        let content = lines.joined(separator: "\n") + "\n"
+        try? content.write(to: url, atomically: true, encoding: .utf8)
+    }
+    
+    /// Liest API-Key aus iCloud-Datei (Documents/openai_key.txt im Aktien-iCloud-Container)
+    private static func openAIAPIKeyFromICloudFile() -> String? {
+        guard let containerURL = FileManager.default.url(forUbiquityContainerIdentifier: nil) else { return nil }
+        let fileURL = containerURL.appendingPathComponent("Documents").appendingPathComponent(openAIICloudFilename)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+        try? FileManager.default.startDownloadingUbiquitousItem(at: fileURL)
+        guard let data = try? Data(contentsOf: fileURL),
+              let key = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !key.isEmpty else { return nil }
+        return key
+    }
+    
+    /// System-Prompt für OpenAI Finanzdaten-Parser (wie Python-Skript)
+    private static let openAISystemPrompt = """
+    Du bist ein Finanzdaten-Parser. \
+    Du gibst IMMER genau einen Wert zurück: \
+    entweder eine Zahl mit Dezimalpunkt (z.B. 2150.37) oder -1. \
+    Keine Wörter, kein €-Zeichen, keine Leerzeichen, keine Zeilenumbrüche.
+    """
+    
+    /// Parst Modellantwort zu Kursziel (wie Python _to_decimal_only): -1 = nil, sonst erste Zahl. Erlaubt 2150.37 und 2.150,37.
+    private static func openAIParseKursziel(_ s: String) -> Double? {
+        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed == "-1" { return nil }
+        let pattern = #"-?\d[\d\.,]*"#
+        let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: trimmed, range: nsRange),
+              let range = Range(match.range, in: trimmed) else { return nil }
+        var num = String(trimmed[range])
+        if num.contains(".") && num.contains(",") {
+            let lastComma = num.lastIndex(of: ",") ?? num.startIndex
+            let lastDot = num.lastIndex(of: ".") ?? num.startIndex
+            if lastComma > lastDot {
+                num = num.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+            } else {
+                num = num.replacingOccurrences(of: ",", with: "")
+            }
+        } else if num.contains(",") {
+            num = num.replacingOccurrences(of: ",", with: ".")
+        }
+        return Double(num)
+    }
+    
+    /// Liefert die zu verwendende FMP-URL. Wenn gespeicherter Wert mit https:// beginnt: URL so verwenden (nur Symbol ggf. ersetzen).
+    private static func fmpURLForRequest(symbol: String) -> URL? {
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        if raw.hasPrefix("https://") || raw.hasPrefix("http://") {
+            return fmpURLByReplacingSymbol(in: raw, newSymbol: symbol)
+        }
+        let urlStr = "https://financialmodelingprep.com/stable/price-target-consensus?symbol=\(symbol)&apikey=\(raw)"
+        return URL(string: urlStr)
+    }
+    
+    /// Konvertiert KurszielInfo von USD/GBP in EUR (Devisenkurs aus CSV oder Frankfurter-API). Währung Anzeige wird EUR.
+    private static func kurszielZuEUR(info: KurszielInfo, aktie: Aktie) async -> KurszielInfo {
+        let w = (info.waehrung ?? "EUR").uppercased()
+        guard w == "USD" || w == "GBP" else { return info }
+        let rate: Double
+        if w == "USD" {
+            if let d = aktie.devisenkurs, d > 0 {
+                rate = d
+                debug("   💱 USD→EUR mit CSV-Devisenkurs: \(rate)")
+            } else {
+                rate = await fetchUSDtoEURRate()
+            }
+        } else {
+            rate = await fetchGBPtoEURRate()
+            debug("   💱 GBP→EUR: \(rate)")
+        }
+        return KurszielInfo(
+            kursziel: info.kursziel * rate,
+            datum: info.datum,
+            spalte4Durchschnitt: info.spalte4Durchschnitt,
+            quelle: info.quelle,
+            waehrung: "EUR",
+            kurszielHigh: info.kurszielHigh.map { $0 * rate },
+            kurszielLow: info.kurszielLow.map { $0 * rate },
+            kurszielAnalysten: info.kurszielAnalysten
+        )
+    }
+    
+    /// USD → EUR Wechselkurs (Frankfurter API, kein Key nötig). Fallback ca. 0.92
+    private static func fetchUSDtoEURRate() async -> Double {
+        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=USD&symbols=EUR") else { return 0.92 }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            let (data, _) = try await URLSession.shared.data(for: request)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let rates = json["rates"] as? [String: Any],
+               let eur = rates["EUR"] as? Double, eur > 0 {
+                debug("   💱 USD→EUR Kurs: \(eur)")
+                return eur
+            }
+        } catch {
+            debug("   💱 Wechselkurs-API Fehler, nutze 0.92")
+        }
+        return 0.92
+    }
+    
+    /// GBP → EUR Wechselkurs (Frankfurter API). Fallback ca. 1.17 (1 GBP ≈ 1.17 EUR)
+    private static func fetchGBPtoEURRate() async -> Double {
+        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=GBP&symbols=EUR") else { return 1.17 }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            let (data, _) = try await URLSession.shared.data(for: request)
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let rates = json["rates"] as? [String: Any],
+               let eur = rates["EUR"] as? Double, eur > 0 {
+                debug("   💱 GBP→EUR Kurs: \(eur)")
+                return eur
+            }
+        } catch {
+            debug("   💱 GBP-Wechselkurs-API Fehler, nutze 1.17")
+        }
+        return 1.17
+    }
+    
+    /// Ersetzt in einer FMP-URL den symbol-Parameter durch newSymbol
+    private static func fmpURLByReplacingSymbol(in urlStr: String, newSymbol: String) -> URL? {
+        guard let symRange = urlStr.range(of: "symbol=") else { return URL(string: urlStr) }
+        let valueStart = symRange.upperBound
+        let rest = urlStr[valueStart...]
+        let valueEnd = rest.firstIndex(of: "&") ?? rest.endIndex
+        let before = String(urlStr[..<valueStart])
+        let after = valueEnd == rest.endIndex ? "" : String(rest[valueEnd...])
+        let newURL = before + newSymbol + after
+        return URL(string: newURL)
+    }
+    
+    /// FMP-Symbol für eine Aktie (für FMP-Test-Anzeige)
+    static func fmpSymbolForAktie(_ aktie: Aktie) -> String? {
+        return fmpSymbol(for: aktie)
+    }
+    
+    /// FMP-Befehl (URL) für Anzeige. Nutzt Symbol oder search-isin per ISIN.
+    static func fmpBefehlForDisplay(for aktie: Aktie) -> (url: String, viaIsin: Bool)? {
+        if let sym = fmpSymbol(for: aktie), let url = fmpURLForRequest(symbol: sym) {
+            return (maskApiKeyInURL(url.absoluteString), false)
+        }
+        let isinNorm = aktie.isin.trimmingCharacters(in: .whitespaces).uppercased()
+        if isinNorm.count >= 12, let apiKey = fmpExtractAPIKey(),
+           let url = URL(string: "https://financialmodelingprep.com/stable/search-isin?isin=\(String(isinNorm.prefix(12)))&apikey=\(apiKey)") {
+            return (maskApiKeyInURL(url.absoluteString), true)
+        }
+        return nil
+    }
+    
+    private static func maskApiKeyInURL(_ urlStr: String) -> String {
+        if let range = urlStr.range(of: "apikey=") {
+            let after = urlStr[range.upperBound...]
+            let keyEnd = after.firstIndex(of: "&") ?? after.endIndex
+            let before = String(urlStr[..<range.upperBound])
+            let afterKey = String(after[keyEnd...])
+            return before + "***" + afterKey
+        }
+        return urlStr
+    }
+    
+    /// Ruft Kursziel von FMP für eine einzelne Aktie ab (WKN/ISIN/Bezeichnung → Symbol, bei fehlendem Symbol auch search-isin per ISIN)
+    static func fetchKurszielFromFMP(for aktie: Aktie) async -> KurszielInfo? {
+        var sym = fmpSymbol(for: aktie)
+        if sym == nil, !aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
+            sym = await fmpSymbolFromSearchISIN(isin: aktie.isin)
+        }
+        guard let symbol = sym, let url = fmpURLForRequest(symbol: symbol) else { return nil }
+        return await fetchKurszielFromFMPURL(url.absoluteString)
+    }
+    
+    /// Ruft eine vollständige FMP-URL auf (z. B. aus WKN-Test) und liefert KurszielInfo
+    static func fetchKurszielFromFMPURL(_ urlString: String) async -> KurszielInfo? {
+        let trimmed = urlString.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed), trimmed.contains("financialmodelingprep.com") else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 30
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try? JSONSerialization.jsonObject(with: data)
+            var item: [String: Any]?
+            if let arr = json as? [[String: Any]] { item = arr.first }
+            else if let obj = json as? [String: Any] { item = obj }
+            guard let it = item else { return nil }
+            let symbol = it["symbol"] as? String ?? "?"
+            guard let parsed = parseFMPConsensusItem(it, symbol: symbol) else { return nil }
+            var consensus = parsed.consensus
+            var high = parsed.high
+            var low = parsed.low
+            if usTicker.contains(symbol) {
+                let rate = await fetchUSDtoEURRate()
+                consensus = parsed.consensus * rate
+                high = parsed.high.map { $0 * rate }
+                low = parsed.low.map { $0 * rate }
+            } else if gbpTicker.contains(symbol) {
+                let rate = await fetchGBPtoEURRate()
+                consensus = parsed.consensus * rate
+                high = parsed.high.map { $0 * rate }
+                low = parsed.low.map { $0 * rate }
+            }
+            return KurszielInfo(kursziel: consensus, datum: parsed.datum, spalte4Durchschnitt: nil, quelle: .fmp, waehrung: "EUR", kurszielHigh: high, kurszielLow: low, kurszielAnalysten: parsed.analysts)
+        } catch {
+            debug("   ❌ FMP URL Fehler: \(error.localizedDescription)")
+            return nil
+        }
+    }
+    
+    /// Nur für Aufrufe, die einen einzelnen Key erwarten (Legacy)
+    private static func fmpConsensusURL(symbol: String, apiKey: String) -> URL? {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key.hasPrefix("https://") || key.hasPrefix("http://") {
+            return fmpURLByReplacingSymbol(in: key, newSymbol: symbol)
+        }
+        let urlStr = "https://financialmodelingprep.com/stable/price-target-consensus?symbol=\(symbol)&apikey=\(key)"
+        return URL(string: urlStr)
+    }
+    
+    /// Parst FMP price-target-consensus Response (stable: targetHigh, targetLow, targetConsensus, targetMedian)
+    private static func parseFMPConsensusItem(_ item: [String: Any], symbol: String) -> (consensus: Double, high: Double?, low: Double?, analysts: Int?, datum: Date?)? {
+        let consensus = (item["targetConsensus"] as? Double) ?? (item["adjConsensus"] as? Double) ?? (item["consensus"] as? Double) ?? (item["consensusPriceTarget"] as? Double) ?? (item["publishedPriceTarget"] as? Double)
+        guard let kursziel = consensus, kursziel > 0 else { return nil }
+        let high = (item["targetHigh"] as? Double) ?? (item["adjHighTargetPrice"] as? Double) ?? (item["high"] as? Double) ?? (item["highPriceTarget"] as? Double)
+        let low = (item["targetLow"] as? Double) ?? (item["adjLowTargetPrice"] as? Double) ?? (item["low"] as? Double) ?? (item["lowPriceTarget"] as? Double)
+        let analysts = item["numberOfAnalysts"] as? Int ?? item["analystCount"] as? Int
+        var datum: Date? = nil
+        if let d = (item["publishedDate"] as? String) ?? (item["date"] as? String) {
+            let fmt = ISO8601DateFormatter()
+            fmt.formatOptions = [.withFullDate, .withDashSeparatorInDate]
+            datum = fmt.date(from: String(d.prefix(10)))
+        }
+        return (kursziel, high, low, analysts, datum)
+    }
+    
+    /// Testet mehrere FMP-APIs und schreibt alle Ergebnisse in den Debug-Log
+    static func testFMPAlleAPIs() async -> String {
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return "FMP-Feld leer (API-Key oder komplette URL eintragen)"
+        }
+        clearDebugLog()
+        debug("━━━ FMP API-TEST ━━━")
+        debug("   Eingabe: \(raw.hasPrefix("http") ? "komplette URL" : "API-Key (\(raw.count) Zeichen)")")
+        debug("")
+        let symbols = ["AAPL", "SAP", "RHM"]
+        var ergebnisse: [String] = []
+        for symbol in symbols {
+            let name = "stable/price-target-consensus \(symbol)"
+            guard let url = fmpURLForRequest(symbol: symbol) else {
+                debug("   ❌ Ungültige URL")
+                ergebnisse.append("\(name): URL-Fehler")
+                continue
+            }
+            debug("─── \(name) ───")
+            debug("   URL: https://financialmodelingprep.com/stable/price-target-consensus?symbol=\(symbol)&apikey=***")
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 15
+                request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+                let (data, response) = try await URLSession.shared.data(for: request)
+                let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+                debug("   HTTP Status: \(status)")
+                debug("   Response: \(data.count) Bytes")
+                if let raw = String(data: data, encoding: .utf8) {
+                    let preview = raw.prefix(400)
+                    debug("   Vorschau: \(preview)\(raw.count > 400 ? "…" : "")")
+                    if let errDict = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+                       let errMsg = errDict["Error Message"] as? String ?? errDict["error"] as? String ?? errDict["message"] as? String {
+                        debug("   ❌ API-Fehler: \(errMsg)")
+                        ergebnisse.append("\(name): \(errMsg)")
+                    } else if status == 200 {
+                        debug("   ✅ OK")
+                        ergebnisse.append("\(name): OK (\(data.count) Bytes)")
+                    } else {
+                        ergebnisse.append("\(name): HTTP \(status)")
+                    }
+                }
+            } catch {
+                debug("   ❌ Fehler: \(error.localizedDescription)")
+                ergebnisse.append("\(name): \(error.localizedDescription)")
+            }
+            debug("")
+        }
+        debug("━━━ FMP API-TEST ENDE ━━━")
+        return "Test abgeschlossen.\n\n" + ergebnisse.joined(separator: "\n") + "\n\nDetails im Debug-Log (Toolbar)."
+    }
+    
+    /// Testet die FMP-Verbindung. Wenn im FMP-Feld eine komplette URL steht (https://...), wird sie unverändert aufgerufen.
+    static func testFMPVerbindung() async -> String {
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return "FMP-Feld ist leer (API-Key oder komplette URL eintragen)"
+        }
+        let url: URL?
+        if raw.hasPrefix("https://") || raw.hasPrefix("http://") {
+            url = URL(string: raw)
+            debug("━━━ FMP Verbindungstest ━━━")
+            debug("   Befehl wird so ausgeführt wie eingegeben (komplette URL)")
+        } else {
+            url = fmpConsensusURL(symbol: "AAPL", apiKey: raw)
+            debug("━━━ FMP Verbindungstest ━━━")
+            debug("   Befehl: ...?symbol=AAPL&apikey=***")
+        }
+        guard let requestURL = url else { return "Ungültige URL" }
+        do {
+            var request = URLRequest(url: requestURL)
+            request.timeoutInterval = 30
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else { return "Keine HTTP-Antwort" }
+            if http.statusCode == 401 {
+                let raw = String(data: data, encoding: .utf8) ?? ""
+                var text = "❌ HTTP 401 Unauthorized – API-Key ungültig oder falsch"
+                text += "\n\nBefehl (im Browser testen, DEIN_KEY ersetzen):"
+                text += "\nhttps://financialmodelingprep.com/stable/price-target-consensus?symbol=AAPL&apikey=DEIN_KEY"
+                text += "\n\nPrüfe: Key exakt aus FMP-Dashboard kopiert? Keine Leerzeichen?"
+                if !raw.isEmpty { text += "\n\nResponse: \(raw.prefix(200))..." }
+                return text
+            }
+            let json = try? JSONSerialization.jsonObject(with: data)
+            if let errDict = json as? [String: Any] {
+                let errMsg = errDict["Error Message"] as? String ?? errDict["error"] as? String ?? errDict["message"] as? String ?? errDict["errors"] as? String
+                if let msg = errMsg, !msg.isEmpty {
+                    var text = "❌ FMP Fehler (HTTP \(http.statusCode)):\n\(msg)"
+                    if http.statusCode == 401 {
+                        text += "\n\nBefehl zum Testen im Browser:"
+                        text += "\nhttps://financialmodelingprep.com/stable/price-target-consensus?symbol=AAPL&apikey=DEIN_KEY"
+                        text += "\n\nPrüfe: API-Key exakt kopiert? Keine Leerzeichen am Anfang/Ende?"
+                    }
+                    return text
+                }
+            }
+            var item: [String: Any]?
+            if let arr = json as? [[String: Any]] { item = arr.first }
+            else if let obj = json as? [String: Any] { item = obj }
+            guard let it = item else {
+                return "⚠️ Keine Kursziel-Daten (HTTP \(http.statusCode))"
+            }
+            let symbolName = it["symbol"] as? String ?? "Symbol"
+            guard let parsed = parseFMPConsensusItem(it, symbol: symbolName) else {
+                return "⚠️ Kein gültiger Consensus (HTTP \(http.statusCode))"
+            }
+            var lines = ["✅ Verbindung OK (price-target-consensus)"]
+            lines.append("\(symbolName): Consensus \(String(format: "%.2f", parsed.consensus)) EUR")
+            if let h = parsed.high { lines.append("Hochziel: \(String(format: "%.2f", h))") }
+            if let l = parsed.low { lines.append("Niedrigziel: \(String(format: "%.2f", l))") }
+            if let n = parsed.analysts { lines.append("Analysten: \(n)") }
+            return lines.joined(separator: "\n")
+        } catch {
+            return "❌ Fehler: \(error.localizedDescription)"
+        }
+    }
+    
+    /// Testet die OpenAI-Verbindung mit Kursziel-Abfrage (WKN 703000) – Rückgabe: Antwort-Text oder Fehlermeldung
+    static func testOpenAIVerbindung() async -> String {
+        guard let apiKey = openAIAPIKey, !apiKey.isEmpty else {
+            return "API-Key nicht konfiguriert (Einstellungen)"
+        }
+        let prompt = "kursziel (nur wert) wkn 703000 in EUR. Suche in finanzen.net."
+        let gesendetPrefix = "Gesendet:\n\"\(prompt)\""
+        do {
+            let content = try await openAICallWithFallback(systemPrompt: openAISystemPrompt, userPrompt: prompt, apiKey: apiKey)
+            let trimmed = content.trimmingCharacters(in: .whitespaces)
+            return "\(gesendetPrefix)\n\n✅ Verbindung OK\nAntwort: \(trimmed.isEmpty ? "(leer)" : trimmed)"
+        } catch {
+            return "\(gesendetPrefix)\n\nFehler: \(error.localizedDescription)"
+        }
+    }
+    
+    /// Ruft OpenAI ab – Responses API zuerst, bei Fehler Fallback zu Chat Completions
+    private static func openAICallWithFallback(systemPrompt: String, userPrompt: String, apiKey: String) async throws -> String {
+        do {
+            return try await openAICallResponsesAPI(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey)
+        } catch {
+            return try await openAICallChatCompletions(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey)
+        }
+    }
+    
+    /// Responses API (v1/responses)
+    private static func openAICallResponsesAPI(systemPrompt: String, userPrompt: String, apiKey: String) async throws -> String {
+        let url = URL(string: "https://api.openai.com/v1/responses")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+        let combinedInput = "\(systemPrompt)\n\n\(userPrompt)"
+        let body: [String: Any] = ["model": "gpt-5-nano", "input": combinedInput]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse else { throw NSError(domain: "OpenAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Keine HTTP-Antwort"]) }
+        guard http.statusCode == 200 else {
+            let errText = String(data: data, encoding: .utf8) ?? "HTTP \(http.statusCode)"
+            throw NSError(domain: "OpenAI", code: http.statusCode, userInfo: [NSLocalizedDescriptionKey: errText])
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let text = openAIExtractTextFromResponse(json) { return text }
+        let rawPreview = String(data: data, encoding: .utf8).map { String($0.prefix(500)) } ?? "–"
+        throw NSError(domain: "OpenAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Antwort konnte nicht geparst werden. Raw: \(rawPreview)"])
+    }
+    
+    /// Chat Completions API (Fallback) – choices[0].message.content
+    private static func openAICallChatCompletions(systemPrompt: String, userPrompt: String, apiKey: String) async throws -> String {
+        let url = URL(string: "https://api.openai.com/v1/chat/completions")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 30
+        let body: [String: Any] = [
+            "model": "gpt-5-nano",
+            "messages": [
+                ["role": "system", "content": systemPrompt],
+                ["role": "user", "content": userPrompt]
+            ]
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let errText = String(data: data, encoding: .utf8) ?? "HTTP-Fehler"
+            throw NSError(domain: "OpenAI", code: (response as? HTTPURLResponse)?.statusCode ?? -1, userInfo: [NSLocalizedDescriptionKey: errText])
+        }
+        let json = try JSONSerialization.jsonObject(with: data) as? [String: Any]
+        if let content = openAIExtractTextFromResponse(json) { return content }
+        throw NSError(domain: "OpenAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Antwort konnte nicht geparst werden"])
+    }
+    
+    /// Extrahiert Text aus Responses- oder Chat-Completions-JSON
+    private static func openAIExtractTextFromResponse(_ json: [String: Any]?) -> String? {
+        guard let json = json else { return nil }
+        if let t = json["output_text"] as? String { return t }
+        if let output = json["output"] as? [[String: Any]] {
+            for item in output {
+                if let content = item["content"] as? [[String: Any]] {
+                    for c in content {
+                        if (c["type"] as? String) == "output_text", let t = c["text"] as? String { return t }
+                    }
+                }
+            }
+        }
+        if let outputItems = json["output_items"] as? [[String: Any]] {
+            for item in outputItems {
+                if let content = item["content"] as? [[String: Any]] {
+                    for c in content {
+                        if (c["type"] as? String) == "output_text", let t = c["text"] as? String { return t }
+                    }
+                }
+            }
+        }
+        if let choices = json["choices"] as? [[String: Any]],
+           let first = choices.first,
+           let message = first["message"] as? [String: Any],
+           let content = message["content"] as? String { return content }
+        return nil
+    }
+    
+    /// Ruft Kursziel von OpenAI ab (gpt-4o-mini) – benötigt API-Key in Einstellungen
+    static func fetchKurszielVonOpenAI(wkn: String, bezeichnung: String? = nil, isin: String? = nil) async -> KurszielInfo? {
+        guard let apiKey = openAIAPIKey, !apiKey.isEmpty else {
+            debug("   ❌ OpenAI API-Key nicht konfiguriert (Einstellungen)")
+            return nil
+        }
+        debug("   🔑 OpenAI API-Key geladen (Länge \(apiKey.count), Format: \(apiKey.hasPrefix("sk-") ? "sk-... ✓" : "Präfix prüfen"))")
+        guard !wkn.isEmpty else { return nil }
+        
+        let prompt = "kursziel (nur wert) wkn \(wkn) in EUR. Suche in finanzen.net."
+        debug("   📤 OpenAI Request (Responses API): \(prompt)")
+        
+        do {
+            let content = try await openAICallWithFallback(systemPrompt: openAISystemPrompt, userPrompt: prompt, apiKey: apiKey)
+            debug("   📥 OpenAI Response (raw): \(content)")
+            let trimmed = content.trimmingCharacters(in: .whitespaces)
+            debug("   📥 OpenAI Response (content): \(trimmed)")
+            guard let kursziel = openAIParseKursziel(trimmed), kursziel > 0 else {
+                debug("   ❌ OpenAI: Antwort konnte nicht geparst werden oder < 0")
+                return nil
+            }
+            let waehrung = trimmed.uppercased().contains("USD") ? "USD" : "EUR"
+            debug("   ✅ OpenAI: \(kursziel) \(waehrung)")
+            return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: nil, quelle: .openAI, waehrung: waehrung)
+        } catch {
+            debug("   ❌ OpenAI Fehler: \(error.localizedDescription)")
+            return nil
+        }
+    }
+    
+    /// Ruft Kursziel von ariva.de ab
+    private static func fetchKurszielVonAriva(slug: String) async -> KurszielInfo? {
+        // ariva.de: {slug}-aktie/kursziele
+        let arivaSlug = slug.replacingOccurrences(of: "_", with: "-")
+        let urlString = "https://www.ariva.de/\(arivaSlug)-aktie/kursziele"
+        return await fetchKurszielFromURL(urlString)
+    }
+    
+    /// Gemeinsame HTTP-Anfrage und HTML-Parsing (ohne Tab-Suche)
+    private static func fetchKurszielFromURLWithTab(_ urlString: String) async -> KurszielInfo? {
+        // Einfach die normale fetchKurszielFromURL verwenden
+        return await fetchKurszielFromURL(urlString)
+    }
+    
+    /// Gemeinsame HTTP-Anfrage und HTML-Parsing
+    private static func fetchKurszielFromURL(_ urlString: String) async -> KurszielInfo? {
+        guard let url = URL(string: urlString) else { 
+            debug("   ❌ Ungültige URL: \(urlString)")
+            return nil 
+        }
+        
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+            request.setValue("de-DE,de;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+            request.setValue("https://www.finanzen.net/", forHTTPHeaderField: "Referer")
+            request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+            request.timeoutInterval = 10.0
+            
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let httpResponse = response as? HTTPURLResponse else {
+                debug("   ❌ Keine HTTP-Antwort")
+                return nil
+            }
+            
+            debug("   📥 HTTP Status: \(httpResponse.statusCode)")
+            
+            guard (200...399).contains(httpResponse.statusCode) else { 
+                debug("   ❌ HTTP Fehler: \(httpResponse.statusCode)")
+                return nil 
+            }
+            
+            if let html = String(data: data, encoding: .utf8) {
+                debug("   📄 HTML-Größe: \(html.count) Zeichen")
+                // Zeige ersten 500 Zeichen des HTMLs für Debugging
+                let preview = String(html.prefix(500))
+                debug("   📋 HTML-Vorschau: \(preview)...")
+                
+                if let (kursziel, spalte4, waehrung) = parseKurszielFromHTML(html, urlString: urlString) {
+                    debug("   ✅ Kursziel aus HTML geparst: \(kursziel) \(waehrung ?? "EUR")" + (spalte4.map { ", Spalte 4: \($0)" } ?? ""))
+                    return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: spalte4, quelle: .finanzenNet, waehrung: waehrung ?? "EUR")
+                } else {
+                    debug("   ❌ Kein Kursziel im HTML gefunden")
+                }
+            } else {
+                debug("   ❌ HTML konnte nicht dekodiert werden")
+            }
+        } catch {
+            debug("   ❌ Fehler: \(error.localizedDescription)")
+        }
+        
+        return nil
+    }
+    
+    /// Extrahiert Kursziel aus HTML-Tabellen
+    /// Sucht nach Tabellen mit "Analyst" oder "Kursziel" als Überschriftsfeld
+    /// urlString für Slug-Extraktion (z. B. /kursziele/allianz → allianz) bei Buy/Hold-Tabelle
+    /// Rückgabe: (Kursziel-Durchschnitt, Spalte-4-Durchschnitt?, Währung "EUR"/"USD"?)
+    private static func extractKurszielFromHTMLTables(_ html: String, urlString: String? = nil) -> (Double, Double?, String?)? {
+        debug("   🔍 Suche nach Tabellen mit 'Analyst' oder 'Kursziel' als Überschrift...")
+        
+        // Finde alle <table> Tags
+        let tablePattern = "<table[^>]*>([\\s\\S]*?)</table>"
+        guard let tableRegex = try? NSRegularExpression(pattern: tablePattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) else {
+            return nil
+        }
+        
+        let htmlRange = NSRange(html.startIndex..., in: html)
+        var tableMatches = tableRegex.matches(in: html, options: [], range: htmlRange)
+        
+        // WICHTIG: Sortiere nach Tabellengröße absteigend – das nicht-gierige Regex
+        // trifft verschachtelte (innere) Tabellen zuerst. Die Haupttabelle ist die größte.
+        // So verarbeiten wir die äußere Tabelle mit den echten Kursziel-Daten zuerst.
+        tableMatches.sort { $0.range.length > $1.range.length }
+        
+        debug("   📊 Gefundene Tabellen insgesamt: \(tableMatches.count) (sortiert nach Größe)")
+        
+        // Durchsuche ALLE Tabellen (größte zuerst)
+        for (tableIdx, match) in tableMatches.enumerated() {
+            guard let tableRange = Range(match.range, in: html) else { continue }
+            let tableHTML = String(html[tableRange])
+            
+            debug("   🔍 Prüfe Tabelle \(tableIdx+1)")
+            
+            // Suche nach <thead> oder erste <tr> für Header
+            var headers: [String] = []
+            
+            // Versuche <thead> zu finden
+            let theadPattern = "<thead[^>]*>([\\s\\S]*?)</thead>"
+            var headerRowIndex = 0
+            if let theadRegex = try? NSRegularExpression(pattern: theadPattern, options: [.caseInsensitive, .dotMatchesLineSeparators]),
+               let theadMatch = theadRegex.firstMatch(in: tableHTML, options: [], range: NSRange(tableHTML.startIndex..., in: tableHTML)),
+               let theadRange = Range(theadMatch.range(at: 1), in: tableHTML) {
+                let theadHTML = String(tableHTML[theadRange])
+                headers = extractTableHeaders(from: theadHTML)
+                debug("   📋 Header aus <thead> extrahiert")
+            } else {
+                // Versuche Zeilen – suche erste Zeile mit "Analyst" UND "Kursziel" (z. B. Siemens Energy: erste Zeile ist "Kurs|Ø Kursziel|BUY|HOLD|SELL", zweite "Analyst|Kursziel|Abstand Kursziel|Datum")
+                let trPattern = "<tr[^>]*>([\\s\\S]*?)</tr>"
+                if let trRegex = try? NSRegularExpression(pattern: trPattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+                    let range = NSRange(tableHTML.startIndex..., in: tableHTML)
+                    let matches = trRegex.matches(in: tableHTML, options: [], range: range)
+                    for (idx, trMatch) in matches.enumerated() {
+                        guard let trRange = Range(trMatch.range(at: 1), in: tableHTML) else { continue }
+                        let rowHTML = String(tableHTML[trRange])
+                        let rowHeaders = extractTableHeaders(from: rowHTML)
+                        let rowText = rowHeaders.joined(separator: " ").lowercased()
+                        let hatAnalyst = rowHeaders.contains { $0.lowercased().contains("analyst") }
+                        let hatKursziel = rowHeaders.contains { h in
+                            let l = h.lowercased()
+                            return l.contains("kursziel") && !l.contains("marktkap") && !l.contains("kapitalisierung")
+                        }
+                        if hatAnalyst && hatKursziel {
+                            headers = rowHeaders
+                            headerRowIndex = idx
+                            debug("   📋 Header aus Zeile \(idx+1) extrahiert (Analyst+Kursziel gefunden)")
+                            break
+                        }
+                    }
+                    if headers.isEmpty, let firstMatch = matches.first,
+                       let trRange = Range(firstMatch.range(at: 1), in: tableHTML) {
+                        let firstRowHTML = String(tableHTML[trRange])
+                        headers = extractTableHeaders(from: firstRowHTML)
+                        debug("   📋 Header aus erster Zeile extrahiert (Fallback)")
+                    }
+                }
+            }
+            
+            debug("   📋 Tabelle: \(headers.count) Spalten gefunden")
+            debug("   📋 Spalten: \(headers.joined(separator: ", "))")
+            
+            let tableText = tableHTML.lowercased()
+            let headersText = headers.joined(separator: " ").lowercased()
+            
+            // Variant 2: Buy/Hold/Sell-Tabelle mit Ø Kursziel und Abst. Kursziel – Zeile per Firmenname (Slug aus URL)
+            let hasBuyHoldSell = tableText.contains("buy") && tableText.contains("sell")
+            let hasOderKursziel = headersText.contains("ø kursziel") || headersText.contains("Ø kursziel")
+            let hasAbstKursziel = headersText.contains("abst") && headersText.contains("kursziel")
+            if hasBuyHoldSell && hasOderKursziel && hasAbstKursziel, let urlStr = urlString {
+                let slug = urlStr.components(separatedBy: "/").last?.lowercased().trimmingCharacters(in: .whitespaces) ?? ""
+                if !slug.isEmpty {
+                    debug("   🔍 Variant 2: Buy/Hold-Tabelle, suche Zeile mit Slug '\(slug)'")
+                    let rows = extractTableRows(from: tableHTML)
+                    // Ø Kursziel-Spalte (nicht Abst. Kursziel) – eine Spalte weiter als Buy/Hold/Sell
+                    let kurszielIdx = headers.firstIndex { h in
+                        let l = h.lowercased()
+                        return (l.contains("ø") || l.contains("durchschnitt")) && l.contains("kursziel") && !l.contains("abst")
+                    }
+                    let abstandIdx = headers.firstIndex { h in
+                        let l = h.lowercased()
+                        return (l.contains("abst") || l.contains("abstand")) && l.contains("kursziel")
+                    }
+                    if let kIdx = kurszielIdx, let aIdx = abstandIdx, kIdx < headers.count, aIdx < headers.count {
+                        for row in rows.dropFirst() {
+                            guard row.count > max(kIdx, aIdx) else { continue }
+                            let aktieCell = row[0].lowercased()
+                            if aktieCell.contains(slug) || slug.contains(aktieCell.replacingOccurrences(of: " ", with: "")) {
+                                let betragStr = row[kIdx]
+                                let abstandStr = row[aIdx]
+                                if let betrag = parseNumberFromTable(betragStr), betrag > 0 {
+                                    let w = waehrungAusZelle(betragStr) ?? "EUR"
+                                    let abstand = parseNumberFromTable(abstandStr)
+                                    debug("   ✅ Variant 2: Zeile gefunden – \(betrag) \(w), Abstand \(abstand.map { "\($0)%" } ?? "–")")
+                                    return (betrag, abstand, w)
+                                }
+                            }
+                        }
+                        debug("   ⚠️  Variant 2: Keine Zeile mit '\(slug)' gefunden")
+                    }
+                }
+                debug("   ⏭️  Variant 2: Kein Slug aus URL, überspringe")
+            }
+            
+            // Variant 1 zuerst prüfen – Analyst+Kursziel-Tabelle hat Vorrang (auch wenn „buy“/„sell“ im HTML vorkommt, z. B. Siemens Energy)
+            let hasAnalyst = headers.contains { $0.lowercased().contains("analyst") }
+            let hasKursziel = headers.contains { header in
+                let h = header.lowercased()
+                return h.contains("kursziel") && !h.contains("marktkap") && !h.contains("kapitalisierung")
+            }
+            if hasAnalyst && hasKursziel {
+                // Analyst-Tabelle (Variant 1) – nicht überspringen, auch wenn Buy/Sell irgendwo im HTML steht
+                debug("   ✅ Analyst+Kursziel in Header – verarbeite als Variant 1 (ignoriere Buy/Sell im HTML)")
+            } else if hasBuyHoldSell && !(hasOderKursziel && hasAbstKursziel) {
+                debug("   ⏭️  Überspringe Tabelle \(tableIdx+1) – Buy-Sell ohne Ø/Abst. Kursziel")
+                continue
+            } else if hasBuyHoldSell {
+                continue
+            }
+            
+            // Variant 1: Tabelle mit Analyst UND Kursziel (Abstand optional – kann „Abstand Kursziel“ ohne Ø sein, Zeilen mit „-“)
+            let hasAbstand = headersText.contains("abstand")
+            
+            // Variant 1: Analyst | Kursziel | [Abstand Kursziel] – Abstand optional (z. B. Siemens Energy: „-“ in Zeilen)
+            if !(hasAnalyst && hasKursziel) {
+                debug("   ⏭️  Überspringe Tabelle \(tableIdx+1) – fehlt Analyst/Kursziel (Variant 1)")
+                continue
+            }
+            debug("   ✅ Variant 1: Analyst + Kursziel in Header" + (hasAbstand ? " (+ Abstand)" : " (ohne Abstand)"))
+            
+            // Finde Kursziel-Spalten-Index – NUR Durchschnitt/Kursziel, NICHT Höchstziel/Tiefstziel!
+                var kurszielColumnIndex: Int? = nil
+                for (idx, header) in headers.enumerated() {
+                    let headerLower = header.lowercased()
+                    // Höchstziel/Tiefstziel ausschließen – die liefern falsche Werte (z.B. 2714 statt 1145)
+                    if headerLower.contains("höchst") || headerLower.contains("tiefst") || headerLower.contains("high") || headerLower.contains("low") {
+                        continue
+                    }
+                    // Suche "Kursziel" oder "Durchschnitt" – nicht "Marktkap", nicht "Abstand" (Abstand Kursziel ist eine Spalte weiter)
+                    if (headerLower.contains("kursziel") || headerLower.contains("durchschnitt") || headerLower.contains("konsens"))
+                        && !headerLower.contains("marktkap") && !headerLower.contains("kapitalisierung")
+                        && !headerLower.contains("abstand") && !headerLower.contains("abst") {
+                        kurszielColumnIndex = idx
+                        debug("   📍 Kursziel-Spalte Index: \(idx), Name: '\(header)'")
+                        break
+                    }
+                }
+                // Fallback: "ziel" oder "target", aber weiterhin Höchst/Tiefst ausschließen
+                if kurszielColumnIndex == nil {
+                    for (idx, header) in headers.enumerated() {
+                        let headerLower = header.lowercased()
+                        if (headerLower.contains("höchst") || headerLower.contains("tiefst") || headerLower.contains("high") || headerLower.contains("low")) { continue }
+                        if (headerLower.contains("ziel") || headerLower.contains("target"))
+                            && !headerLower.contains("marktkap") && !headerLower.contains("kapitalisierung") && !headerLower.contains("analyst") {
+                            kurszielColumnIndex = idx
+                            debug("   📍 Kursziel-Spalte (Variante) Index: \(idx), Name: '\(header)'")
+                            break
+                        }
+                    }
+                }
+                
+                // Falls immer noch keine Kursziel-Spalte gefunden, aber "Analyst" vorhanden ist,
+                // suche in den Daten nach Zahlen, die wie Kursziele aussehen
+                // Struktur: Analyst | Pfeil | Kursziel | +/- | Abstand
+                if kurszielColumnIndex == nil && hasAnalyst {
+                    // Finde Analyst-Spalten-Index
+                    var analystColumnIndex: Int? = nil
+                    for (idx, header) in headers.enumerated() {
+                        if header.lowercased().contains("analyst") {
+                            analystColumnIndex = idx
+                            debug("   📍 Analyst-Spalte Index: \(idx)")
+                            break
+                        }
+                    }
+                    
+                    // Die Kursziel-Spalte ist wahrscheinlich 2 Spalten nach Analyst (Analyst | Pfeil | Kursziel)
+                    if let analystIdx = analystColumnIndex {
+                        let rows = extractTableRows(from: tableHTML)
+                        
+                        // Prüfe verschiedene Positionen nach Analyst
+                        // Position analystIdx+1 könnte Pfeil sein, analystIdx+2 könnte Kursziel sein
+                        for offset in [1, 2, 3] {
+                            let candidateIdx = analystIdx + offset
+                            if candidateIdx < headers.count {
+                                var hasKurszielFormat = false
+                                // Prüfe erste paar Datenzeilen (überspringe Header)
+                                for row in rows.dropFirst().prefix(3) {
+                                    if row.count > candidateIdx {
+                                        let cell = row[candidateIdx]
+                                        // Prüfe ob es wie "2060,00 EUR" aussieht
+                                        if cell.contains("EUR") || cell.contains("€") || 
+                                           (parseNumberFromTable(cell) != nil && parseNumberFromTable(cell)! > 100) {
+                                            hasKurszielFormat = true
+                                            debug("   🔍 Spalte \(candidateIdx) enthält Kursziel-Format: '\(cell)'")
+                                            break
+                                        }
+                                    }
+                                }
+                                if hasKurszielFormat {
+                                    kurszielColumnIndex = candidateIdx
+                                    debug("   📍 Kursziel-Spalte vermutet als Index \(candidateIdx) (Offset \(offset) nach Analyst)")
+                                    break
+                                }
+                            }
+                        }
+                    }
+                }
+                
+                // Extrahiere alle Zeilen – nutze ermittelten Spaltenindex (nicht feste Spalte 2!)
+                // Feste Spalte 2 kann "Höchstziel" o.ä. sein – kurszielColumnIndex ist korrekt
+                let allRows = extractTableRows(from: tableHTML)
+                // Überspringe Zeilen vor der Header-Zeile (z. B. „Kurs|Ø Kursziel|BUY|HOLD|SELL“)
+                let rows = headerRowIndex > 0 ? Array(allRows.dropFirst(headerRowIndex + 1)) : allRows
+                debug("   📊 \(allRows.count) Zeilen gesamt, \(rows.count) Datenzeilen (nach Header)")
+                debug("   📋 Alle Zeilen (mit |):")
+                for (rowIdx, row) in rows.enumerated() {
+                    let rowString = row.joined(separator: " | ")
+                    debug("      Zeile \(rowIdx+1): \(rowString)")
+                }
+                
+                let spalteBetrag = kurszielColumnIndex ?? 2   // Kursziel-Spalte aus Header, Fallback 2
+                debug("   📐 Spalten-Mapping: Kursziel = Index \(spalteBetrag), Abstand % = Spalte direkt danach")
+                var verarbeitungGestartet = false
+                var summeEUR: Decimal = 0
+                var summeUSD: Decimal = 0
+                var summeGBP: Decimal = 0
+                var anzahlEUR = 0
+                var anzahlUSD = 0
+                var anzahlGBP = 0
+                var summeSpalte4: Decimal = 0
+                var anzahlZeilenSpalte4 = 0
+                var anzahlSpalten = 0
+                
+                for (rowIdx, row) in rows.enumerated() {
+                    let rowMitPipe = row.joined(separator: " | ")
+                    let hatPipe = rowMitPipe.contains("|")
+                    
+                    // Start: Erstes | gefunden → Verarbeitung beginnen
+                    if !verarbeitungGestartet {
+                        if hatPipe {
+                            verarbeitungGestartet = true
+                            anzahlSpalten = row.count
+                            debug("   ▶️  Start bei Zeile \(rowIdx+1) – erstes | Zeichen gefunden, \(anzahlSpalten) Spalten")
+                        } else {
+                            debug("   ⏭️  Überspringe Zeile \(rowIdx+1) – noch kein |")
+                            continue
+                        }
+                    }
+                    
+                    // Stopp: Kein | mehr → Einlesung beenden
+                    if verarbeitungGestartet && !hatPipe {
+                        debug("   ⏹️  Stopp bei Zeile \(rowIdx+1) – kein | Zeichen mehr")
+                        break
+                    }
+                    
+                    // Betrag parsen – Währung pro Zeile aus Zelle (direkt nach Betrag)
+                    // Mindestens spalteBetrag+1 Spalten nötig (nicht spalteAbstand – manche Zeilen haben weniger)
+                    if row.count > spalteBetrag {
+                        let betragStr = row[spalteBetrag]
+                        let naechsteSpalteStr = row.count > spalteBetrag + 1 ? row[spalteBetrag + 1] : ""
+                        debug("   🔍 Zeile \(rowIdx+1): Kursziel Index \(spalteBetrag)='\(betragStr)' | Abstand Index \(spalteBetrag+1)='\(naechsteSpalteStr)' [erwartet z.B. +8,85%]")
+                        
+                        // Kursziel: zuerst aus Kursziel-Spalte, falls leer/ungültig aus nächster Spalte (z.B. Eli Lilly)
+                        var kurszielWert: Double? = nil
+                        var kurszielWaehrung: String? = nil
+                        var kurszielSpalteIdx = spalteBetrag
+                        
+                        if let betrag = parseNumberFromTable(betragStr), betrag > 0 {
+                            let w = waehrungAusZelle(betragStr) ?? "EUR"
+                            kurszielWert = betrag
+                            kurszielWaehrung = w
+                            kurszielSpalteIdx = spalteBetrag
+                        } else if let wert = parseNumberFromTable(naechsteSpalteStr), wert > 0, let w = waehrungAusZelle(naechsteSpalteStr) {
+                            kurszielWert = wert
+                            kurszielWaehrung = w
+                            kurszielSpalteIdx = spalteBetrag + 1
+                            debug("   📍 Kursziel aus Index \(spalteBetrag+1) (Währung in Zelle): \(wert) \(w)")
+                        }
+                        
+                        if let betrag = kurszielWert, let w = kurszielWaehrung {
+                            if w == "USD" {
+                                summeUSD += Decimal(betrag)
+                                anzahlUSD += 1
+                                debug("   ✅ Betrag: \(betrag) USD")
+                            } else if w == "GBP" {
+                                summeGBP += Decimal(betrag)
+                                anzahlGBP += 1
+                                debug("   ✅ Betrag: \(betrag) GBP")
+                            } else {
+                                summeEUR += Decimal(betrag)
+                                anzahlEUR += 1
+                                debug("   ✅ Betrag: \(betrag) EUR")
+                            }
+                            // Abstand: Spalte direkt nach dem Kursziel – %-Wert (z.B. +8,85%)
+                            let abstandSpalteIdx = kurszielSpalteIdx + 1
+                            let abstandStr = row.count > abstandSpalteIdx ? row[abstandSpalteIdx] : ""
+                            if waehrungAusZelle(abstandStr) == nil, let abstand = parseNumberFromTable(abstandStr) {
+                                summeSpalte4 += Decimal(abstand)
+                                anzahlZeilenSpalte4 += 1
+                                debug("   📏 Abstand: \(abstand)% (Index \(abstandSpalteIdx))")
+                            }
+                        }
+                    }
+                }
+                
+                // Bei gemischten Währungen: EUR bevorzugt, sonst GBP, sonst USD. GBP wird später in EUR umgerechnet.
+                let (summeBetrag, anzahlZeilen, erkannteWaehrung): (Decimal, Int, String?) = {
+                    if anzahlEUR > 0 && (anzahlUSD > 0 || anzahlGBP > 0) {
+                        debug("   ⚠️  Gemischte Währungen – nur EUR-Zeilen (\(anzahlEUR)) werden bewertet")
+                        return (summeEUR, anzahlEUR, "EUR")
+                    }
+                    if anzahlEUR > 0 { return (summeEUR, anzahlEUR, "EUR") }
+                    if anzahlGBP > 0 { return (summeGBP, anzahlGBP, "GBP") }
+                    if anzahlUSD > 0 { return (summeUSD, anzahlUSD, "USD") }
+                    return (0, 0, nil)
+                }()
+                
+                // Ergebnis: Summen getrennt + finale Währung – im Debug anzeigen
+                debug("   📊 Ergebnis – EUR: Summe=\(summeEUR), Anzahl=\(anzahlEUR) | GBP: Summe=\(summeGBP), Anzahl=\(anzahlGBP) | USD: Summe=\(summeUSD), Anzahl=\(anzahlUSD)")
+                let waehrungDebug = erkannteWaehrung ?? "EUR"
+                debug("   📊 Ergebnis – Verwendet: Summe=\(summeBetrag) \(waehrungDebug), Anzahl=\(anzahlZeilen)")
+                let durchschnittSp4 = anzahlZeilenSpalte4 > 0 ? summeSpalte4 / Decimal(anzahlZeilenSpalte4) : nil
+                debug("   📊 Ergebnis – Spalte 4: Summe=\(summeSpalte4), Anzahl=\(anzahlZeilenSpalte4), Durchschnitt=\(durchschnittSp4.map { "\($0)" } ?? "–")")
+                
+                if anzahlZeilen > 0 {
+                    let durchschnitt = summeBetrag / Decimal(anzahlZeilen)
+                    let durchschnittDouble = NSDecimalNumber(decimal: durchschnitt).doubleValue
+                    let spalte4Double = durchschnittSp4.map { NSDecimalNumber(decimal: $0).doubleValue }
+                    return (durchschnittDouble, spalte4Double, erkannteWaehrung)
+                } else {
+                    debug("   ⚠️  Keine gültigen Beträge in Spalte 3 gefunden")
+                }
+        }
+        
+        debug("   ❌ Keine passende Tabelle mit Kursziel gefunden")
+        return nil
+    }
+    
+    /// Extrahiert Header aus HTML (th oder td Tags)
+    private static func extractTableHeaders(from html: String) -> [String] {
+        var headers: [String] = []
+        let cellPattern = "<(th|td)[^>]*>([\\s\\S]*?)</(th|td)>"
+        
+        if let regex = try? NSRegularExpression(pattern: cellPattern, options: [.caseInsensitive]) {
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, options: [], range: range)
+            
+            for match in matches {
+                if match.numberOfRanges > 2,
+                   let contentRange = Range(match.range(at: 2), in: html) {
+                    let content = String(html[contentRange])
+                    let cleaned = cleanHTMLText(content)
+                    if !cleaned.isEmpty {
+                        headers.append(cleaned)
+                    }
+                }
+            }
+        }
+        
+        return headers
+    }
+    
+    /// Extrahiert Zeilen aus HTML-Tabelle
+    private static func extractTableRows(from html: String) -> [[String]] {
+        var rows: [[String]] = []
+        let rowPattern = "<tr[^>]*>([\\s\\S]*?)</tr>"
+        
+        if let regex = try? NSRegularExpression(pattern: rowPattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, options: [], range: range)
+            
+            for match in matches {
+                if match.numberOfRanges > 1,
+                   let rowRange = Range(match.range(at: 1), in: html) {
+                    let rowHTML = String(html[rowRange])
+                    let cells = extractTableCells(from: rowHTML)
+                    if !cells.isEmpty {
+                        rows.append(cells)
+                    }
+                }
+            }
+        }
+        
+        return rows
+    }
+    
+    /// Extrahiert Zellen aus einer Tabellenzeile
+    private static func extractTableCells(from html: String) -> [String] {
+        var cells: [String] = []
+        let cellPattern = "<(td|th)[^>]*>([\\s\\S]*?)</(td|th)>"
+        
+        if let regex = try? NSRegularExpression(pattern: cellPattern, options: [.caseInsensitive, .dotMatchesLineSeparators]) {
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, options: [], range: range)
+            
+            for match in matches {
+                if match.numberOfRanges > 2,
+                   let contentRange = Range(match.range(at: 2), in: html) {
+                    let content = String(html[contentRange])
+                    let cleaned = cleanHTMLText(content)
+                    
+                    // Wenn die Zelle Pipe-Zeichen enthält, könnte es mehrere Spalten sein
+                    // Teile sie auf
+                    if cleaned.contains("|") {
+                        let parts = cleaned.split(separator: "|")
+                        for part in parts {
+                            let trimmed = part.trimmingCharacters(in: .whitespaces)
+                            if !trimmed.isEmpty {
+                                cells.append(trimmed)
+                            }
+                        }
+                    } else {
+                        cells.append(cleaned)
+                    }
+                }
+            }
+        }
+        
+        return cells
+    }
+    
+    /// Bereinigt HTML-Text (entfernt Tags, Entities, etc.)
+    private static func cleanHTMLText(_ text: String) -> String {
+        var cleaned = text
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            // HTML-Entities dekodieren
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            // Numerische HTML-Entities (z.B. &#x2B; = +)
+            .replacingOccurrences(of: "&#x2B;", with: "+")
+            .replacingOccurrences(of: "&#43;", with: "+")
+            .replacingOccurrences(of: "&#x2D;", with: "-")
+            .replacingOccurrences(of: "&#45;", with: "-")
+            // Entferne Pipe-Zeichen am Anfang/Ende (sind Trennzeichen)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .trimmingCharacters(in: CharacterSet(charactersIn: "|"))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return cleaned
+    }
+    
+    /// Parst Zahl aus Tabellenzelle (wie Python-Version)
+    /// Behandelt Format wie "2060,00 EUR" oder "2.060,00 EUR"
+    private static func parseNumberFromTable(_ text: String) -> Double? {
+        var cleaned = text.trimmingCharacters(in: .whitespaces)
+        
+        // Währung/Prozent/Leerzeichen entfernen
+        cleaned = cleaned.replacingOccurrences(of: "€", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "EUR", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "USD", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "$", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "%", with: "")
+        cleaned = cleaned.replacingOccurrences(of: " ", with: "")
+        
+        // Entferne + oder - am Anfang (für Abstand, inkl. Unicode-Varianten)
+        let plusMinus = CharacterSet(charactersIn: "+-\u{2212}\u{2013}")  // + - − –
+        cleaned = cleaned.trimmingCharacters(in: plusMinus)
+        cleaned = cleaned.trimmingCharacters(in: .whitespaces)
+        
+        // Tausenderpunkte entfernen, Dezimalkomma -> Punkt
+        if cleaned.contains(".") && cleaned.contains(",") {
+            // Deutsche Formatierung: 2.060,00 -> 2060.00
+            cleaned = cleaned.replacingOccurrences(of: ".", with: "")
+            cleaned = cleaned.replacingOccurrences(of: ",", with: ".")
+        } else if cleaned.contains(".") {
+            // Prüfe ob Punkt als Tausender-Trennzeichen
+            let parts = cleaned.split(separator: ".")
+            if parts.count > 2 {
+                // Mehrere Punkte = Tausender-Trennzeichen: 2.060 -> 2060
+                cleaned = cleaned.replacingOccurrences(of: ".", with: "")
+            }
+            // Sonst ist es Dezimaltrennzeichen: 2060.00
+        } else if cleaned.contains(",") {
+            // Nur Komma = Dezimaltrennzeichen: 2060,00 -> 2060.00
+            cleaned = cleaned.replacingOccurrences(of: ",", with: ".")
+        }
+        
+        return Double(cleaned)
+    }
+    
+    /// Ermittelt Währung aus Zellinhalt (z. B. "2714,00 USD" -> "USD", "5,20 GBP" -> "GBP", "2060 EUR" -> "EUR")
+    private static func waehrungAusZelle(_ text: String) -> String? {
+        let upper = text.uppercased()
+        if upper.contains("USD") || upper.contains("US$") || text.contains("$") { return "USD" }
+        if upper.contains("GBP") || upper.contains("£") || upper.contains("PENCE") { return "GBP" }
+        if upper.contains("EUR") || upper.contains("€") { return "EUR" }
+        return nil
+    }
+    
+    /// Parst Kursziel aus HTML
+    /// Rückgabe: (Kursziel, Spalte-4-Durchschnitt?, Währung?)
+    private static func parseKurszielFromHTML(_ html: String, urlString: String? = nil) -> (Double, Double?, String?)? {
+        debug("   🔍 Starte HTML-Parsing...")
+        
+        // NEUE METHODE: Versuche zuerst HTML-Tabellen zu extrahieren
+        if let (kursziel, spalte4, waehrung) = extractKurszielFromHTMLTables(html, urlString: urlString) {
+            debug("   ✅ Kursziel aus HTML-Tabelle extrahiert: \(kursziel) \(waehrung ?? "EUR")" + (spalte4.map { ", Spalte 4: \($0)" } ?? ""))
+            return (kursziel, spalte4, waehrung)
+        }
+        
+        debug("   ⚠️  Keine passende Tabelle gefunden, verwende Regex-Parsing...")
+        // Helper: Parst eine Zahl mit deutscher oder englischer Formatierung
+        func parseNumber(_ str: String) -> Double? {
+            var cleaned = str.trimmingCharacters(in: .whitespaces)
+            
+            // Entferne Tausender-Trennzeichen (Punkte) und ersetze Komma durch Punkt
+            if cleaned.contains(".") && cleaned.contains(",") {
+                // Deutsche Formatierung: 1.234,56 -> 1234.56
+                cleaned = cleaned.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+            } else if cleaned.contains(".") {
+                // Prüfe ob Punkt als Tausender-Trennzeichen oder Dezimaltrennzeichen verwendet wird
+                let parts = cleaned.split(separator: ".")
+                if parts.count == 2 {
+                    // Wenn der Teil nach dem Punkt 3 Ziffern hat, könnte es Tausender-Trennzeichen sein
+                    if parts[1].count == 3 && !parts[1].contains(",") {
+                        // Wahrscheinlich Tausender-Trennzeichen: 2.170 -> 2170
+                        cleaned = cleaned.replacingOccurrences(of: ".", with: "")
+                    }
+                    // Sonst ist es wahrscheinlich Dezimaltrennzeichen: 1234.56
+                } else if parts.count > 2 {
+                    // Mehrere Punkte = Tausender-Trennzeichen: 1.234.567 -> 1234567
+                    cleaned = cleaned.replacingOccurrences(of: ".", with: "")
+                }
+            } else if cleaned.contains(",") {
+                // Nur Komma = Dezimaltrennzeichen: 1234,56 -> 1234.56
+                cleaned = cleaned.replacingOccurrences(of: ",", with: ".")
+            }
+            
+            return Double(cleaned)
+        }
+        
+        // PRIORITÄT 1: Suche nach expliziten Mittel/Durchschnitt-Werten (höchste Priorität)
+        // Diese sollten bevorzugt werden, da sie den tatsächlichen Durchschnitt darstellen
+        debug("   🔍 PRIORITÄT 1: Suche nach Mittel/Durchschnitt-Werten")
+        let mittelPatterns = [
+            "Mittel[^0-9]*von[^0-9]*[0-9]+[^0-9]*Analysten[^0-9]*von[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Mittel[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Durchschnitt[^0-9]*von[^0-9]*[0-9]+[^0-9]*Analysten[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Durchschnitt[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Durchschnittliches Kursziel[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Ø Kursziel[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Analystenkonsens[^0-9]*([0-9]{1,4}[.,0-9]+)"
+        ]
+        
+        for (index, pattern) in mittelPatterns.enumerated() {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(html.startIndex..., in: html)
+                let matches = regex.matches(in: html, options: [], range: range)
+                for match in matches {
+                    if match.numberOfRanges > 1,
+                       let kurszielRange = Range(match.range(at: 1), in: html) {
+                        let kurszielString = String(html[kurszielRange])
+                        debug("   📌 Pattern \(index+1) gefunden: '\(kurszielString)'")
+                        if let kursziel = parseNumber(kurszielString), kursziel >= 1.0 {
+                            debug("   ✅ Geparst als: \(kursziel) €")
+                            return (kursziel, nil, nil)
+                        } else {
+                            debug("   ❌ Konnte nicht als Zahl geparst werden oder < 1.0")
+                        }
+                    }
+                }
+            }
+        }
+        debug("   ❌ Kein Mittel/Durchschnitt gefunden")
+        
+        // PRIORITÄT 2: Suche nach Bereichen, aber nur wenn sie plausibel sind (nicht Höchstziel)
+        // Ignoriere Bereiche, die zu groß sind (z.B. 2162 - 2714, da 2714 wahrscheinlich Höchstziel ist)
+        let bereichPatterns = [
+            "Durchschnitt[^0-9]*([0-9]{1,4}[.,0-9]+)[^0-9]*[–-][^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "ca\\.?[^0-9]*~?([0-9]{1,4}[.,0-9]+)[^0-9]*[–-][^0-9]*([0-9]{1,4}[.,0-9]+)[^0-9]*€"
+        ]
+        
+        for pattern in bereichPatterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(html.startIndex..., in: html)
+                let matches = regex.matches(in: html, options: [], range: range)
+                for match in matches {
+                    if match.numberOfRanges > 2,
+                       let minRange = Range(match.range(at: 1), in: html),
+                       let maxRange = Range(match.range(at: 2), in: html) {
+                        let minString = String(html[minRange])
+                        let maxString = String(html[maxRange])
+                        
+                        if let min = parseNumber(minString), let max = parseNumber(maxString), min > 0, max > min {
+                            // Nur verwenden, wenn der Bereich nicht zu groß ist (max. 30% Unterschied)
+                            // Dies filtert Höchstziel-Bereiche heraus
+                            let differenzProzent = ((max - min) / min) * 100
+                            if differenzProzent <= 30 {
+                                // Berechne Durchschnitt
+                                let durchschnitt = (min + max) / 2.0
+                                if durchschnitt >= 1.0 {
+                                    return (durchschnitt, nil, nil)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        // PRIORITÄT 3: Suche nach einzelnen Kursziel-Werten (Fallback)
+        let patterns = [
+            "Kursziel[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Price Target[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "Zielkurs[^0-9]*([0-9]{1,4}[.,0-9]+)",
+            "targetMeanPrice[^}]*raw[^0-9]*([0-9]+[.,0-9]+)",
+            "data-target-price=\"([0-9]+[.,0-9]+)\""
+        ]
+        
+        for pattern in patterns {
+            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) {
+                let range = NSRange(html.startIndex..., in: html)
+                let matches = regex.matches(in: html, options: [], range: range)
+                for match in matches {
+                    if match.numberOfRanges > 1,
+                       let kurszielRange = Range(match.range(at: 1), in: html) {
+                        let kurszielString = String(html[kurszielRange])
+                        if let kursziel = parseNumber(kurszielString), kursziel >= 1.0 {
+                            return (kursziel, nil, nil)
+                        }
+                    }
+                }
+            }
+        }
+        
+        return nil
+    }
+}
