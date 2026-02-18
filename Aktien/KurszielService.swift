@@ -77,6 +77,14 @@ class KurszielService {
     private static let usTicker = Set(["AAPL", "MSFT", "AMZN", "GOOGL", "TSLA", "META"])
     /// UK-Aktien (LSE), FMP liefert GBP – werden in EUR umgerechnet
     private static let gbpTicker = Set(["GLEN", "HSBC", "BP", "SHEL", "VOD", "AZN", "GSK", "ULVR", "DGE", "RIO", "BHP", "NG", "LLOY", "BARC", "STAN"])
+
+    /// US-Ticker: 2–5 Buchstaben, kein Börsensuffix (.DE, .F, .PA etc.) – FMP liefert USD
+    private static func isLikelyUSTicker(_ symbol: String) -> Bool {
+        let s = symbol.trimmingCharacters(in: .whitespaces).uppercased()
+        guard s.count >= 2, s.count <= 5 else { return false }
+        if s.contains(".") { return false }
+        return s.allSatisfy { $0.isLetter }
+    }
     
     /// Ruft Kursziel direkt für eine WKN oder URL ab (für Testzwecke)
     static func fetchKurszielByWKN(_ wkn: String) async -> KurszielInfo? {
@@ -1332,18 +1340,24 @@ class KurszielService {
             var consensus = parsed.consensus
             var high = parsed.high
             var low = parsed.low
-            if usTicker.contains(symbol) {
-                let rate = await fetchUSDtoEURRate()
-                consensus = parsed.consensus * rate
-                high = parsed.high.map { $0 * rate }
-                low = parsed.low.map { $0 * rate }
-            } else if gbpTicker.contains(symbol) {
+            if gbpTicker.contains(symbol) {
                 let rate = await fetchGBPtoEURRate()
                 consensus = parsed.consensus * rate
                 high = parsed.high.map { $0 * rate }
                 low = parsed.low.map { $0 * rate }
+            } else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
+                let rate = await fetchUSDtoEURRate()
+                consensus = parsed.consensus * rate
+                high = parsed.high.map { $0 * rate }
+                low = parsed.low.map { $0 * rate }
             }
-            return KurszielInfo(kursziel: consensus, datum: parsed.datum, spalte4Durchschnitt: nil, quelle: .fmp, waehrung: "EUR", kurszielHigh: high, kurszielLow: low, kurszielAnalysten: parsed.analysts)
+            let waehrung: String
+            if gbpTicker.contains(symbol) || usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
+                waehrung = "EUR"
+            } else {
+                waehrung = "USD"
+            }
+            return KurszielInfo(kursziel: consensus, datum: parsed.datum, spalte4Durchschnitt: nil, quelle: .fmp, waehrung: waehrung, kurszielHigh: high, kurszielLow: low, kurszielAnalysten: parsed.analysts)
         } catch {
             debug("   ❌ FMP URL Fehler: \(error.localizedDescription)")
             return nil
@@ -1869,9 +1883,8 @@ class KurszielService {
                                 if let betrag = parseNumberFromTable(betragStr), betrag > 0 {
                                     let w = waehrungAusZelle(betragStr) ?? "EUR"
                                     let abstand = parseNumberFromTable(abstandStr)
-                                    let ohneUmr = (w == "USD" || w == "GBP")
-                                    debug("   ✅ Variant 2: Zeile gefunden – \(betrag) \(w), Abstand \(abstand.map { "\($0)%" } ?? "–")" + (ohneUmr ? " (ohne Umrechnung)" : ""))
-                                    return (betrag, abstand, w, ohneUmr)
+                                    debug("   ✅ Variant 2: Zeile gefunden – \(betrag) \(w), Abstand \(abstand.map { "\($0)%" } ?? "–")" + ((w == "USD" || w == "GBP") ? " (wird in EUR umgerechnet)" : ""))
+                                    return (betrag, abstand, w, false)
                                 }
                             }
                         }
@@ -2091,7 +2104,7 @@ class KurszielService {
                     }
                 }
                 
-                // Bei gemischten Währungen: EUR bevorzugt. Nur eine andere Währung → ohne Devisenumrechnung übernehmen.
+                // Bei gemischten Währungen: EUR bevorzugt. USD/GBP werden immer in EUR umgerechnet.
                 let (summeBetrag, anzahlZeilen, erkannteWaehrung, ohneUmrechnung): (Decimal, Int, String?, Bool) = {
                     if anzahlEUR > 0 && (anzahlUSD > 0 || anzahlGBP > 0) {
                         debug("   ⚠️  Gemischte Währungen – nur EUR-Zeilen (\(anzahlEUR)) werden bewertet")
@@ -2099,12 +2112,12 @@ class KurszielService {
                     }
                     if anzahlEUR > 0 { return (summeEUR, anzahlEUR, "EUR", false) }
                     if anzahlGBP > 0 {
-                        debug("   📌 Nur GBP-Zeilen – Wert unverändert (keine Devisenumrechnung)")
-                        return (summeGBP, anzahlGBP, "GBP", true)
+                        debug("   📌 Nur GBP-Zeilen – wird in EUR umgerechnet")
+                        return (summeGBP, anzahlGBP, "GBP", false)
                     }
                     if anzahlUSD > 0 {
-                        debug("   📌 Nur USD-Zeilen – Wert unverändert (keine Devisenumrechnung)")
-                        return (summeUSD, anzahlUSD, "USD", true)
+                        debug("   📌 Nur USD-Zeilen – wird in EUR umgerechnet")
+                        return (summeUSD, anzahlUSD, "USD", false)
                     }
                     return (0, 0, nil, false)
                 }()

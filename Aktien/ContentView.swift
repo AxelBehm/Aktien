@@ -2049,7 +2049,8 @@ private struct FMPTestSheetView: View {
         fmpResult = nil
         fmpError = nil
         Task {
-            if let info = await KurszielService.fetchKurszielFromFMP(for: aktie) {
+            if var info = await KurszielService.fetchKurszielFromFMP(for: aktie) {
+                info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
                 await MainActor.run {
                     fmpResult = info
                     isFetching = false
@@ -2190,7 +2191,8 @@ private struct FinanzenNetTestSheetView: View {
         errorMsg = nil
         debugLog = []
         Task {
-            if let info = await KurszielService.fetchKurszielFromFinanzenNet(for: aktie) {
+            if var info = await KurszielService.fetchKurszielFromFinanzenNet(for: aktie) {
+                info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
                 await MainActor.run {
                     result = info
                     debugLog = KurszielService.getDebugLog()
@@ -2328,7 +2330,8 @@ private struct SnippetTestSheetView: View {
         errorMsg = nil
         debugLog = []
         Task {
-            if let info = await KurszielService.fetchKurszielFromSnippet(for: aktie) {
+            if var info = await KurszielService.fetchKurszielFromSnippet(for: aktie) {
+                info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
                 await MainActor.run {
                     result = info
                     debugLog = KurszielService.getDebugLog()
@@ -2349,21 +2352,45 @@ struct DebugLogSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var logEntries: [String] = []
     
+    private func refreshLog() {
+        logEntries = KurszielService.getDebugLog()
+    }
+    
     var body: some View {
-        NavigationView {
-            Group {
+        NavigationStack {
+            VStack(spacing: 0) {
+                Button(action: refreshLog) {
+                    Label("Aktualisieren", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 14)
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.blue)
+                .padding(.horizontal, 16)
+                .padding(.top, 16)
+                .padding(.bottom, 12)
+                
+                Rectangle()
+                    .fill(Color.gray.opacity(0.3))
+                    .frame(height: 1)
+                
                 if logEntries.isEmpty {
-                    Text("Kein Debug-Log vorhanden.\nFühren Sie „Kursziele abrufen“ aus.")
+                    Spacer()
+                    Text("Kein Eintrag.")
+                        .font(.headline)
+                    Text("Zuerst z. B. „finanzen.net abrufen“ (bei einer Aktie) ausführen, dann hier „Aktualisieren“ tippen.")
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
-                        .padding()
+                        .padding(.horizontal, 24)
+                        .padding(.top, 8)
+                    Spacer()
                 } else {
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 4) {
                             ForEach(Array(logEntries.enumerated()), id: \.offset) { _, entry in
                                 Text(entry)
                                     .font(.system(.caption, design: .monospaced))
-                                    .foregroundColor(entry.contains("FMP") || entry.contains("━━━") ? .primary : .secondary)
+                                    .foregroundColor(entry.contains("FMP") || entry.contains("━━━") || entry.contains("💱") ? .primary : .secondary)
                             }
                         }
                         .padding()
@@ -2378,7 +2405,7 @@ struct DebugLogSheet: View {
                 }
             }
             .onAppear {
-                logEntries = KurszielService.getDebugLog()
+                refreshLog()
             }
         }
     }
