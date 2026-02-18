@@ -53,6 +53,31 @@ class KurszielService {
     static var debugMode = true
     static var debugLog: [String] = []
     
+    /// Beim App-Start einmal ermittelte Wechselkurse (Frankfurter API) – für alle Umrechnungen verwendet
+    static var appWechselkursUSDtoEUR: Double?
+    static var appWechselkursGBPtoEUR: Double?
+    
+    /// Lädt USD→EUR und GBP→EUR einmal (beim Start); setzt appWechselkursUSDtoEUR / appWechselkursGBPtoEUR. Rückgabe für UI-Anzeige.
+    static func fetchAppWechselkurse() async -> (usdToEur: Double?, gbpToEur: Double?) {
+        async let usd = fetchUSDtoEURRateInternal()
+        async let gbp = fetchGBPtoEURRateInternal()
+        let (usdVal, gbpVal) = await (usd, gbp)
+        appWechselkursUSDtoEUR = usdVal
+        appWechselkursGBPtoEUR = gbpVal
+        debug("   💱 App-Wechselkurse: USD→EUR \(usdVal), GBP→EUR \(gbpVal)")
+        return (usdVal, gbpVal)
+    }
+    
+    /// Für Umrechnung: USD→EUR (App-Kurs oder Fallback 0.92)
+    static func rateUSDtoEUR() -> Double {
+        appWechselkursUSDtoEUR ?? 0.92
+    }
+    
+    /// Für Umrechnung: GBP→EUR (App-Kurs oder Fallback 1.17)
+    static func rateGBPtoEUR() -> Double {
+        appWechselkursGBPtoEUR ?? 1.17
+    }
+    
     static func clearDebugLog() {
         debugLog = []
     }
@@ -993,14 +1018,13 @@ class KurszielService {
                 var low = parsed.low
                 var rate: Double = 1.0
                 if istUSD {
-                    rate = wknToAktie[wkn]?.devisenkurs ?? 0
-                    if rate <= 0 { rate = await fetchUSDtoEURRate() }
-                    else { debug("   💱 FMP \(sym): USD→EUR mit CSV-Devisenkurs \(rate)") }
+                    rate = rateUSDtoEUR()
+                    debug("   💱 FMP \(sym): USD→EUR mit App-Kurs \(rate)")
                     consensus = parsed.consensus * rate
                     high = parsed.high.map { $0 * rate }
                     low = parsed.low.map { $0 * rate }
                 } else if istGBP {
-                    rate = await fetchGBPtoEURRate()
+                    rate = rateGBPtoEUR()
                     consensus = parsed.consensus * rate
                     high = parsed.high.map { $0 * rate }
                     low = parsed.low.map { $0 * rate }
@@ -1199,75 +1223,97 @@ class KurszielService {
         return await kurszielZuEUR(info: info, aktie: aktie)
     }
 
-    /// Konvertiert KurszielInfo von USD/GBP in EUR (Devisenkurs aus CSV oder Frankfurter-API). Währung Anzeige wird EUR.
-    /// Bei ohneDevisenumrechnung: Wert unverändert übernehmen (nur eine andere Währung in Tabelle).
+    /// Konvertiert KurszielInfo in EUR: USD/GBP mit App-Wechselkurs; andere Währungen mit 1 (keine Umrechnung, manuell zu ändern).
     private static func kurszielZuEUR(info: KurszielInfo, aktie: Aktie) async -> KurszielInfo {
         if info.ohneDevisenumrechnung {
-            debug("   💱 Nur eine andere Währung – Wert unverändert übernommen (keine Umrechnung)")
+            debug("   💱 Wert unverändert übernommen (keine Umrechnung)")
             return info
         }
         let w = (info.waehrung ?? "EUR").uppercased()
-        guard w == "USD" || w == "GBP" else { return info }
-        let rate: Double
+        if w == "EUR" { return info }
         if w == "USD" {
-            if let d = aktie.devisenkurs, d > 0 {
-                rate = d
-                debug("   💱 USD→EUR mit CSV-Devisenkurs: \(rate)")
-            } else {
-                rate = await fetchUSDtoEURRate()
-            }
-        } else {
-            rate = await fetchGBPtoEURRate()
-            debug("   💱 GBP→EUR: \(rate)")
+            let rate = rateUSDtoEUR()
+            debug("   💱 USD→EUR mit App-Kurs: \(rate)")
+            return KurszielInfo(
+                kursziel: info.kursziel * rate,
+                datum: info.datum,
+                spalte4Durchschnitt: info.spalte4Durchschnitt,
+                quelle: info.quelle,
+                waehrung: "EUR",
+                kurszielHigh: info.kurszielHigh.map { $0 * rate },
+                kurszielLow: info.kurszielLow.map { $0 * rate },
+                kurszielAnalysten: info.kurszielAnalysten
+            )
         }
+        if w == "GBP" {
+            let rate = rateGBPtoEUR()
+            debug("   💱 GBP→EUR mit App-Kurs: \(rate)")
+            return KurszielInfo(
+                kursziel: info.kursziel * rate,
+                datum: info.datum,
+                spalte4Durchschnitt: info.spalte4Durchschnitt,
+                quelle: info.quelle,
+                waehrung: "EUR",
+                kurszielHigh: info.kurszielHigh.map { $0 * rate },
+                kurszielLow: info.kurszielLow.map { $0 * rate },
+                kurszielAnalysten: info.kurszielAnalysten
+            )
+        }
+        // Andere Währung: mit 1 bewerten, keine Umrechnung – manuell zu ändern
+        debug("   💱 Andere Währung \(w): keine Umrechnung (manuell anpassen)")
         return KurszielInfo(
-            kursziel: info.kursziel * rate,
+            kursziel: info.kursziel,
             datum: info.datum,
             spalte4Durchschnitt: info.spalte4Durchschnitt,
             quelle: info.quelle,
-            waehrung: "EUR",
-            kurszielHigh: info.kurszielHigh.map { $0 * rate },
-            kurszielLow: info.kurszielLow.map { $0 * rate },
-            kurszielAnalysten: info.kurszielAnalysten
+            waehrung: info.waehrung,
+            kurszielHigh: info.kurszielHigh,
+            kurszielLow: info.kurszielLow,
+            kurszielAnalysten: info.kurszielAnalysten,
+            ohneDevisenumrechnung: true
         )
     }
     
-    /// USD → EUR Wechselkurs (Frankfurter API, kein Key nötig). Fallback ca. 0.92
-    private static func fetchUSDtoEURRate() async -> Double {
-        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=USD&symbols=EUR") else { return 0.92 }
+    /// Frankfurter API: USD → EUR (nur für fetchAppWechselkurse)
+    private static func fetchUSDtoEURRateInternal() async -> Double {
+        let fallback: Double = 0.92
+        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=USD&symbols=EUR") else { return fallback }
         do {
             var request = URLRequest(url: url)
             request.timeoutInterval = 5
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let rates = json["rates"] as? [String: Any],
                let eur = rates["EUR"] as? Double, eur > 0 {
-                debug("   💱 USD→EUR Kurs: \(eur)")
+                debug("   💱 USD→EUR: \(eur) (API HTTP \(status))")
                 return eur
             }
         } catch {
-            debug("   💱 Wechselkurs-API Fehler, nutze 0.92")
+            debug("   💱 USD→EUR Fallback 0.92: \(error.localizedDescription)")
         }
-        return 0.92
+        return fallback
     }
     
-    /// GBP → EUR Wechselkurs (Frankfurter API). Fallback ca. 1.17 (1 GBP ≈ 1.17 EUR)
-    private static func fetchGBPtoEURRate() async -> Double {
-        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=GBP&symbols=EUR") else { return 1.17 }
+    /// Frankfurter API: GBP → EUR (nur für fetchAppWechselkurse)
+    private static func fetchGBPtoEURRateInternal() async -> Double {
+        let fallback: Double = 1.17
+        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=GBP&symbols=EUR") else { return fallback }
         do {
             var request = URLRequest(url: url)
             request.timeoutInterval = 5
-            let (data, _) = try await URLSession.shared.data(for: request)
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
             if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                let rates = json["rates"] as? [String: Any],
                let eur = rates["EUR"] as? Double, eur > 0 {
-                debug("   💱 GBP→EUR Kurs: \(eur)")
+                debug("   💱 GBP→EUR: \(eur) (API HTTP \(status))")
                 return eur
             }
         } catch {
-            debug("   💱 GBP-Wechselkurs-API Fehler, nutze 1.17")
+            debug("   💱 GBP→EUR Fallback 1.17: \(error.localizedDescription)")
         }
-        return 1.17
+        return fallback
     }
     
     /// Ersetzt in einer FMP-URL den symbol-Parameter durch newSymbol
@@ -1341,12 +1387,12 @@ class KurszielService {
             var high = parsed.high
             var low = parsed.low
             if gbpTicker.contains(symbol) {
-                let rate = await fetchGBPtoEURRate()
+                let rate = rateGBPtoEUR()
                 consensus = parsed.consensus * rate
                 high = parsed.high.map { $0 * rate }
                 low = parsed.low.map { $0 * rate }
             } else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
-                let rate = await fetchUSDtoEURRate()
+                let rate = rateUSDtoEUR()
                 consensus = parsed.consensus * rate
                 high = parsed.high.map { $0 * rate }
                 low = parsed.low.map { $0 * rate }

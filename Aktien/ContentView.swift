@@ -196,11 +196,52 @@ extension Aktie {
     }
 }
 
+/// App-weite Anzeige der beim Start geladenen Devisenkurse (USD/EUR, GBP/EUR)
+@Observable
+final class AppWechselkurse {
+    static let shared = AppWechselkurse()
+    var usdToEur: Double?
+    var gbpToEur: Double?
+    var isLoading = true
+    func set(usd: Double?, gbp: Double?) {
+        usdToEur = usd
+        gbpToEur = gbp
+        isLoading = false
+    }
+}
+
+/// Zeile im Kopf: Devisenkurse USD/EUR und GBP/EUR
+private struct DevisenkursKopfView: View {
+    var usdToEur: Double?
+    var gbpToEur: Double?
+    var isLoading: Bool
+    var body: some View {
+        HStack(spacing: 16) {
+            if isLoading {
+                Text("Devisen: Wird geladen…")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            } else {
+                Text("USD/EUR: \(usdToEur.map { String(format: "%.4f", $0) } ?? "–")")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Text("GBP/EUR: \(gbpToEur.map { String(format: "%.4f", $0) } ?? "–")")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 8)
+        .background(Color(.systemGroupedBackground))
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: [SortDescriptor<Aktie>(\.bankleistungsnummer), SortDescriptor<Aktie>(\.bezeichnung)]) private var aktien: [Aktie]
     @Query(sort: \ImportSummary.importDatum, order: .reverse) private var importSummaries: [ImportSummary]
     
+    @State private var appWechselkurse = AppWechselkurse.shared
     @State private var isImporting = false
     @State private var importMessage = ""
     @State private var showImportMessage = false
@@ -360,6 +401,8 @@ struct ContentView: View {
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationSplitView {
+            VStack(spacing: 0) {
+                DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
             ScrollViewReader { proxy in
             List {
                 // Gesamtsummen der letzten 5 Einlesungen (Datum aus Dateinamen z.B. Bestandsaufstellung_20260205_130835)
@@ -557,6 +600,7 @@ struct ContentView: View {
                     }
                 }
             }
+            }
         }
 #if os(macOS)
             .navigationSplitViewColumnWidth(min: 300, ideal: 350)
@@ -700,6 +744,12 @@ struct ContentView: View {
                 Label("Aktien", systemImage: "list.bullet")
             }
             .tag(0)
+            .task {
+                let (usd, gbp) = await KurszielService.fetchAppWechselkurse()
+                await MainActor.run {
+                    AppWechselkurse.shared.set(usd: usd, gbp: gbp)
+                }
+            }
 
             NavigationStack {
                 KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: currentDetailISIN, onCopyISIN: { isin in
