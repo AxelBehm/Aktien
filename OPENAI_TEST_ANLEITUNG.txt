@@ -1,0 +1,21 @@
+OpenAI Kursziel-Test – Anleitung (SICHER)
+=========================================
+
+API-Key sichern (nicht im Skript speichern!):
+
+Option A – Datei openai_key.local (empfohlen):
+  1. Datei anlegen: openai_key.local (im gleichen Ordner wie test_openai_kursziel.sh)
+  2. Nur den API-Key eintragen, eine Zeile, sonst nichts
+  3. Diese Datei ist in .gitignore – wird nicht in Git committed
+
+Option B – Umgebungsvariable:
+  export OPENAI_API_KEY=sk-proj-...
+  ./test_openai_kursziel.sh
+
+Ausführen:
+---------
+  cd /Users/axelbehm/.cursor/worktrees/Aktien/hii
+  ./test_openai_kursziel.sh
+
+Ergebnis-Datei (wird beim Lauf erstellt):
+  openai_kursziel_result.json

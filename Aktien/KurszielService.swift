@@ -31,8 +31,10 @@ struct KurszielInfo {
     let kurszielHigh: Double?
     let kurszielLow: Double?
     let kurszielAnalysten: Int?
+    /// true = Wert unverändert übernehmen (nur eine andere Währung, keine Devisenumrechnung)
+    let ohneDevisenumrechnung: Bool
     
-    init(kursziel: Double, datum: Date?, spalte4Durchschnitt: Double?, quelle: KurszielQuelle, waehrung: String?, kurszielHigh: Double? = nil, kurszielLow: Double? = nil, kurszielAnalysten: Int? = nil) {
+    init(kursziel: Double, datum: Date?, spalte4Durchschnitt: Double?, quelle: KurszielQuelle, waehrung: String?, kurszielHigh: Double? = nil, kurszielLow: Double? = nil, kurszielAnalysten: Int? = nil, ohneDevisenumrechnung: Bool = false) {
         self.kursziel = kursziel
         self.datum = datum
         self.spalte4Durchschnitt = spalte4Durchschnitt
@@ -41,6 +43,7 @@ struct KurszielInfo {
         self.kurszielHigh = kurszielHigh
         self.kurszielLow = kurszielLow
         self.kurszielAnalysten = kurszielAnalysten
+        self.ohneDevisenumrechnung = ohneDevisenumrechnung
     }
 }
 
@@ -56,6 +59,11 @@ class KurszielService {
     
     static func getDebugLog() -> [String] {
         return debugLog
+    }
+    
+    /// Öffentlich für Debug-Ausgabe aus UI (z.B. vor OpenAI-Aufruf)
+    static func debugAppend(_ message: String) {
+        debug(message)
     }
     
     private static func debug(_ message: String) {
@@ -129,12 +137,6 @@ class KurszielService {
         }
         debug("❌ Kein Kursziel gefunden")
         
-        debug("4️⃣ Versuche finanzen.net Suche für \(wknOrUrl)")
-        if let info = await fetchKurszielVonFinanzenNetSearch(wkn: wknOrUrl) {
-            debug("✅ Erfolg: Kursziel = \(info.kursziel) \(info.waehrung ?? "EUR")")
-            return info
-        }
-        
         debug("❌ Keine Methode erfolgreich für WKN \(wknOrUrl)")
         return nil
     }
@@ -155,7 +157,9 @@ class KurszielService {
             debug("0️⃣ Versuche kursziele.csv für \(aktie.bezeichnung)")
             if let info = fetchKurszielVonCSV(bezeichnung: aktie.bezeichnung) {
                 debug("   → Gefunden: \(info.kursziel) € (CSV)")
-                return await kurszielZuEUR(info: info, aktie: aktie)
+                let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                return eurInfo
             }
             debug("   ❌ Kein Eintrag in CSV")
             
@@ -163,7 +167,9 @@ class KurszielService {
             debug("1️⃣ Versuche FMP für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
             if let info = await fetchKurszielFromFMP(for: aktie) {
                 debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (FMP)")
-                return await kurszielZuEUR(info: info, aktie: aktie)
+                let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                return eurInfo
             }
             debug("   ❌ Kein Kursziel von FMP")
             
@@ -172,40 +178,38 @@ class KurszielService {
                 debug("1b️⃣ [Fonds] Versuche Suchsnippet (DuckDuckGo) für \(aktie.bezeichnung)")
                 if let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
                     debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (Snippet)")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 }
                 debug("   ❌ Kein Betrag im Snippet")
             }
             
-            // 2. OpenAI (benötigt API-Key in Einstellungen)
-            debug("2️⃣ Versuche OpenAI für \(aktie.bezeichnung) (WKN: \(aktie.wkn))")
-            if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR")")
-                return await kurszielZuEUR(info: info, aktie: aktie)
-            }
-            debug("   ❌ Kein Kursziel gefunden")
-            
-            // 3. finanzen.net Kursziel-Seite – Slug-URL (wie Testroutine, gleiche URL = gleiches Ergebnis)
+            // 2. finanzen.net Kursziel-Seite (OpenAI nur bei unrealistischem Ergebnis – zu langsam) – Slug-URL (wie Testroutine, gleiche URL = gleiches Ergebnis)
             // Ohne Plausibilitätsprüfung, damit identisch zur Testroutine (finanzen.net/kursziele/rheinmetall)
             let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
             for slugVersuch in slugKandidaten {
                 guard !slugVersuch.isEmpty else { continue }
-                debug("3️⃣ Versuche finanzen.net/kursziele/\(slugVersuch)")
+                debug("2️⃣ Versuche finanzen.net/kursziele/\(slugVersuch)")
                 if let info = await fetchKurszielVonFinanzenNetKursziele(slug: slugVersuch) {
                     debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (wie Testroutine)")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 } else {
                     debug("   ❌ Kein Kursziel gefunden")
                 }
             }
             
-            // 4. finanzen.net mit WKN
-            debug("4️⃣ Versuche finanzen.net/kursziele/\(aktie.wkn)")
+            // 3. finanzen.net mit WKN
+            debug("3️⃣ Versuche finanzen.net/kursziele/\(aktie.wkn)")
             if let info = await fetchKurszielVonFinanzenNetKursziele(wkn: aktie.wkn) {
                 debug("   → Gefunden: \(info.kursziel) €")
                 if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                     debug("   ✅ Plausibilitätsprüfung bestanden")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 } else {
                     debug("   ❌ Plausibilitätsprüfung fehlgeschlagen (Referenz: \(refPrice?.description ?? "keine"))")
                 }
@@ -214,12 +218,14 @@ class KurszielService {
             }
             
             // finanzen.net Aktien-Seite
-            debug("4️⃣ Versuche finanzen.net/aktien/\(aktie.wkn)")
+            debug("3️⃣ Versuche finanzen.net/aktien/\(aktie.wkn)")
             if let info = await fetchKurszielVonFinanzenNet(wkn: aktie.wkn) {
                 debug("   → Gefunden: \(info.kursziel) €")
                 if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                     debug("   ✅ Plausibilitätsprüfung bestanden")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 } else {
                     debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                 }
@@ -233,7 +239,9 @@ class KurszielService {
                 debug("   → Gefunden: \(info.kursziel) €")
                 if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                     debug("   ✅ Plausibilitätsprüfung bestanden")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 } else {
                     debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                 }
@@ -248,7 +256,9 @@ class KurszielService {
                     debug("   → Gefunden: \(info.kursziel) €")
                     if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                         debug("   ✅ Plausibilitätsprüfung bestanden")
-                        return await kurszielZuEUR(info: info, aktie: aktie)
+                        let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                        return eurInfo
                     } else {
                         debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                     }
@@ -266,7 +276,9 @@ class KurszielService {
                     debug("   → Gefunden: \(info.kursziel) €")
                     if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                         debug("   ✅ Plausibilitätsprüfung bestanden")
-                        return await kurszielZuEUR(info: info, aktie: aktie)
+                        let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                        return eurInfo
                     } else {
                         debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                     }
@@ -283,7 +295,9 @@ class KurszielService {
                 debug("   → Gefunden: \(info.kursziel) €")
                 if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                     debug("   ✅ Plausibilitätsprüfung bestanden")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 } else {
                     debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                 }
@@ -296,7 +310,9 @@ class KurszielService {
                 debug("   → Gefunden: \(info.kursziel) €")
                 if isValidKursziel(info.kursziel, referencePrice: refPrice) {
                     debug("   ✅ Plausibilitätsprüfung bestanden")
-                    return await kurszielZuEUR(info: info, aktie: aktie)
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
                 } else {
                     debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                 }
@@ -312,6 +328,36 @@ class KurszielService {
     /// true wenn Gattung "Fonds" enthält (nur für Fonds wird der Snippet-Fallback genutzt)
     private static func istFonds(_ aktie: Aktie) -> Bool {
         aktie.gattung.localizedCaseInsensitiveContains("Fonds")
+    }
+    
+    /// Öffentlich für FMP-Bulk/Form: Wendet bei unrealistischem Kursziel OpenAI-Versuch an. Gibt Ersatz oder Original zurück.
+    static func applyOpenAIFallbackBeiUnrealistisch(info: KurszielInfo, refPrice: Double?, aktie: Aktie) async -> KurszielInfo {
+        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: info, refPrice: refPrice, aktie: aktie) {
+            return replacement
+        }
+        return info
+    }
+    
+    /// Optional: Callback für „Übernehmen?“ wenn OpenAI-Ersatz bei unrealistischem Kursziel
+    static var onUnrealistischErsatzBestätigen: ((KurszielInfo, KurszielInfo) async -> Bool)?
+    
+    /// Wenn Kursziel unrealistisch wäre (Abstand > Schwellwert) und API-Key da: versucht OpenAI als Ersatz
+    private static func beiUnrealistischOpenAIVersuchen(eurInfo: KurszielInfo, refPrice: Double?, aktie: Aktie) async -> KurszielInfo? {
+        guard let k = refPrice ?? aktie.devisenkurs, k > 0 else { return nil }
+        let kz = eurInfo.kursziel
+        if kz < k * 0.2 || kz > k * 50 { return nil }
+        let pct = abs((kz - k) / k * 100)
+        let schwellwert = kz > k ? 200.0 : 100.0
+        if pct <= schwellwert { return nil }
+        guard openAIAPIKey != nil else { return nil }
+        debug("   ⚠️ Kursziel \(String(format: "%.2f", kz)) würde als unrealistisch gelten (Abstand \(Int(pct))%). Versuche OpenAI.")
+        guard let openAIInfo = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) else { return nil }
+        let replacement = await kurszielZuEUR(info: openAIInfo, aktie: aktie)
+        if let callback = onUnrealistischErsatzBestätigen {
+            let ok = await callback(eurInfo, replacement)
+            return ok ? replacement : nil
+        }
+        return replacement
     }
     
     /// URL für Snippet-Suche (DuckDuckGo) – zum Anzeigen/Öffnen in der UI
@@ -601,7 +647,7 @@ class KurszielService {
             if let html = String(data: data, encoding: .utf8) {
                 // Suche nach "target" oder "price target" im HTML
                 // Dies ist eine vereinfachte Suche - für robustere Lösung würde man HTML-Parser verwenden
-                if let (kursziel, spalte4, waehrung) = parseKurszielFromHTML(html) {
+                if let (kursziel, spalte4, waehrung, _) = parseKurszielFromHTML(html) {
                     return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: spalte4, quelle: .yahoo, waehrung: waehrung ?? "USD")
                 }
             }
@@ -984,6 +1030,11 @@ class KurszielService {
         }
     }
     
+    /// Öffentlich für Datei-Import: Bereinigt API-Key (BOM, Leerzeichen, unsichtbare Zeichen)
+    static func cleanOpenAIKey(_ raw: String) -> String? {
+        return openAICleanKey(raw)
+    }
+    
     /// Bereinigt API-Key: BOM, Leerzeichen, Zeilenumbrüche entfernen; „k-proj“ → „sk-proj“ falls kopierfehler
     private static func openAICleanKey(_ raw: String) -> String? {
         var key = raw
@@ -1080,36 +1131,49 @@ class KurszielService {
         return key
     }
     
-    /// System-Prompt für OpenAI Finanzdaten-Parser (wie Python-Skript)
-    private static let openAISystemPrompt = """
-    Du bist ein Finanzdaten-Parser. \
-    Du gibst IMMER genau einen Wert zurück: \
-    entweder eine Zahl mit Dezimalpunkt (z.B. 2150.37) oder -1. \
-    Keine Wörter, kein €-Zeichen, keine Leerzeichen, keine Zeilenumbrüche.
-    """
+    /// System-Prompt für OpenAI Kursziel (mit web_search)
+    private static let openAISystemPrompt = "Gib GENAU den Aktienkursziel-Preis in EUR zurück (Zahl mit Dezimalpunkt, z.B. 125.50) oder -1. NIEMALS ISIN, WKN oder andere Kennungen zurückgeben – nur den Kursziel-Preis."
     
-    /// Parst Modellantwort zu Kursziel (wie Python _to_decimal_only): -1 = nil, sonst erste Zahl. Erlaubt 2150.37 und 2.150,37.
+    /// Parst Modellantwort zu Kursziel. Findet plausibelste Zahl (ignoriert Jahre 1990–2030, bevorzugt Werte nahe EUR/€).
     private static func openAIParseKursziel(_ s: String) -> Double? {
         let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed == "-1" { return nil }
         let pattern = #"-?\d[\d\.,]*"#
         let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(in: trimmed, range: nsRange),
-              let range = Range(match.range, in: trimmed) else { return nil }
-        var num = String(trimmed[range])
-        if num.contains(".") && num.contains(",") {
-            let lastComma = num.lastIndex(of: ",") ?? num.startIndex
-            let lastDot = num.lastIndex(of: ".") ?? num.startIndex
-            if lastComma > lastDot {
-                num = num.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
-            } else {
-                num = num.replacingOccurrences(of: ",", with: "")
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let matches = regex.matches(in: trimmed, range: nsRange)
+        var best: Double?
+        var bestScore = -1.0
+        for match in matches {
+            guard let range = Range(match.range, in: trimmed) else { continue }
+            var numStr = String(trimmed[range])
+            if numStr.contains(".") && numStr.contains(",") {
+                let lastComma = numStr.lastIndex(of: ",") ?? numStr.startIndex
+                let lastDot = numStr.lastIndex(of: ".") ?? numStr.startIndex
+                if lastComma > lastDot {
+                    numStr = numStr.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+                } else {
+                    numStr = numStr.replacingOccurrences(of: ",", with: "")
+                }
+            } else if numStr.contains(",") {
+                numStr = numStr.replacingOccurrences(of: ",", with: ".")
             }
-        } else if num.contains(",") {
-            num = num.replacingOccurrences(of: ",", with: ".")
+            guard let val = Double(numStr), val > 0 else { continue }
+            // Jahre ausfiltern (1990–2030)
+            if val >= 1990 && val <= 2030 && val == floor(val) { continue }
+            var score = 0.0
+            if val >= 0.01 && val <= 500_000 { score += 10 }
+            let pos = trimmed.distance(from: trimmed.startIndex, to: range.lowerBound)
+            let ctxStart = max(0, pos - 40)
+            let ctxEnd = min(trimmed.count, pos + numStr.count + 40)
+            let startIdx = trimmed.index(trimmed.startIndex, offsetBy: ctxStart)
+            let endIdx = trimmed.index(trimmed.startIndex, offsetBy: ctxEnd)
+            let context = String(trimmed[startIdx..<endIdx]).lowercased()
+            if context.contains("eur") || context.contains("€") || context.contains("kursziel") || context.contains("ziel") || context.contains("angehoben") { score += 5 }
+            if val == floor(val) && val < 1000 { score += 2 }
+            if score > bestScore { bestScore = score; best = val }
         }
-        return Double(num)
+        return best
     }
     
     /// Liefert die zu verwendende FMP-URL. Wenn gespeicherter Wert mit https:// beginnt: URL so verwenden (nur Symbol ggf. ersetzen).
@@ -1122,8 +1186,18 @@ class KurszielService {
         return URL(string: urlStr)
     }
     
+    /// Öffentlich: Konvertiert KurszielInfo von USD/GBP in EUR (für Button-Flows wie OpenAI, Aus Datei).
+    static func kurszielInfoZuEUR(info: KurszielInfo, aktie: Aktie) async -> KurszielInfo {
+        return await kurszielZuEUR(info: info, aktie: aktie)
+    }
+
     /// Konvertiert KurszielInfo von USD/GBP in EUR (Devisenkurs aus CSV oder Frankfurter-API). Währung Anzeige wird EUR.
+    /// Bei ohneDevisenumrechnung: Wert unverändert übernehmen (nur eine andere Währung in Tabelle).
     private static func kurszielZuEUR(info: KurszielInfo, aktie: Aktie) async -> KurszielInfo {
+        if info.ohneDevisenumrechnung {
+            debug("   💱 Nur eine andere Währung – Wert unverändert übernommen (keine Umrechnung)")
+            return info
+        }
         let w = (info.waehrung ?? "EUR").uppercased()
         guard w == "USD" || w == "GBP" else { return info }
         let rate: Double
@@ -1287,9 +1361,19 @@ class KurszielService {
     }
     
     /// Parst FMP price-target-consensus Response (stable: targetHigh, targetLow, targetConsensus, targetMedian)
+    /// FMP: targetConsensus = Durchschnitt aller Analysten, targetMedian = Median (robuster bei Ausreißern)
+    /// Bevorzugt targetMedian wenn vorhanden – oft näher am Kurs bei UK-Aktien mit wenigen Analysten
     private static func parseFMPConsensusItem(_ item: [String: Any], symbol: String) -> (consensus: Double, high: Double?, low: Double?, analysts: Int?, datum: Date?)? {
+        let median = (item["targetMedian"] as? Double) ?? (item["adjMedian"] as? Double) ?? (item["medianPriceTarget"] as? Double)
         let consensus = (item["targetConsensus"] as? Double) ?? (item["adjConsensus"] as? Double) ?? (item["consensus"] as? Double) ?? (item["consensusPriceTarget"] as? Double) ?? (item["publishedPriceTarget"] as? Double)
-        guard let kursziel = consensus, kursziel > 0 else { return nil }
+        let kz: Double?
+        if let m = median, m > 0 {
+            kz = m
+            debug("   📊 FMP \(symbol): Nutze targetMedian (\(String(format: "%.2f", m))) statt targetConsensus (\(consensus.map { String(format: "%.2f", $0) } ?? "–"))")
+        } else {
+            kz = consensus
+        }
+        guard let kursziel = kz, kursziel > 0 else { return nil }
         let high = (item["targetHigh"] as? Double) ?? (item["adjHighTargetPrice"] as? Double) ?? (item["high"] as? Double) ?? (item["highPriceTarget"] as? Double)
         let low = (item["targetLow"] as? Double) ?? (item["adjLowTargetPrice"] as? Double) ?? (item["low"] as? Double) ?? (item["lowPriceTarget"] as? Double)
         let analysts = item["numberOfAnalysts"] as? Int ?? item["analystCount"] as? Int
@@ -1419,41 +1503,68 @@ class KurszielService {
         }
     }
     
-    /// Testet die OpenAI-Verbindung mit Kursziel-Abfrage (WKN 703000) – Rückgabe: Antwort-Text oder Fehlermeldung
-    static func testOpenAIVerbindung() async -> String {
+    /// Testet die OpenAI-Verbindung mit beliebigem Befehl – Rückgabe: Antwort-Text oder Fehlermeldung
+    /// prompt: z.B. "Gib mir das aktuelle Datum zurück" – nur ein Rückgabewert erwartet
+    static func testOpenAIVerbindung(prompt: String) async -> String {
+        clearDebugLog()
         guard let apiKey = openAIAPIKey, !apiKey.isEmpty else {
             return "API-Key nicht konfiguriert (Einstellungen)"
         }
-        let prompt = "kursziel (nur wert) wkn 703000 in EUR. Suche in finanzen.net."
-        let gesendetPrefix = "Gesendet:\n\"\(prompt)\""
+        let userPrompt = prompt.trimmingCharacters(in: .whitespaces)
+        guard !userPrompt.isEmpty else {
+            return "Befehl ist leer"
+        }
+        let systemPrompt = "Gib nur genau einen Wert zurück. Keine Erklärungen, keine Wörter drumherum. Nur die Antwort."
+        let responsesURL = "https://api.openai.com/v1/responses"
+        let chatURL = "https://api.openai.com/v1/chat/completions"
+        debug("━━━ OpenAI Verbindungstest ━━━")
+        debug("   URL (Responses): \(responsesURL)")
+        debug("   URL (Fallback Chat): \(chatURL)")
+        debug("   Befehl: \(userPrompt)")
         do {
-            let content = try await openAICallWithFallback(systemPrompt: openAISystemPrompt, userPrompt: prompt, apiKey: apiKey)
+            let content = try await openAICallWithFallback(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey)
             let trimmed = content.trimmingCharacters(in: .whitespaces)
-            return "\(gesendetPrefix)\n\n✅ Verbindung OK\nAntwort: \(trimmed.isEmpty ? "(leer)" : trimmed)"
+            debug("   Antwort: \(trimmed.isEmpty ? "(leer)" : trimmed)")
+            var result = "URL: \(responsesURL)\n(bzw. \(chatURL) bei Fallback)\n\nBefehl (Klartext):\n\"\(userPrompt)\"\n\n✅ Verbindung OK\nAntwort: \(trimmed.isEmpty ? "(leer)" : trimmed)"
+            return result
         } catch {
-            return "\(gesendetPrefix)\n\nFehler: \(error.localizedDescription)"
+            debug("   ❌ Fehler: \(error.localizedDescription)")
+            return "URL: \(responsesURL)\n(bzw. \(chatURL) bei Fallback)\n\nBefehl (Klartext):\n\"\(userPrompt)\"\n\nFehler: \(error.localizedDescription)"
         }
     }
     
-    /// Ruft OpenAI ab – Responses API zuerst, bei Fehler Fallback zu Chat Completions
+    /// Modell: gpt-4o mit web_search (Responses API), Fallback Chat Completions
+    private static let openAIModelPrimary = "gpt-4o"
+    private static let openAIModelFallback = "gpt-4o"
+    
+    /// Ruft OpenAI ab – Responses API mit gpt-4o-mini zuerst, bei Fehler Chat Completions
     private static func openAICallWithFallback(systemPrompt: String, userPrompt: String, apiKey: String) async throws -> String {
         do {
-            return try await openAICallResponsesAPI(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey)
+            return try await openAICallResponsesAPI(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey, model: openAIModelPrimary)
         } catch {
-            return try await openAICallChatCompletions(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey)
+            return try await openAICallChatCompletions(systemPrompt: systemPrompt, userPrompt: userPrompt, apiKey: apiKey, model: openAIModelFallback)
         }
     }
     
-    /// Responses API (v1/responses)
-    private static func openAICallResponsesAPI(systemPrompt: String, userPrompt: String, apiKey: String) async throws -> String {
+    /// Responses API (v1/responses) – gpt-4o mit web_search
+    private static func openAICallResponsesAPI(systemPrompt: String, userPrompt: String, apiKey: String, model: String = openAIModelPrimary) async throws -> String {
         let url = URL(string: "https://api.openai.com/v1/responses")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.timeoutInterval = 30
-        let combinedInput = "\(systemPrompt)\n\n\(userPrompt)"
-        let body: [String: Any] = ["model": "gpt-5-nano", "input": combinedInput]
+        request.timeoutInterval = 60
+        let input: [[String: String]] = [
+            ["role": "system", "content": systemPrompt],
+            ["role": "user", "content": userPrompt]
+        ]
+        let body: [String: Any] = [
+            "model": model,
+            "tools": [["type": "web_search"]],
+            "tool_choice": ["type": "web_search"],
+            "temperature": 0,
+            "input": input
+        ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else { throw NSError(domain: "OpenAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Keine HTTP-Antwort"]) }
@@ -1468,7 +1579,7 @@ class KurszielService {
     }
     
     /// Chat Completions API (Fallback) – choices[0].message.content
-    private static func openAICallChatCompletions(systemPrompt: String, userPrompt: String, apiKey: String) async throws -> String {
+    private static func openAICallChatCompletions(systemPrompt: String, userPrompt: String, apiKey: String, model: String = openAIModelFallback) async throws -> String {
         let url = URL(string: "https://api.openai.com/v1/chat/completions")!
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -1476,7 +1587,7 @@ class KurszielService {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.timeoutInterval = 30
         let body: [String: Any] = [
-            "model": "gpt-5-nano",
+            "model": model,
             "messages": [
                 ["role": "system", "content": systemPrompt],
                 ["role": "user", "content": userPrompt]
@@ -1522,17 +1633,37 @@ class KurszielService {
         return nil
     }
     
-    /// Ruft Kursziel von OpenAI ab (gpt-4o-mini) – benötigt API-Key in Einstellungen
+    /// Ruft Kursziel von OpenAI ab (gpt-4o mit web_search) – benötigt API-Key in Einstellungen
     static func fetchKurszielVonOpenAI(wkn: String, bezeichnung: String? = nil, isin: String? = nil) async -> KurszielInfo? {
         guard let apiKey = openAIAPIKey, !apiKey.isEmpty else {
             debug("   ❌ OpenAI API-Key nicht konfiguriert (Einstellungen)")
             return nil
         }
         debug("   🔑 OpenAI API-Key geladen (Länge \(apiKey.count), Format: \(apiKey.hasPrefix("sk-") ? "sk-... ✓" : "Präfix prüfen"))")
-        guard !wkn.isEmpty else { return nil }
+        let isinTrimmed = isin?.trimmingCharacters(in: .whitespaces)
+        let hasISIN = (isinTrimmed?.count ?? 0) >= 10
+        guard hasISIN || !wkn.isEmpty else {
+            debug("   ❌ Weder ISIN (≥10 Zeichen) noch WKN vorhanden")
+            return nil
+        }
         
-        let prompt = "kursziel (nur wert) wkn \(wkn) in EUR. Suche in finanzen.net."
+        if hasISIN {
+            debug("   📌 Verwende ISIN: \(isinTrimmed ?? "")")
+        } else {
+            debug("   📌 ISIN leer/zu kurz, verwende WKN: \(wkn)")
+        }
+        
+        var prompt = "Aktienkursziel für "
+        if let bez = bezeichnung, !bez.isEmpty { prompt += "\(bez) " }
+        prompt += "("
+        if hasISIN, let isin = isinTrimmed {
+            prompt += "ISIN \(isin)"
+        } else {
+            prompt += "WKN \(wkn)"
+        }
+        prompt += "). Nur den Kursziel-Preis in EUR (z.B. 125.50), nicht ISIN/WKN."
         debug("   📤 OpenAI Request (Responses API): \(prompt)")
+        debug("   📡 Sende an https://api.openai.com/v1/responses ...")
         
         do {
             let content = try await openAICallWithFallback(systemPrompt: openAISystemPrompt, userPrompt: prompt, apiKey: apiKey)
@@ -1543,11 +1674,25 @@ class KurszielService {
                 debug("   ❌ OpenAI: Antwort konnte nicht geparst werden oder < 0")
                 return nil
             }
-            let waehrung = trimmed.uppercased().contains("USD") ? "USD" : "EUR"
+            // Verhindern: Modell gibt ISIN/WKN-Ziffern statt Kursziel zurück (z.B. 11821202 aus DE00011821202)
+            let kurszielStr = String(format: "%.0f", kursziel)
+            if kurszielStr.count >= 7, let isin = isinTrimmed, isin.contains(kurszielStr) {
+                debug("   ❌ OpenAI: Rückgabe sieht nach ISIN-Kennung aus (\(kurszielStr)), nicht nach Kursziel – ignoriert")
+                return nil
+            }
+            if kursziel >= 1_000_000, kursziel == floor(kursziel) {
+                debug("   ❌ OpenAI: Unplausibel hoher ganzzahliger Wert (\(kursziel)) – evtl. ISIN, ignoriert")
+                return nil
+            }
+            let waehrung = (trimmed.contains("$") || trimmed.uppercased().contains("USD")) ? "USD" : "EUR"
             debug("   ✅ OpenAI: \(kursziel) \(waehrung)")
             return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: nil, quelle: .openAI, waehrung: waehrung)
         } catch {
+            let nsErr = error as NSError
             debug("   ❌ OpenAI Fehler: \(error.localizedDescription)")
+            if nsErr.domain == NSURLErrorDomain {
+                debug("   📡 Netzwerk-Code: \(nsErr.code) – prüfe App-Sandbox: com.apple.security.network.client")
+            }
             return nil
         }
     }
@@ -1600,9 +1745,9 @@ class KurszielService {
                 let preview = String(html.prefix(500))
                 debug("   📋 HTML-Vorschau: \(preview)...")
                 
-                if let (kursziel, spalte4, waehrung) = parseKurszielFromHTML(html, urlString: urlString) {
+                if let (kursziel, spalte4, waehrung, ohneUmrechnung) = parseKurszielFromHTML(html, urlString: urlString) {
                     debug("   ✅ Kursziel aus HTML geparst: \(kursziel) \(waehrung ?? "EUR")" + (spalte4.map { ", Spalte 4: \($0)" } ?? ""))
-                    return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: spalte4, quelle: .finanzenNet, waehrung: waehrung ?? "EUR")
+                    return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: spalte4, quelle: .finanzenNet, waehrung: waehrung ?? "EUR", ohneDevisenumrechnung: ohneUmrechnung)
                 } else {
                     debug("   ❌ Kein Kursziel im HTML gefunden")
                 }
@@ -1617,11 +1762,11 @@ class KurszielService {
     }
     
     /// Extrahiert Kursziel aus HTML-Tabellen
-    /// Sucht nach Tabellen mit "Analyst" oder "Kursziel" als Überschriftsfeld
+    /// Sucht nach Tabellen mit "Analyst"/"Analysten" und "Kursziel" als Überschriftsfeld
     /// urlString für Slug-Extraktion (z. B. /kursziele/allianz → allianz) bei Buy/Hold-Tabelle
-    /// Rückgabe: (Kursziel-Durchschnitt, Spalte-4-Durchschnitt?, Währung "EUR"/"USD"?)
-    private static func extractKurszielFromHTMLTables(_ html: String, urlString: String? = nil) -> (Double, Double?, String?)? {
-        debug("   🔍 Suche nach Tabellen mit 'Analyst' oder 'Kursziel' als Überschrift...")
+    /// Rückgabe: (Kursziel-Durchschnitt, Spalte-4-Durchschnitt?, Währung, ohneDevisenumrechnung wenn nur eine andere Währung)
+    private static func extractKurszielFromHTMLTables(_ html: String, urlString: String? = nil) -> (Double, Double?, String?, Bool)? {
+        debug("   🔍 Suche nach Tabellen mit 'Analyst'/'Analysten' und 'Kursziel' als Überschrift...")
         
         // Finde alle <table> Tags
         let tablePattern = "<table[^>]*>([\\s\\S]*?)</table>"
@@ -1669,7 +1814,7 @@ class KurszielService {
                         let rowHTML = String(tableHTML[trRange])
                         let rowHeaders = extractTableHeaders(from: rowHTML)
                         let rowText = rowHeaders.joined(separator: " ").lowercased()
-                        let hatAnalyst = rowHeaders.contains { $0.lowercased().contains("analyst") }
+                        let hatAnalyst = rowHeaders.contains { $0.lowercased().contains("analyst") || $0.lowercased().contains("analysten") }
                         let hatKursziel = rowHeaders.contains { h in
                             let l = h.lowercased()
                             return l.contains("kursziel") && !l.contains("marktkap") && !l.contains("kapitalisierung")
@@ -1724,8 +1869,9 @@ class KurszielService {
                                 if let betrag = parseNumberFromTable(betragStr), betrag > 0 {
                                     let w = waehrungAusZelle(betragStr) ?? "EUR"
                                     let abstand = parseNumberFromTable(abstandStr)
-                                    debug("   ✅ Variant 2: Zeile gefunden – \(betrag) \(w), Abstand \(abstand.map { "\($0)%" } ?? "–")")
-                                    return (betrag, abstand, w)
+                                    let ohneUmr = (w == "USD" || w == "GBP")
+                                    debug("   ✅ Variant 2: Zeile gefunden – \(betrag) \(w), Abstand \(abstand.map { "\($0)%" } ?? "–")" + (ohneUmr ? " (ohne Umrechnung)" : ""))
+                                    return (betrag, abstand, w, ohneUmr)
                                 }
                             }
                         }
@@ -1735,8 +1881,8 @@ class KurszielService {
                 debug("   ⏭️  Variant 2: Kein Slug aus URL, überspringe")
             }
             
-            // Variant 1 zuerst prüfen – Analyst+Kursziel-Tabelle hat Vorrang (auch wenn „buy“/„sell“ im HTML vorkommt, z. B. Siemens Energy)
-            let hasAnalyst = headers.contains { $0.lowercased().contains("analyst") }
+            // Variant 1 zuerst prüfen – Analyst/Analysten+Kursziel-Tabelle hat Vorrang (auch wenn „buy“/„sell“ im HTML vorkommt)
+            let hasAnalyst = headers.contains { $0.lowercased().contains("analyst") || $0.lowercased().contains("analysten") }
             let hasKursziel = headers.contains { header in
                 let h = header.lowercased()
                 return h.contains("kursziel") && !h.contains("marktkap") && !h.contains("kapitalisierung")
@@ -1853,6 +1999,8 @@ class KurszielService {
                 
                 let spalteBetrag = kurszielColumnIndex ?? 2   // Kursziel-Spalte aus Header, Fallback 2
                 debug("   📐 Spalten-Mapping: Kursziel = Index \(spalteBetrag), Abstand % = Spalte direkt danach")
+                // Pivot-/Werbungstabellen überspringen (z. B. Schokolade-Werbung) – danach folgen die echten Daten mit |
+                let pivotStichwoerter = ["schokolade", "werbung", "pivot", "sponsored", "anzeige", "rabatt", "angebot"]
                 var verarbeitungGestartet = false
                 var summeEUR: Decimal = 0
                 var summeUSD: Decimal = 0
@@ -1867,6 +2015,13 @@ class KurszielService {
                 for (rowIdx, row) in rows.enumerated() {
                     let rowMitPipe = row.joined(separator: " | ")
                     let hatPipe = rowMitPipe.contains("|")
+                    let rowLower = rowMitPipe.lowercased()
+                    
+                    // Pivot/Werbung überspringen (z. B. Schokolade-Anzeige) – darüber hinweglesen
+                    if hatPipe && pivotStichwoerter.contains(where: { rowLower.contains($0) }) {
+                        debug("   ⏭️  Überspringe Zeile \(rowIdx+1) – Pivot/Werbung erkannt")
+                        continue
+                    }
                     
                     // Start: Erstes | gefunden → Verarbeitung beginnen
                     if !verarbeitungGestartet {
@@ -1936,16 +2091,22 @@ class KurszielService {
                     }
                 }
                 
-                // Bei gemischten Währungen: EUR bevorzugt, sonst GBP, sonst USD. GBP wird später in EUR umgerechnet.
-                let (summeBetrag, anzahlZeilen, erkannteWaehrung): (Decimal, Int, String?) = {
+                // Bei gemischten Währungen: EUR bevorzugt. Nur eine andere Währung → ohne Devisenumrechnung übernehmen.
+                let (summeBetrag, anzahlZeilen, erkannteWaehrung, ohneUmrechnung): (Decimal, Int, String?, Bool) = {
                     if anzahlEUR > 0 && (anzahlUSD > 0 || anzahlGBP > 0) {
                         debug("   ⚠️  Gemischte Währungen – nur EUR-Zeilen (\(anzahlEUR)) werden bewertet")
-                        return (summeEUR, anzahlEUR, "EUR")
+                        return (summeEUR, anzahlEUR, "EUR", false)
                     }
-                    if anzahlEUR > 0 { return (summeEUR, anzahlEUR, "EUR") }
-                    if anzahlGBP > 0 { return (summeGBP, anzahlGBP, "GBP") }
-                    if anzahlUSD > 0 { return (summeUSD, anzahlUSD, "USD") }
-                    return (0, 0, nil)
+                    if anzahlEUR > 0 { return (summeEUR, anzahlEUR, "EUR", false) }
+                    if anzahlGBP > 0 {
+                        debug("   📌 Nur GBP-Zeilen – Wert unverändert (keine Devisenumrechnung)")
+                        return (summeGBP, anzahlGBP, "GBP", true)
+                    }
+                    if anzahlUSD > 0 {
+                        debug("   📌 Nur USD-Zeilen – Wert unverändert (keine Devisenumrechnung)")
+                        return (summeUSD, anzahlUSD, "USD", true)
+                    }
+                    return (0, 0, nil, false)
                 }()
                 
                 // Ergebnis: Summen getrennt + finale Währung – im Debug anzeigen
@@ -1959,7 +2120,7 @@ class KurszielService {
                     let durchschnitt = summeBetrag / Decimal(anzahlZeilen)
                     let durchschnittDouble = NSDecimalNumber(decimal: durchschnitt).doubleValue
                     let spalte4Double = durchschnittSp4.map { NSDecimalNumber(decimal: $0).doubleValue }
-                    return (durchschnittDouble, spalte4Double, erkannteWaehrung)
+                    return (durchschnittDouble, spalte4Double, erkannteWaehrung, ohneUmrechnung)
                 } else {
                     debug("   ⚠️  Keine gültigen Beträge in Spalte 3 gefunden")
                 }
@@ -2123,14 +2284,14 @@ class KurszielService {
     }
     
     /// Parst Kursziel aus HTML
-    /// Rückgabe: (Kursziel, Spalte-4-Durchschnitt?, Währung?)
-    private static func parseKurszielFromHTML(_ html: String, urlString: String? = nil) -> (Double, Double?, String?)? {
+    /// Rückgabe: (Kursziel, Spalte-4-Durchschnitt?, Währung?, ohneDevisenumrechnung)
+    private static func parseKurszielFromHTML(_ html: String, urlString: String? = nil) -> (Double, Double?, String?, Bool)? {
         debug("   🔍 Starte HTML-Parsing...")
         
         // NEUE METHODE: Versuche zuerst HTML-Tabellen zu extrahieren
-        if let (kursziel, spalte4, waehrung) = extractKurszielFromHTMLTables(html, urlString: urlString) {
-            debug("   ✅ Kursziel aus HTML-Tabelle extrahiert: \(kursziel) \(waehrung ?? "EUR")" + (spalte4.map { ", Spalte 4: \($0)" } ?? ""))
-            return (kursziel, spalte4, waehrung)
+        if let (kursziel, spalte4, waehrung, ohneUmrechnung) = extractKurszielFromHTMLTables(html, urlString: urlString) {
+            debug("   ✅ Kursziel aus HTML-Tabelle extrahiert: \(kursziel) \(waehrung ?? "EUR")" + (spalte4.map { ", Spalte 4: \($0)" } ?? "") + (ohneUmrechnung ? " (ohne Umrechnung)" : ""))
+            return (kursziel, spalte4, waehrung, ohneUmrechnung)
         }
         
         debug("   ⚠️  Keine passende Tabelle gefunden, verwende Regex-Parsing...")
@@ -2188,7 +2349,7 @@ class KurszielService {
                         debug("   📌 Pattern \(index+1) gefunden: '\(kurszielString)'")
                         if let kursziel = parseNumber(kurszielString), kursziel >= 1.0 {
                             debug("   ✅ Geparst als: \(kursziel) €")
-                            return (kursziel, nil, nil)
+                            return (kursziel, nil, nil, false)
                         } else {
                             debug("   ❌ Konnte nicht als Zahl geparst werden oder < 1.0")
                         }
@@ -2224,7 +2385,7 @@ class KurszielService {
                                 // Berechne Durchschnitt
                                 let durchschnitt = (min + max) / 2.0
                                 if durchschnitt >= 1.0 {
-                                    return (durchschnitt, nil, nil)
+                                    return (durchschnitt, nil, nil, false)
                                 }
                             }
                         }
@@ -2251,7 +2412,7 @@ class KurszielService {
                        let kurszielRange = Range(match.range(at: 1), in: html) {
                         let kurszielString = String(html[kurszielRange])
                         if let kursziel = parseNumber(kurszielString), kursziel >= 1.0 {
-                            return (kursziel, nil, nil)
+                            return (kursziel, nil, nil, false)
                         }
                     }
                 }

@@ -1,0 +1,6 @@
+# API-Keys und sensible Daten (niemals committen!)
+openai_key.local
+*_key.local
+
+# Test-Ergebnisse
+openai_kursziel_result.json

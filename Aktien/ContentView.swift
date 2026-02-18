@@ -7,10 +7,40 @@
 
 import SwiftUI
 import SwiftData
+import Observation
 import UniformTypeIdentifiers
 #if os(macOS)
 import AppKit
 #endif
+
+/// Hilft bei Bestätigung „OpenAI-Ersatz übernehmen?“ wenn Kursziel unrealistisch
+@Observable
+final class UnrealistischConfirmHelper {
+    static let shared = UnrealistischConfirmHelper()
+    var isPresented = false
+    var original: KurszielInfo?
+    var replacement: KurszielInfo?
+    private var continuation: CheckedContinuation<Bool, Never>?
+    
+    @MainActor
+    func confirm(original: KurszielInfo, replacement: KurszielInfo) async -> Bool {
+        await withCheckedContinuation { cont in
+            self.original = original
+            self.replacement = replacement
+            self.continuation = cont
+            self.isPresented = true
+        }
+    }
+    
+    @MainActor
+    func choose(_ result: Bool) {
+        continuation?.resume(returning: result)
+        continuation = nil
+        isPresented = false
+        original = nil
+        replacement = nil
+    }
+}
 
 /// Gespeichertes manuelles Kursziel für Wiedereinsetzen nach „Alles löschen“ und erneutem Einlesen (Zuordnung über ISIN/WKN)
 private struct SavedManualKursziel: Codable {
@@ -136,12 +166,13 @@ extension Aktie {
         return kz >= kurs * 0.2 && kz <= kurs * 50
     }
     
-    /// Anzeige „Unrealistisch“: nur bei unplausibel oder Abstand zum Kursziel > 100 %
+    /// Anzeige „Unrealistisch“: nur bei unplausibel oder Abstand zu groß (Aufwärtspotenzial: 200 %, Abwärts: 100 %)
     var zeigeAlsUnrealistisch: Bool {
         if !isKurszielPlausibel { return true }
         guard let kz = kursziel, let k = kurs ?? devisenkurs, k > 0 else { return false }
         let pct = abs((kz - k) / k * 100)
-        return pct > 100
+        let schwellwert = kz > k ? 200.0 : 100.0
+        return pct > schwellwert
     }
     
     /// Ermittelt den Status für die Listenanzeige
@@ -192,6 +223,7 @@ struct ContentView: View {
     /// Daten liegen vor dem Tagesdatum → nach OK Abfrage anzeigen, ob Kursziele ermittelt werden sollen (zeitaufwendig).
     @State private var showKurszielAbfrageBeiAltemDatum = false
     @State private var showKurszielAbfrageAlert = false
+    @State private var unrealistischConfirm = UnrealistischConfirmHelper.shared
     
     /// Filter nach Kursziel-Quelle: Aus = alle, sonst nur die gewählte Quelle
     enum KurszielQuelleFilter: String, CaseIterable {
@@ -719,6 +751,21 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
         }
+        .confirmationDialog("OpenAI-Ersatz übernehmen?", isPresented: $unrealistischConfirm.isPresented) {
+            Button("Ja, übernehmen") {
+                unrealistischConfirm.choose(true)
+            }
+            Button("Nein, nicht übernehmen") {
+                unrealistischConfirm.choose(false)
+            }
+            Button("Abbrechen", role: .cancel) {
+                unrealistischConfirm.choose(false)
+            }
+        } message: {
+            if let orig = unrealistischConfirm.original, let repl = unrealistischConfirm.replacement {
+                Text("Original: \(String(format: "%.2f", orig.kursziel)) \(orig.waehrung ?? "EUR"). OpenAI-Ersatz: \(String(format: "%.2f", repl.kursziel)) \(repl.waehrung ?? "EUR"). Übernehmen?")
+            }
+        }
     }
 
     private func importCSVFiles() {
@@ -933,6 +980,9 @@ struct ContentView: View {
             aktuelleKurszielAktie = nil
         }
         KurszielService.clearDebugLog()
+        KurszielService.onUnrealistischErsatzBestätigen = { original, replacement in
+            await UnrealistischConfirmHelper.shared.confirm(original: original, replacement: replacement)
+        }
         
         // Nicht überschreiben: manuell geändert oder aus CSV (C), außer „Alle überschreiben“ ist an
         let sollUeberschreiben: (Aktie) -> Bool = { forceOverwrite || (!$0.kurszielManuellGeaendert && $0.kurszielQuelle != "C") }
@@ -963,7 +1013,7 @@ struct ContentView: View {
             
             var info: KurszielInfo? = nil
             if let fmpInfo = fmpCache[aktie.wkn] {
-                info = fmpInfo
+                info = await KurszielService.applyOpenAIFallbackBeiUnrealistisch(info: fmpInfo, refPrice: aktie.kurs ?? aktie.einstandskurs, aktie: aktie)
             } else {
                 info = await KurszielService.fetchKursziel(for: aktie)
             }
@@ -1000,6 +1050,7 @@ struct ContentView: View {
             isImportingKursziele = false
             aktuelleKurszielAktie = nil
         }
+        KurszielService.onUnrealistischErsatzBestätigen = nil
     }
     
     private func deleteAllAktien() {
@@ -1088,6 +1139,7 @@ struct KurszielListenView: View {
     /// Wird aufgerufen, wenn „Kursziel suchen“ getippt wird → Zeile blau markieren; beim nächsten Tipp auf andere Zeile Markierung verschieben
     var onKurszielSuchenTapped: ((String) -> Void)? = nil
     @Environment(\.modelContext) private var modelContext
+    @State private var showDebugLog = false
     private let finanzenNetAnalysenURL = URL(string: "https://www.finanzen.net/analysen")!
     
     var body: some View {
@@ -1130,16 +1182,24 @@ struct KurszielListenView: View {
         }
         .scrollDismissesKeyboard(.interactively)
         .navigationTitle("Kursziele")
-        #if os(iOS)
         .toolbar {
+            ToolbarItem(placement: .topBarTrailing) {
+                Button(action: { showDebugLog = true }) {
+                    Label("Debug-Log", systemImage: "ladybug")
+                }
+            }
+            #if os(iOS)
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
                 Button("Fertig") {
                     UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
                 }
             }
+            #endif
         }
-        #endif
+        .sheet(isPresented: $showDebugLog) {
+            DebugLogSheet()
+        }
     }
 }
 
@@ -1155,6 +1215,13 @@ private struct KurszielZeileView: View {
     @State private var showFMPTest = false
     @State private var showFinanzenNetTest = false
     @State private var showSnippetTest = false
+    @State private var showOpenAIDebug = false
+    @State private var isLoadingOpenAI = false
+    @State private var showOpenAIFileImporter = false
+    @State private var pendingKurszielFromFile: Double? = nil
+    @State private var showKurszielFromFileConfirm = false
+    @State private var pendingOpenAIInfo: KurszielInfo? = nil
+    @State private var showOpenAIÜbernehmenConfirm = false
     
     private var istFonds: Bool { aktie.gattung.localizedCaseInsensitiveContains("Fonds") }
     
@@ -1306,7 +1373,7 @@ private struct KurszielZeileView: View {
                             .foregroundColor(.secondary)
                     }
                 }
-                // finanzen.net testen + FMP testen + Snippet testen (nur Fonds) + Kursziel suchen
+                // finanzen.net testen + FMP testen + OpenAI + Snippet testen (nur Fonds) + Kursziel suchen
                 HStack {
                     Spacer()
                     Button("finanzen.net") {
@@ -1317,6 +1384,19 @@ private struct KurszielZeileView: View {
                     .controlSize(.small)
                     Button("FMP testen") {
                         showFMPTest = true
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    Button("OpenAI") {
+                        loadKurszielViaOpenAI()
+                    }
+                    .font(.caption)
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isLoadingOpenAI)
+                    Button("Aus Datei") {
+                        showOpenAIFileImporter = true
                     }
                     .font(.caption)
                     .buttonStyle(.bordered)
@@ -1353,6 +1433,176 @@ private struct KurszielZeileView: View {
         }
         .sheet(isPresented: $showSnippetTest) {
             SnippetTestSheetView(aktie: aktie, modelContext: modelContext, onRowEdited: onRowEdited)
+        }
+        .fileImporter(isPresented: $showOpenAIFileImporter, allowedContentTypes: [.json], allowsMultipleSelection: false) { result in
+            loadKurszielFromFile(result: result)
+        }
+        .confirmationDialog("Kursziel übernehmen?", isPresented: $showKurszielFromFileConfirm) {
+            Button("Ja") {
+                if let kz = pendingKurszielFromFile {
+                    aktie.kursziel = kz
+                    aktie.kurszielDatum = Date()
+                    aktie.kurszielQuelle = "A"
+                    aktie.kurszielWaehrung = "EUR"
+                    aktie.kurszielManuellGeaendert = false
+                    try? modelContext.save()
+                    onRowEdited?(aktie.isin)
+                }
+                pendingKurszielFromFile = nil
+            }
+            Button("Nein", role: .cancel) {
+                pendingKurszielFromFile = nil
+            }
+        } message: {
+            if let kz = pendingKurszielFromFile {
+                Text("Kursziel \(String(format: "%.2f", kz)) EUR aus Datei übernehmen?")
+            }
+        }
+        .confirmationDialog("Kursziel übernehmen?", isPresented: $showOpenAIÜbernehmenConfirm) {
+            Button("Ja, übernehmen") {
+                if let info = pendingOpenAIInfo {
+                    aktie.kursziel = info.kursziel
+                    aktie.kurszielDatum = info.datum
+                    aktie.kurszielAbstand = info.spalte4Durchschnitt
+                    aktie.kurszielQuelle = info.quelle.rawValue
+                    aktie.kurszielWaehrung = info.waehrung
+                    aktie.kurszielManuellGeaendert = false
+                    try? modelContext.save()
+                    onRowEdited?(aktie.isin)
+                }
+                pendingOpenAIInfo = nil
+            }
+            Button("Nein, nicht übernehmen") {
+                pendingOpenAIInfo = nil
+            }
+            Button("Abbrechen", role: .cancel) {
+                pendingOpenAIInfo = nil
+            }
+        } message: {
+            if let info = pendingOpenAIInfo {
+                Text("Kursziel \(String(format: "%.2f", info.kursziel)) \(info.waehrung ?? "EUR") von OpenAI übernehmen?")
+            }
+        }
+    }
+    
+    /// Extrahiert erste Zahl aus Text (z.B. "125.50 USD" → 125.5)
+    private func extractFirstNumber(from s: String) -> Double? {
+        let pattern = #"\d+(?:[.,]\d+)?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: s, range: NSRange(s.startIndex..., in: s)),
+              let range = Range(match.range, in: s) else { return nil }
+        var numStr = String(s[range]).replacingOccurrences(of: ",", with: ".")
+        return Double(numStr)
+    }
+
+    /// Demo-Umweg: Kursziel aus openai_kursziel_result.json lesen (Skript im Terminal ausführen, dann Datei wählen)
+    private func loadKurszielFromFile(result: Result<[URL], Error>) {
+        KurszielService.clearDebugLog()
+        KurszielService.debugAppend("━━━ Kursziel aus Datei (Demo-Umweg) ━━━")
+        switch result {
+        case .success(let urls):
+            guard let url = urls.first else {
+                KurszielService.debugAppend("   ❌ Keine Datei gewählt")
+                return
+            }
+            guard url.startAccessingSecurityScopedResource() else {
+                KurszielService.debugAppend("   ❌ Kein Zugriff auf Datei")
+                return
+            }
+            defer { url.stopAccessingSecurityScopedResource() }
+            do {
+                let data = try Data(contentsOf: url)
+                guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let output = json["output"] as? [[String: Any]] else {
+                    KurszielService.debugAppend("   ❌ Ungültiges Format (erwarte output[])")
+                    return
+                }
+                var kursziel: Double?
+                var istUSD = false
+                for item in output {
+                    for c in (item["content"] as? [[String: Any]]) ?? [] {
+                        if (c["type"] as? String) == "output_text", let t = c["text"] as? String {
+                            let trimmed = t.trimmingCharacters(in: .whitespaces)
+                            if let v = Double(trimmed.replacingOccurrences(of: ",", with: ".")), v > 0 {
+                                kursziel = v
+                                istUSD = trimmed.contains("$") || trimmed.uppercased().contains("USD")
+                                break
+                            }
+                            // Fallback: Zahl aus Text mit Währung (z.B. "125.50 USD" oder "125.50 $")
+                            if let v = extractFirstNumber(from: trimmed), v > 0 {
+                                kursziel = v
+                                istUSD = trimmed.contains("$") || trimmed.uppercased().contains("USD")
+                                break
+                            }
+                        }
+                    }
+                    if kursziel != nil { break }
+                }
+                var kzGültig = kursziel
+                if let kz = kursziel, kz > 0 {
+                    // Verhindern: ISIN-Ziffern statt Kursziel (z.B. 11821202 aus DE00011821202)
+                    let kzStr = String(format: "%.0f", kz)
+                    if kzStr.count >= 7, !aktie.isin.isEmpty, aktie.isin.contains(kzStr) {
+                        KurszielService.debugAppend("   ❌ Gelesener Wert (\(kzStr)) sieht nach ISIN aus, nicht Kursziel")
+                        kzGültig = nil
+                    } else if kz >= 1_000_000, kz == floor(kz) {
+                        KurszielService.debugAppend("   ❌ Unplausibel hoher Wert (\(kz)) – evtl. ISIN, ignoriert")
+                        kzGültig = nil
+                    }
+                }
+                if let kz = kzGültig, kz > 0 {
+                    if istUSD {
+                        Task {
+                            let info = KurszielInfo(kursziel: kz, datum: Date(), spalte4Durchschnitt: nil, quelle: .openAI, waehrung: "USD")
+                            let eurInfo = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
+                            await MainActor.run {
+                                KurszielService.debugAppend("   ✅ Gelesen: \(kz) USD → \(String(format: "%.2f", eurInfo.kursziel)) EUR")
+                                pendingKurszielFromFile = eurInfo.kursziel
+                                showKurszielFromFileConfirm = true
+                            }
+                        }
+                    } else {
+                        KurszielService.debugAppend("   ✅ Gelesen: \(kz) EUR")
+                        pendingKurszielFromFile = kz
+                        showKurszielFromFileConfirm = true
+                    }
+                } else {
+                    KurszielService.debugAppend("   ❌ Kein Kursziel in Datei gefunden")
+                }
+            } catch {
+                KurszielService.debugAppend("   ❌ Fehler: \(error.localizedDescription)")
+            }
+        case .failure(let error):
+            KurszielService.debugAppend("   ❌ Datei-Auswahl: \(error.localizedDescription)")
+        }
+    }
+    
+    private func loadKurszielViaOpenAI() {
+        guard KurszielService.openAIAPIKey != nil else {
+            KurszielService.clearDebugLog()
+            KurszielService.debugLog.append("[\(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))] ❌ OpenAI API-Key nicht konfiguriert (Einstellungen)")
+            return
+        }
+        isLoadingOpenAI = true
+        KurszielService.clearDebugLog()
+        KurszielService.debugAppend("━━━ OpenAI Kursziel (Button) ━━━")
+        KurszielService.debugAppend("   Aktie: \(aktie.bezeichnung), WKN: \(aktie.wkn), ISIN: \(aktie.isin)")
+        Task {
+            if var info = await KurszielService.fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
+                await MainActor.run {
+                    KurszielService.debugAppend("   ✅ Erfolg: \(info.kursziel) \(info.waehrung ?? "EUR")")
+                    pendingOpenAIInfo = info
+                    showOpenAIÜbernehmenConfirm = true
+                }
+            } else {
+                await MainActor.run {
+                    KurszielService.debugAppend("   ❌ Kein Kursziel erhalten")
+                }
+            }
+            await MainActor.run {
+                isLoadingOpenAI = false
+            }
         }
     }
     
@@ -2148,9 +2398,13 @@ struct WKNTesterView: View {
     var openAIFromSettings: String = ""
     @State private var debugLog: [String] = []
     @State private var selectedTestQuelle: WKNTestQuelle = .finanzenNet
+    @State private var openAITestBefehl = "Gib mir das aktuelle Datum zurück"
     @Environment(\.dismiss) private var dismiss
     
-    /// Klartext des Befehls (OpenAI-Prompt oder URL mit maskiertem Key)
+    private static let openAIResponsesURL = "https://api.openai.com/v1/responses"
+    private static let openAIChatURL = "https://api.openai.com/v1/chat/completions"
+    
+    /// Klartext des Befehls (OpenAI-Prompt oder URL mit maskiertem Key) – nur für FMP/finanzen.net
     private var befehlKlartext: String {
         let raw = wkn.trimmingCharacters(in: .whitespaces)
         if raw.contains("financialmodelingprep.com") {
@@ -2169,7 +2423,7 @@ struct WKNTesterView: View {
             .replacingOccurrences(of: "https://", with: "")
             .replacingOccurrences(of: "http://", with: "")
             .trimmingCharacters(in: .whitespaces)
-        return "kursziel (nur wert) wkn \(wknOnly.isEmpty ? raw : wknOnly) in EUR. Suche in finanzen.net."
+        return "kursziel (nur wert) wkn \(wknOnly.isEmpty ? raw : wknOnly) in EUR."
     }
     
     private static func preset(for quelle: WKNTestQuelle, fmpUrlFromSettings: String) -> String {
@@ -2185,18 +2439,9 @@ struct WKNTesterView: View {
         }
     }
     
+    /// Binding ohne Auto-https – WKN (z.B. 716460) bleibt unverändert, URLs werden direkt übernommen
     private var displayWKN: Binding<String> {
-        Binding(
-            get: { wkn },
-            set: { newValue in
-                if !newValue.hasPrefix("http://") && !newValue.hasPrefix("https://") && !newValue.isEmpty {
-                    // Wenn keine URL, füge "https://" hinzu
-                    wkn = "https://" + newValue
-                } else {
-                    wkn = newValue
-                }
-            }
-        )
+        Binding(get: { wkn }, set: { wkn = $0 })
     }
     
     var body: some View {
@@ -2218,91 +2463,163 @@ struct WKNTesterView: View {
                 } header: {
                     Text("Test-URL / Quelle")
                 } footer: {
-                    Text("Finanzen.net: Beispiel-URL. FMP: API-URL aus Einstellungen oder Platzhalter. OpenAI: WKN (z. B. 716460); Abruf nutzt dann zuerst OpenAI.")
+                    Text("Finanzen.net: Beispiel-URL. FMP: API-URL aus Einstellungen. OpenAI: Genereller API-Test (z.B. Datum zurückgeben), Link zum Kopieren.")
                 }
                 
-                Section {
-                    TextField("URL oder WKN eingeben", text: displayWKN)
-                        .keyboardType(.URL)
-                        .autocapitalization(.none)
-                        .autocorrectionDisabled()
-                        .textContentType(.URL)
-                    if !urlFromSettings.trimmingCharacters(in: .whitespaces).isEmpty || !openAIFromSettings.trimmingCharacters(in: .whitespaces).isEmpty {
-                        Button("Aus Einstellungen einfügen") {
-                            switch selectedTestQuelle {
-                            case .openAI:
-                                wkn = Self.preset(for: .openAI, fmpUrlFromSettings: urlFromSettings)
-                            case .fmp:
-                                wkn = urlFromSettings.trimmingCharacters(in: .whitespaces).isEmpty
-                                    ? Self.preset(for: .fmp, fmpUrlFromSettings: urlFromSettings)
-                                    : urlFromSettings.trimmingCharacters(in: .whitespaces)
-                            case .finanzenNet:
-                                wkn = Self.preset(for: .finanzenNet, fmpUrlFromSettings: urlFromSettings)
-                            }
-                            result = nil
-                            debugLog = []
-                            KurszielService.clearDebugLog()
-                        }
-                    }
-                } header: {
-                    Text("WKN oder URL")
-                } footer: {
-                    Text("FMP: Kursziel-API-URL aus Einstellungen. OpenAI: Test-WKN (Key aus Einstellungen). Mit „Aus Einstellungen einfügen“ wird je nach gewählter Quelle der passende Wert gesetzt.")
-                }
-                
-                if !wkn.isEmpty && wkn != "https://" {
+                if selectedTestQuelle == .openAI {
+                    // OpenAI: Nur genereller API-Test – Befehl, Link, curl-Syntax, Test
                     Section {
-                        Text(befehlKlartext)
+                        Text("\(Self.openAIResponsesURL)\n(bzw. \(Self.openAIChatURL) bei Fallback)")
                             .font(.system(.caption, design: .monospaced))
                             .textSelection(.enabled)
+                        Divider()
+                        Text("curl -X POST \(Self.openAIChatURL) \\\n  -H \"Authorization: Bearer DEIN_API_KEY\" \\\n  -H \"Content-Type: application/json\" \\\n  -d '{\"model\":\"gpt-4o-mini\",\"messages\":[{\"role\":\"user\",\"content\":\"Gib das heutige Datum\"}]}'")
+                            .font(.system(.caption2, design: .monospaced))
+                            .textSelection(.enabled)
                     } header: {
-                        Text("Befehl (Klartext)")
+                        Text("API-Link & curl-Syntax")
                     } footer: {
-                        Text("An OpenAI gesendeter Prompt bzw. verwendete URL (API-Key maskiert).")
+                        Text("Key steht nicht in der URL, sondern im Header. curl: DEIN_API_KEY durch echten Key ersetzen.")
                     }
-                }
-                
-                if isTesting {
+                    
                     Section {
-                        HStack {
-                            ProgressView()
-                            Text("Kursziel wird abgerufen...")
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                }
-                
-                if let result = result {
-                    Section {
-                        Text(result)
-                            .foregroundColor(result.contains("Fehler") ? .red : .primary)
+                        TextField("Befehl (Klartext)", text: $openAITestBefehl, axis: .vertical)
+                            .lineLimit(2...4)
+                            .textContentType(.none)
                     } header: {
-                        Text("Ergebnis")
+                        Text("Befehl")
+                    } footer: {
+                        Text("z.B. „Gib mir das aktuelle Datum zurück“ – nur ein Rückgabewert. Befehl anpassen, dann testen.")
                     }
-                }
-                
-                if !debugLog.isEmpty {
-                    Section {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 4) {
-                                ForEach(debugLog, id: \.self) { logEntry in
-                                    Text(logEntry)
-                                        .font(.system(.caption, design: .monospaced))
-                                        .foregroundColor(.secondary)
-                                }
+                    
+                    if isTesting {
+                        Section {
+                            HStack {
+                                ProgressView()
+                                Text("Test wird ausgeführt...")
+                                    .foregroundColor(.secondary)
                             }
                         }
-                        .frame(maxHeight: 300)
+                    }
+                    
+                    if let result = result {
+                        Section {
+                            Text(result)
+                                .foregroundColor(result.contains("Fehler") ? .red : .primary)
+                                .textSelection(.enabled)
+                        } header: {
+                            Text("Ergebnis")
+                        }
+                    }
+                    
+                    if !debugLog.isEmpty {
+                        Section {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    ForEach(debugLog, id: \.self) { logEntry in
+                                        Text(logEntry)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .frame(maxHeight: 300)
+                        } header: {
+                            Text("Debug")
+                        }
+                    }
+                    
+                    Section {
+                        Button("Verbindung testen") {
+                            testOpenAI()
+                        }
+                        .disabled(openAITestBefehl.trimmingCharacters(in: .whitespaces).isEmpty || isTesting)
+                    }
+                } else {
+                    // finanzen.net / FMP: URL oder WKN, Kursziel abrufen
+                    Section {
+                        TextField("URL oder WKN eingeben", text: displayWKN)
+                            .keyboardType(.default)
+                            .autocapitalization(.none)
+                            .autocorrectionDisabled()
+                        if !urlFromSettings.trimmingCharacters(in: .whitespaces).isEmpty || !openAIFromSettings.trimmingCharacters(in: .whitespaces).isEmpty {
+                            Button("Aus Einstellungen einfügen") {
+                                switch selectedTestQuelle {
+                                case .openAI:
+                                    break
+                                case .fmp:
+                                    wkn = urlFromSettings.trimmingCharacters(in: .whitespaces).isEmpty
+                                        ? Self.preset(for: .fmp, fmpUrlFromSettings: urlFromSettings)
+                                        : urlFromSettings.trimmingCharacters(in: .whitespaces)
+                                case .finanzenNet:
+                                    wkn = Self.preset(for: .finanzenNet, fmpUrlFromSettings: urlFromSettings)
+                                }
+                                result = nil
+                                debugLog = []
+                                KurszielService.clearDebugLog()
+                            }
+                        }
                     } header: {
-                        Text("Debug-Log")
+                        Text("WKN oder URL")
+                    } footer: {
+                        Text("FMP: Kursziel-API-URL aus Einstellungen. Mit „Aus Einstellungen einfügen“ wird der passende Wert gesetzt.")
                     }
-                }
-                
-                Section {
-                    Button("Kursziel abrufen") {
-                        testKursziel()
+                    
+                    if !wkn.isEmpty && wkn != "https://" {
+                        Section {
+                            Text(befehlKlartext)
+                                .font(.system(.caption, design: .monospaced))
+                                .textSelection(.enabled)
+                        } header: {
+                            Text("Befehl (Klartext)")
+                        } footer: {
+                            Text("Verwendete URL (API-Key maskiert).")
+                        }
                     }
-                    .disabled(wkn.isEmpty || wkn == "https://" || isTesting)
+                    
+                    if isTesting {
+                        Section {
+                            HStack {
+                                ProgressView()
+                                Text("Kursziel wird abgerufen...")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                    
+                    if let result = result {
+                        Section {
+                            Text(result)
+                                .foregroundColor(result.contains("Fehler") ? .red : .primary)
+                                .textSelection(.enabled)
+                        } header: {
+                            Text("Ergebnis")
+                        }
+                    }
+                    
+                    if !debugLog.isEmpty {
+                        Section {
+                            ScrollView {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    ForEach(debugLog, id: \.self) { logEntry in
+                                        Text(logEntry)
+                                            .font(.system(.caption, design: .monospaced))
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            }
+                            .frame(maxHeight: 300)
+                        } header: {
+                            Text("Debug")
+                        }
+                    }
+                    
+                    Section {
+                        Button("Kursziel abrufen") {
+                            testKursziel()
+                        }
+                        .disabled(wkn.isEmpty || wkn == "https://" || isTesting)
+                    }
                 }
             }
             .onAppear {
@@ -2322,6 +2639,23 @@ struct WKNTesterView: View {
         }
     }
     
+    private func testOpenAI() {
+        let befehl = openAITestBefehl.trimmingCharacters(in: .whitespaces)
+        guard !befehl.isEmpty, !openAIFromSettings.trimmingCharacters(in: .whitespaces).isEmpty else { return }
+        KurszielService.openAIAPIKey = openAIFromSettings.trimmingCharacters(in: .whitespaces)
+        isTesting = true
+        result = nil
+        debugLog = []
+        Task {
+            let testResult = await KurszielService.testOpenAIVerbindung(prompt: befehl)
+            await MainActor.run {
+                result = testResult
+                debugLog = KurszielService.getDebugLog()
+                isTesting = false
+            }
+        }
+    }
+    
     private func testKursziel() {
         guard !wkn.isEmpty && wkn != "https://" else { return }
         isTesting = true
@@ -2330,8 +2664,8 @@ struct WKNTesterView: View {
         
         Task {
             var wknCleaned = wkn.trimmingCharacters(in: .whitespaces)
-            // Entferne "https://" am Anfang, wenn es nur das ist
-            if wknCleaned == "https://" {
+            if wknCleaned.isEmpty || wknCleaned == "https://" {
+                await MainActor.run { isTesting = false }
                 return
             }
             KurszielService.clearDebugLog()
@@ -2377,6 +2711,8 @@ struct SettingsView: View {
     @State private var isTestingConnection = false
     @State private var connectionTestResult: String? = nil
     @State private var showConnectionTestAlert = false
+    @State private var showDebugFromConnectionTest = false
+    @State private var openAITestBefehl = "Gib mir das aktuelle Datum zurück"
     @State private var isTestingFMP = false
     @State private var fmpTestResult: String? = nil
     @State private var showFMPTestAlert = false
@@ -2455,6 +2791,9 @@ struct SettingsView: View {
                     Button("API-Key aus Datei laden…") {
                         showFilePicker = true
                     }
+                    TextField("Befehl (Klartext)", text: $openAITestBefehl, axis: .vertical)
+                        .lineLimit(2...4)
+                        .textContentType(.none)
                     Button(action: { testConnection() }) {
                         HStack {
                             Text("Verbindung testen")
@@ -2465,11 +2804,11 @@ struct SettingsView: View {
                             }
                         }
                     }
-                    .disabled(openAIAPIKey.trimmingCharacters(in: .whitespaces).isEmpty || isTestingConnection)
+                    .disabled(openAIAPIKey.trimmingCharacters(in: .whitespaces).isEmpty || openAITestBefehl.trimmingCharacters(in: .whitespaces).isEmpty || isTestingConnection)
                 } header: {
                     Text("OpenAI")
                 } footer: {
-                    Text("API-Key für Kursziele via OpenAI. Direkt eintragen oder Datei auswählen. «Verbindung testen» prüft den Zugriff. Optional: Portfolio-CSV extern mit OpenAI anreichern (Kursziele in neue CSV schreiben) und die erzeugte CSV hier importieren – Spalte „Kursziel“ oder letzte Spalte wird dann übernommen, keine erneute Ermittlung.")
+                    Text("API-Key für Kursziele via OpenAI. «Befehl»: z.B. „Gib mir das aktuelle Datum zurück“ – nur ein Rückgabewert. Befehl anpassen, dann «Verbindung testen». Im Ergebnis wird der komplette Link angezeigt.")
                 }
             }
             .navigationTitle("Einstellungen")
@@ -2498,8 +2837,11 @@ struct SettingsView: View {
                     defer { url.stopAccessingSecurityScopedResource() }
                     do {
                         let data = try Data(contentsOf: url)
-                        guard let key = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !key.isEmpty else {
-                            keyImportMessage = "Datei ist leer oder enthält keinen gültigen Text"
+                        let raw = String(data: data, encoding: .utf8)
+                            ?? String(data: data, encoding: .utf16)
+                            ?? ""
+                        guard let key = KurszielService.cleanOpenAIKey(raw), !key.isEmpty else {
+                            keyImportMessage = "Datei ist leer oder enthält keinen gültigen Text (evtl. unsichtbare Zeichen)"
                             showKeyImportAlert = true
                             return
                         }
@@ -2520,10 +2862,30 @@ struct SettingsView: View {
             } message: {
                 Text(keyImportMessage ?? "")
             }
-            .alert("OpenAI-Verbindungstest", isPresented: $showConnectionTestAlert) {
-                Button("OK", role: .cancel) { }
-            } message: {
-                Text(connectionTestResult ?? "")
+            .sheet(isPresented: $showConnectionTestAlert) {
+                NavigationStack {
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text(connectionTestResult ?? "")
+                            .font(.body)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding()
+                        Spacer()
+                        Button("Debug-Log anzeigen") {
+                            showDebugFromConnectionTest = true
+                        }
+                        .padding(.horizontal)
+                    }
+                    .navigationTitle("OpenAI-Verbindungstest")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .confirmationAction) {
+                            Button("Schließen") { showConnectionTestAlert = false }
+                        }
+                    }
+                    .sheet(isPresented: $showDebugFromConnectionTest) {
+                        DebugLogSheet()
+                    }
+                }
             }
             .alert("FMP-Verbindungstest", isPresented: $showFMPTestAlert) {
                 Button("OK", role: .cancel) { }
@@ -2571,7 +2933,7 @@ struct SettingsView: View {
         KurszielService.openAIAPIKey = openAIAPIKey.trimmingCharacters(in: .whitespaces)
         isTestingConnection = true
         Task {
-            let result = await KurszielService.testOpenAIVerbindung()
+            let result = await KurszielService.testOpenAIVerbindung(prompt: openAITestBefehl)
             await MainActor.run {
                 connectionTestResult = result
                 showConnectionTestAlert = true

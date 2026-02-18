@@ -146,7 +146,7 @@ class CSVParser {
         let bestand = parseDouble(col(1)) ?? 0.0
         let bezeichnung = col(2)
         let wkn = col(3)
-        let isin = col(4)
+        let isin = colByName("isin") ?? col(4)
         let waehrung = col(5).isEmpty ? "EUR" : col(5)
         let hinweisEinstandskurs = col(6)
         let einstandskurs = parseDouble(col(7))
