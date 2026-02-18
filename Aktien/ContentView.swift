@@ -1280,18 +1280,37 @@ private struct KurszielZeileView: View {
         return URL(string: "https://www.google.com/search?q=\(query)")!
     }
     
+    /// Zwischenablage: ISIN + durchschnittliches Kursziel
+    private var zwischenablageText: String {
+        var t = "ISIN: \(aktie.isin)\ndurchschnittliches Kursziel:"
+        if let kz = aktie.kursziel, kz > 0 {
+            t += " \(String(format: "%.2f", kz)) \(aktie.kurszielWaehrung ?? "EUR")"
+        } else { t += " –" }
+        return t
+    }
+    
     private func copyISIN() {
+        let text = zwischenablageText
         #if os(iOS)
-        UIPasteboard.general.string = aktie.isin
+        UIPasteboard.general.string = text
         #elseif os(macOS)
         NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(aktie.isin, forType: .string)
+        NSPasteboard.general.setString(text, forType: .string)
         #endif
         onCopyISIN?(aktie.isin)
         showZwischenablageFeedback = true
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             showZwischenablageFeedback = false
         }
+    }
+    
+    private static let chatGPTURL = URL(string: "https://chat.openai.com/")!
+    private func openChatGPT() {
+        #if os(iOS)
+        UIApplication.shared.open(Self.chatGPTURL)
+        #elseif os(macOS)
+        NSWorkspace.shared.open(Self.chatGPTURL)
+        #endif
     }
     
     var body: some View {
@@ -1323,6 +1342,9 @@ private struct KurszielZeileView: View {
                     }
                     .buttonStyle(.plain)
                     .animation(.easeInOut(duration: 0.2), value: showZwischenablageFeedback)
+                    Button("ChatGPT") { openChatGPT() }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
                     }
                     Text(aktie.bezeichnung)
                         .font(.subheadline)
