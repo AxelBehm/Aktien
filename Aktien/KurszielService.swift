@@ -53,11 +53,11 @@ class KurszielService {
     static var debugMode = true
     static var debugLog: [String] = []
     
-    /// Beim App-Start einmal ermittelte Wechselkurse (Frankfurter API) – für alle Umrechnungen verwendet
+    /// Zuletzt ermittelte Wechselkurse (Frankfurter API) – nur Puffer für rateUSDtoEUR/rateGBPtoEUR; vor jeder Nutzung per fetchAppWechselkurse() direkt neu geladen.
     static var appWechselkursUSDtoEUR: Double?
     static var appWechselkursGBPtoEUR: Double?
     
-    /// Lädt USD→EUR und GBP→EUR einmal (beim Start); setzt appWechselkursUSDtoEUR / appWechselkursGBPtoEUR. Rückgabe für UI-Anzeige.
+    /// Lädt USD→EUR und GBP→EUR (direkter API-Zugriff, keine Zwischenspeicherung zwischen Abrufen). Setzt appWechselkursUSDtoEUR / appWechselkursGBPtoEUR. Rückgabe für UI-Anzeige.
     static func fetchAppWechselkurse() async -> (usdToEur: Double?, gbpToEur: Double?) {
         async let usd = fetchUSDtoEURRateInternal()
         async let gbp = fetchGBPtoEURRateInternal()
@@ -68,18 +68,25 @@ class KurszielService {
         return (usdVal, gbpVal)
     }
     
-    /// Für Umrechnung: USD→EUR (App-Kurs oder Fallback 0.92)
+    /// Für Umrechnung: USD→EUR (nach fetchAppWechselkurse oder Fallback 0.92)
     static func rateUSDtoEUR() -> Double {
         appWechselkursUSDtoEUR ?? 0.92
     }
     
-    /// Für Umrechnung: GBP→EUR (App-Kurs oder Fallback 1.17)
+    /// Für Umrechnung: GBP→EUR (nach fetchAppWechselkurse oder Fallback 1.17)
     static func rateGBPtoEUR() -> Double {
         appWechselkursGBPtoEUR ?? 1.17
     }
     
     static func clearDebugLog() {
         debugLog = []
+    }
+    
+    /// Vor Abruf von FMP/OpenAI/Wechselkursen etc. aufrufen, damit keine alten URL-/Wechselkurs-Caches genutzt werden („erst beim 2. Mal“ vermeiden).
+    static func clearCachesForApiCalls() {
+        URLCache.shared.removeAllCachedResponses()
+        appWechselkursUSDtoEUR = nil
+        appWechselkursGBPtoEUR = nil
     }
     
     static func getDebugLog() -> [String] {
@@ -174,8 +181,9 @@ class KurszielService {
         return nil
     }
     
-    /// Ruft Kursziel für eine Aktie basierend auf WKN, ISIN und Bezeichnung ab
+    /// Ruft Kursziel für eine Aktie basierend auf WKN, ISIN und Bezeichnung ab. Wechselkurse: direkter Zugriff (fetchAppWechselkurse), keine alte Zwischenspeicherung.
     static func fetchKursziel(for aktie: Aktie) async -> KurszielInfo? {
+        _ = await fetchAppWechselkurse()
         return await withTimeout(seconds: 20) {
             let refPrice = aktie.kurs ?? aktie.einstandskurs
             let slug = slugFromBezeichnung(aktie.bezeichnung)
@@ -186,15 +194,7 @@ class KurszielService {
             }
             debug("🔗 Slug: \(slug)")
             
-            // 0. CSV-Datei (iCloud Documents/kursziele.csv) – Format: Wertpapier;Kursziel_EUR
-            debug("0️⃣ Versuche kursziele.csv für \(aktie.bezeichnung)")
-            if let info = fetchKurszielVonCSV(bezeichnung: aktie.bezeichnung) {
-                debug("   → Gefunden: \(info.kursziel) € (CSV)")
-                let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                return eurInfo
-            }
-            debug("   ❌ Kein Eintrag in CSV")
+            // Kursziele aus importierter Portfolio-CSV (Quelle „C“) bleiben in der Aktie; keine kursziele.csv mehr beim Abruf (vermeidet abweichende Werte zu ChatGPT/OpenAI).
             
             // 1. FMP (Symbol oder search-isin per ISIN) – wenn API-Key hinterlegt
             debug("1️⃣ Versuche FMP für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
@@ -371,23 +371,32 @@ class KurszielService {
         return info
     }
     
-    /// Optional: Callback für „Übernehmen?“ wenn OpenAI-Ersatz bei unrealistischem Kursziel
-    static var onUnrealistischErsatzBestätigen: ((KurszielInfo, KurszielInfo) async -> Bool)?
+    /// Optional: Callback für „Übernehmen?“ wenn OpenAI-Ersatz bei unrealistischem Kursziel (bei automatischer Einlesung nicht aufrufen / false zurückgeben)
+    static var onUnrealistischErsatzBestätigen: ((KurszielInfo, KurszielInfo, Aktie) async -> Bool)?
+    
+    /// Prüft, ob ein Kursziel für einen Referenzkurs „realistisch“ ist (Plausibilität + Abstand ≤ Schwellwert wie zeigeAlsUnrealistisch; Abwärts max. 50 %).
+    static func isKurszielRealistisch(kursziel: Double, refPrice: Double?) -> Bool {
+        guard let k = refPrice, k > 0 else { return false }
+        if kursziel < k * 0.5 || kursziel > k * 50 { return false }
+        let pct = abs((kursziel - k) / k * 100)
+        let schwellwert = kursziel > k ? 200.0 : 50.0
+        return pct <= schwellwert
+    }
     
     /// Wenn Kursziel unrealistisch wäre (Abstand > Schwellwert) und API-Key da: versucht OpenAI als Ersatz
     private static func beiUnrealistischOpenAIVersuchen(eurInfo: KurszielInfo, refPrice: Double?, aktie: Aktie) async -> KurszielInfo? {
         guard let k = refPrice ?? aktie.devisenkurs, k > 0 else { return nil }
         let kz = eurInfo.kursziel
-        if kz < k * 0.2 || kz > k * 50 { return nil }
+        if kz < k * 0.5 || kz > k * 50 { return nil }
         let pct = abs((kz - k) / k * 100)
-        let schwellwert = kz > k ? 200.0 : 100.0
+        let schwellwert = kz > k ? 200.0 : 50.0
         if pct <= schwellwert { return nil }
         guard openAIAPIKey != nil else { return nil }
         debug("   ⚠️ Kursziel \(String(format: "%.2f", kz)) würde als unrealistisch gelten (Abstand \(Int(pct))%). Versuche OpenAI.")
         guard let openAIInfo = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) else { return nil }
         let replacement = await kurszielZuEUR(info: openAIInfo, aktie: aktie)
         if let callback = onUnrealistischErsatzBestätigen {
-            let ok = await callback(eurInfo, replacement)
+            let ok = await callback(eurInfo, replacement, aktie)
             return ok ? replacement : nil
         }
         return replacement
@@ -577,13 +586,13 @@ class KurszielService {
         return slug
     }
     
-    /// Prüft ob ein Kursziel plausibel ist (filtert z.B. 0,50€ oder 19,77€ bei Amazon ~197€)
+    /// Prüft ob ein Kursziel plausibel ist (filtert z.B. 0,50€ oder 13€ bei Kurs 30€)
     private static func isValidKursziel(_ kursziel: Double, referencePrice: Double?) -> Bool {
         guard kursziel >= 1.0 else { return false }
         
         if let ref = referencePrice, ref > 0 {
-            // Kursziel muss mind. 20 % des aktuellen Kurses sein (verhindert 19,77 bei 197€)
-            guard kursziel >= ref * 0.2 else { return false }
+            // Kursziel muss mind. 50 % des aktuellen Kurses sein (Abwärts nicht zu extrem)
+            guard kursziel >= ref * 0.5 else { return false }
             // Kursziel sollte nicht mehr als 50x des aktuellen Kurses sein
             guard kursziel <= ref * 50 else { return false }
         }
@@ -818,12 +827,13 @@ class KurszielService {
         set { UserDefaults.standard.set(newValue, forKey: fmpAPIKeyKey) }
     }
     
-    /// WKN → FMP-Symbol. FMP nutzt generell keine .DE-Suffixe – alle deutschen Werte ohne .DE
+    /// WKN → FMP-Symbol (XETRA = EUR). DB→DBK, 710000→MBG (Mercedes), 515100→DTE (Telekom).
     private static let fmpSymbolByWKN: [String: String] = [
         "716460": "SAP", "723610": "SIE", "519000": "ALV", "648300": "ADS",
-        "604700": "BAS", "703000": "RHM", "710000": "DTE", "556520": "VOW3",
+        "604700": "BAS", "703000": "RHM", "710000": "MBG", "556520": "VOW3",
         "575200": "BMW", "623100": "BAYN", "843002": "HEN3", "823212": "MBG",
-        "659990": "AM3D", "625409": "PUM", "514000": "DB", "801440": "CBK",
+        "659990": "AM3D", "625409": "PUM", "514000": "DBK", "801440": "CBK",
+        "515100": "DTE",  // Deutsche Telekom XETRA (nicht 710000 = Mercedes)
         "517010": "IFX", "587590": "1COV", "521380": "DB1", "520000": "PAH3",
         "865985": "AAPL", "881809": "MSFT", "906866": "AMZN", "883121": "GOOGL",
         "A0YEDG": "TSLA", "A1JWVX": "META",
@@ -863,7 +873,7 @@ class KurszielService {
         if slug == "mercedes" || slug == "daimler" { return "MBG" }
         if slug == "puma" { return "PUM" }
         if slug == "am3d" { return "AM3D" }
-        if slug == "deutsche bank" { return "DB" }
+        if slug == "deutsche bank" { return "DBK" }
         if slug == "commerzbank" { return "CBK" }
         if slug == "infineon" { return "IFX" }
         if slug == "covestro" { return "1COV" }
@@ -922,7 +932,9 @@ class KurszielService {
     
     /// Bulk-Abruf FMP Price Target – eine API-Anfrage für alle Aktien. Rückgabe: [WKN: KurszielInfo]
     /// Bei forceOverwrite: auch Aktien mit bestehendem Kursziel (z. B. aus CSV) abfragen.
+    /// Wechselkurse: direkter Zugriff (fetchAppWechselkurse), keine alte Zwischenspeicherung.
     static func fetchKurszieleBulkFMP(aktien: [Aktie], forceOverwrite: Bool = false) async -> [String: KurszielInfo] {
+        _ = await fetchAppWechselkurse()
         debug("━━━ FMP BULK START ━━━")
         guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
             debug("   ❌ FMP: FMP-Feld leer (API-Key oder komplette URL eintragen)")
@@ -930,32 +942,33 @@ class KurszielService {
         }
         let toFetch = aktien.filter { forceOverwrite ? !$0.kurszielManuellGeaendert : (!$0.kurszielManuellGeaendert && $0.kursziel == nil) }
         debug("   📋 FMP: \(toFetch.count) Aktien ohne Kursziel (von \(aktien.count) gesamt)")
-        var symbolToWKN: [String: String] = [:]
+        var symbolToWKNs: [String: [String]] = [:]
         var symbols: [String] = []
+        var isinToSymbolCache: [String: String] = [:]
         var ohneMapping: [(name: String, wkn: String, isin: String)] = []
         for a in toFetch {
-            if let sym = fmpSymbol(for: a), !symbols.contains(sym) {
-                symbols.append(sym)
-                symbolToWKN[sym] = a.wkn
+            var sym: String?
+            let isinNorm = a.isin.trimmingCharacters(in: .whitespaces)
+            if isinNorm.count >= 12 {
+                let isin12 = String(isinNorm.uppercased().prefix(12))
+                if let cached = isinToSymbolCache[isin12] {
+                    sym = cached
+                } else if let resolved = await fmpSymbolFromSearchISIN(isin: a.isin) {
+                    isinToSymbolCache[isin12] = resolved
+                    sym = resolved
+                    debug("   ✅ FMP search-isin: \(isin12) → \(resolved) (\(a.bezeichnung))")
+                }
+            }
+            if sym == nil {
+                sym = fmpSymbol(for: a)
+            }
+            if let s = sym {
+                if !symbols.contains(s) { symbols.append(s) }
+                if symbolToWKNs[s] == nil { symbolToWKNs[s] = [] }
+                if !symbolToWKNs[s]!.contains(a.wkn) { symbolToWKNs[s]!.append(a.wkn) }
             } else {
                 ohneMapping.append((a.bezeichnung, a.wkn, a.isin))
             }
-        }
-        // Fehlende Symbole über FMP search-isin (ISIN → Symbol) ermitteln, wenn API-Key hinterlegt
-        if fmpExtractAPIKey() != nil {
-            var resolvedWKN: Set<String> = []
-            for m in ohneMapping {
-                guard m.isin.trimmingCharacters(in: .whitespaces).count >= 12 else { continue }
-                if let sym = await fmpSymbolFromSearchISIN(isin: m.isin) {
-                    if !symbols.contains(sym) {
-                        symbols.append(sym)
-                        symbolToWKN[sym] = m.wkn
-                    }
-                    resolvedWKN.insert(m.wkn)
-                    debug("   ✅ FMP search-isin: \(m.isin) → \(sym) (\(m.name))")
-                }
-            }
-            ohneMapping = ohneMapping.filter { !resolvedWKN.contains($0.wkn) }
         }
         if !ohneMapping.isEmpty {
             debug("   ⚠️ FMP: Kein Symbol für \(ohneMapping.count) Aktien (WKN/ISIN nicht in Mapping):")
@@ -965,11 +978,9 @@ class KurszielService {
             if ohneMapping.count > 5 { debug("      … und \(ohneMapping.count - 5) weitere") }
         }
         guard !symbols.isEmpty else {
-            debug("   ❌ FMP: Keine Symbole zum Abruf – alle Aktien ohne WKN-Mapping")
+            debug("   ❌ FMP: Keine Symbole (ISIN search-isin + Mapping)")
             return [:]
         }
-        // Bei doppelten WKN (z. B. gleiche Aktie in mehreren Depots) erste Aktie pro WKN verwenden
-        let wknToAktie: [String: Aktie] = Dictionary(aktien.map { ($0.wkn, $0) }, uniquingKeysWith: { first, _ in first })
         let fmpNurTest = false // Test: nur 1 Aufruf – auf true setzen zum Testen
         let symbolsToFetch = fmpNurTest ? Array(symbols.prefix(1)) : symbols
         if fmpNurTest {
@@ -979,7 +990,7 @@ class KurszielService {
         debug("   🔗 URL: Befehl wie eingegeben, nur Symbol getauscht. USD/GBP→EUR: CSV-Devisenkurs (USD) oder Frankfurter-API.")
         var result: [String: KurszielInfo] = [:]
         for (idx, sym) in symbolsToFetch.enumerated() {
-            guard let wkn = symbolToWKN[sym] else { continue }
+            guard let wknList = symbolToWKNs[sym], !wknList.isEmpty else { continue }
             guard let url = fmpURLForRequest(symbol: sym) else { continue }
             debug("   📡 FMP [\(idx + 1)/\(symbolsToFetch.count)]: \(sym)")
             do {
@@ -1030,7 +1041,7 @@ class KurszielService {
                     low = parsed.low.map { $0 * rate }
                 }
                 let info = KurszielInfo(kursziel: consensus, datum: parsed.datum, spalte4Durchschnitt: nil, quelle: .fmp, waehrung: "EUR", kurszielHigh: high, kurszielLow: low, kurszielAnalysten: parsed.analysts)
-                result[wkn] = info
+                for wkn in wknList { result[wkn] = info }
                 let umrechnung = istUSD ? " (aus USD × \(rate))" : (istGBP ? " (aus GBP × \(rate))" : "")
                 debug("   ✅ FMP: \(sym) → Consensus \(String(format: "%.2f", consensus)) EUR\(umrechnung) | High \(high.map { String(format: "%.2f", $0) } ?? "–") | Low \(low.map { String(format: "%.2f", $0) } ?? "–") | Analysten \(parsed.analysts.map { "\($0)" } ?? "–")")
             } catch {
@@ -1090,11 +1101,11 @@ class KurszielService {
             .appendingPathComponent(kurszieleCSVFilename)
     }
     
-    /// Liest Kursziel aus kursziele.csv – Spalten: Wertpapier;Kursziel_EUR. Match nach Bezeichnung (Slug/erster Wort).
+    /// Liest Kursziel aus kursziele.csv – direkter Dateizugriff, keine Zwischenspeicherung. Spalten: Wertpapier;Kursziel_EUR. Match nach Bezeichnung (Slug/erster Wort).
     static func fetchKurszielVonCSV(bezeichnung: String) -> KurszielInfo? {
         guard let url = kurszieleCSVURL(), FileManager.default.fileExists(atPath: url.path) else { return nil }
         try? FileManager.default.startDownloadingUbiquitousItem(at: url)
-        guard let data = try? Data(contentsOf: url),
+        guard let data = FileManager.default.contents(atPath: url.path) ?? (try? Data(contentsOf: url)),
               let csv = String(data: data, encoding: .utf8) else { return nil }
         let bezeichnungSlug = slugFromBezeichnung(bezeichnung)
         let erstesWort = bezeichnung.split(separator: " ").first.map(String.init) ?? ""
@@ -1129,7 +1140,7 @@ class KurszielService {
         var lines: [String] = []
         var headerExists = false
         if fileManager.fileExists(atPath: url.path),
-           let data = try? Data(contentsOf: url),
+           let data = fileManager.contents(atPath: url.path) ?? (try? Data(contentsOf: url)),
            let existing = String(data: data, encoding: .utf8) {
             lines = existing.components(separatedBy: .newlines).filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
             headerExists = lines.first?.contains("Wertpapier") ?? false
@@ -1151,20 +1162,20 @@ class KurszielService {
         try? content.write(to: url, atomically: true, encoding: .utf8)
     }
     
-    /// Liest API-Key aus iCloud-Datei (Documents/openai_key.txt im Aktien-iCloud-Container)
+    /// Liest API-Key aus iCloud-Datei – direkter Dateizugriff, keine Zwischenspeicherung (Documents/openai_key.txt im Aktien-iCloud-Container).
     private static func openAIAPIKeyFromICloudFile() -> String? {
         guard let containerURL = FileManager.default.url(forUbiquityContainerIdentifier: nil) else { return nil }
         let fileURL = containerURL.appendingPathComponent("Documents").appendingPathComponent(openAIICloudFilename)
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
         try? FileManager.default.startDownloadingUbiquitousItem(at: fileURL)
-        guard let data = try? Data(contentsOf: fileURL),
+        guard let data = FileManager.default.contents(atPath: fileURL.path) ?? (try? Data(contentsOf: fileURL)),
               let key = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines),
               !key.isEmpty else { return nil }
         return key
     }
     
     /// System-Prompt für OpenAI Kursziel (mit web_search)
-    private static let openAISystemPrompt = "Gib GENAU den Aktienkursziel-Preis in EUR zurück (Zahl mit Dezimalpunkt, z.B. 125.50) oder -1. NIEMALS ISIN, WKN oder andere Kennungen zurückgeben – nur den Kursziel-Preis."
+    private static let openAISystemPrompt = "Rückgabe nur den Wert oder -1 wenn nichts gefunden wird."
     
     /// Parst Modellantwort zu Kursziel. Findet plausibelste Zahl (ignoriert Jahre 1990–2030, bevorzugt Werte nahe EUR/€).
     private static func openAIParseKursziel(_ s: String) -> Double? {
@@ -1357,11 +1368,14 @@ class KurszielService {
         return urlStr
     }
     
-    /// Ruft Kursziel von FMP für eine einzelne Aktie ab (WKN/ISIN/Bezeichnung → Symbol, bei fehlendem Symbol auch search-isin per ISIN)
+    /// Ruft Kursziel von FMP für eine einzelne Aktie ab. Bevorzugt ISIN (search-isin), sonst WKN/Bezeichnungs-Mapping.
     static func fetchKurszielFromFMP(for aktie: Aktie) async -> KurszielInfo? {
-        var sym = fmpSymbol(for: aktie)
-        if sym == nil, !aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
+        var sym: String?
+        if aktie.isin.trimmingCharacters(in: .whitespaces).count >= 12 {
             sym = await fmpSymbolFromSearchISIN(isin: aktie.isin)
+        }
+        if sym == nil {
+            sym = fmpSymbol(for: aktie)
         }
         guard let symbol = sym, let url = fmpURLForRequest(symbol: symbol) else { return nil }
         return await fetchKurszielFromFMPURL(url.absoluteString)
@@ -1606,7 +1620,7 @@ class KurszielService {
         }
     }
     
-    /// Responses API (v1/responses) – gpt-4o mit web_search
+    /// Responses API (v1/responses) – gpt-4o mit web_search. temperature 0 für möglichst gleiche Ergebnisse bei gleichem Prompt (web_search kann trotzdem variieren).
     private static func openAICallResponsesAPI(systemPrompt: String, userPrompt: String, apiKey: String, model: String = openAIModelPrimary) async throws -> String {
         let url = URL(string: "https://api.openai.com/v1/responses")!
         var request = URLRequest(url: url)
@@ -1638,7 +1652,7 @@ class KurszielService {
         throw NSError(domain: "OpenAI", code: -1, userInfo: [NSLocalizedDescriptionKey: "Antwort konnte nicht geparst werden. Raw: \(rawPreview)"])
     }
     
-    /// Chat Completions API (Fallback) – choices[0].message.content
+    /// Chat Completions API (Fallback) – choices[0].message.content. temperature 0 + seed 42 für reproduzierbarere Ergebnisse.
     private static func openAICallChatCompletions(systemPrompt: String, userPrompt: String, apiKey: String, model: String = openAIModelFallback) async throws -> String {
         let url = URL(string: "https://api.openai.com/v1/chat/completions")!
         var request = URLRequest(url: url)
@@ -1651,7 +1665,9 @@ class KurszielService {
             "messages": [
                 ["role": "system", "content": systemPrompt],
                 ["role": "user", "content": userPrompt]
-            ]
+            ],
+            "temperature": 0,
+            "seed": 42
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
         let (data, response) = try await URLSession.shared.data(for: request)
@@ -1713,15 +1729,12 @@ class KurszielService {
             debug("   📌 ISIN leer/zu kurz, verwende WKN: \(wkn)")
         }
         
-        var prompt = "Aktienkursziel für "
-        if let bez = bezeichnung, !bez.isEmpty { prompt += "\(bez) " }
-        prompt += "("
+        let prompt: String
         if hasISIN, let isin = isinTrimmed {
-            prompt += "ISIN \(isin)"
+            prompt = "ISIN \(isin) durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert oder -1 wenn nichts gefunden wird"
         } else {
-            prompt += "WKN \(wkn)"
+            prompt = "WKN \(wkn) durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert oder -1 wenn nichts gefunden wird"
         }
-        prompt += "). Nur den Kursziel-Preis in EUR (z.B. 125.50), nicht ISIN/WKN."
         debug("   📤 OpenAI Request (Responses API): \(prompt)")
         debug("   📡 Sende an https://api.openai.com/v1/responses ...")
         

@@ -34,7 +34,8 @@ class CSVParser {
     /// Parst CSV-Datei und gibt Aktien + Statistik zurück (für Diagnose).
     /// Kursziel: aus Spalte „Kursziel_EUR“, „Kursziel“ oder letzter Spalte (Zahl) – wenn vorhanden, wird in der App keine Ermittlung durchgeführt.
     /// Optional: Kursziel_Quelle (z. B. aus Python-Script).
-    static func parseCSVWithStats(from url: URL) throws -> (aktien: [Aktie], zeilenGesamt: Int, zeilenImportiert: Int) {
+    /// hadKursziele: true, wenn mindestens eine Zeile ein Kursziel aus der CSV geliefert hat (dann werden C-markierten nicht neu berechnet; sonst schon).
+    static func parseCSVWithStats(from url: URL) throws -> (aktien: [Aktie], zeilenGesamt: Int, zeilenImportiert: Int, hadKursziele: Bool) {
         var content = try String(contentsOf: url, encoding: .utf8)
         if content.isEmpty, let latin1 = try? String(contentsOf: url, encoding: .isoLatin1) {
             content = latin1
@@ -52,7 +53,8 @@ class CSVParser {
                 aktien.append(aktie)
             }
         }
-        return (aktien, dataLines.count, aktien.count)
+        let hadKursziele = aktien.contains { $0.kursziel != nil }
+        return (aktien, dataLines.count, aktien.count, hadKursziele)
     }
     
     /// Baut Map Spaltenname (lowercased) -> Index für Header-basiertes Parsing

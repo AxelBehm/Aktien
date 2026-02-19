@@ -20,13 +20,19 @@ final class UnrealistischConfirmHelper {
     var isPresented = false
     var original: KurszielInfo?
     var replacement: KurszielInfo?
+    var aktienBezeichnung: String = ""
+    /// Dialogtitel inkl. Aktienbezeichnung, beim Öffnen gesetzt
+    var dialogTitle: String = ""
     private var continuation: CheckedContinuation<Bool, Never>?
     
     @MainActor
-    func confirm(original: KurszielInfo, replacement: KurszielInfo) async -> Bool {
+    func confirm(original: KurszielInfo, replacement: KurszielInfo, aktie: Aktie) async -> Bool {
         await withCheckedContinuation { cont in
+            let name = aktie.bezeichnung.isEmpty ? "Aktie" : aktie.bezeichnung
             self.original = original
             self.replacement = replacement
+            self.aktienBezeichnung = name
+            self.dialogTitle = "OpenAI-Ersatz übernehmen? – \(name)"
             self.continuation = cont
             self.isPresented = true
         }
@@ -39,6 +45,8 @@ final class UnrealistischConfirmHelper {
         isPresented = false
         original = nil
         replacement = nil
+        aktienBezeichnung = ""
+        dialogTitle = ""
     }
 }
 
@@ -158,20 +166,21 @@ enum AktieStatus {
 }
 
 extension Aktie {
-    /// Prüft ob Kursziel plausibel ist (z.B. nicht 19,77€ bei Amazon ~197€)
+    /// Prüft ob Kursziel plausibel ist (z.B. nicht 19,77€ bei Amazon ~197€). Abwärts: mind. 50 % des Kurses.
     var isKurszielPlausibel: Bool {
         guard let kz = kursziel, kz >= 1 else { return false }
         let k = self.kurs ?? self.devisenkurs
         guard let kurs = k, kurs > 0 else { return true }
-        return kz >= kurs * 0.2 && kz <= kurs * 50
+        return kz >= kurs * 0.5 && kz <= kurs * 50
     }
     
-    /// Anzeige „Unrealistisch“: nur bei unplausibel oder Abstand zu groß (Aufwärtspotenzial: 200 %, Abwärts: 100 %)
+    /// Anzeige „Unrealistisch“: nur wenn ein Kursziel existiert und es unplausibel ist oder der Abstand zu groß (Aufwärtspotenzial: 200 %, Abwärts: 50 %). Ohne Kursziel → nicht als unrealistisch.
     var zeigeAlsUnrealistisch: Bool {
+        guard kursziel != nil else { return false }
         if !isKurszielPlausibel { return true }
         guard let kz = kursziel, let k = kurs ?? devisenkurs, k > 0 else { return false }
         let pct = abs((kz - k) / k * 100)
-        let schwellwert = kz > k ? 200.0 : 100.0
+        let schwellwert = kz > k ? 200.0 : 50.0
         return pct > schwellwert
     }
     
@@ -285,6 +294,8 @@ struct ContentView: View {
     @State private var visibleISINsOnAktienList: Set<String> = []
     /// true = Liste nach grösster Differenz Kurs ↔ Kursziel sortieren, mit % zum Ziel
     @State private var sortiereNachAbstandKursziel = false
+    /// Pfad für Aktien-Detail (nur unser Chevron, kein System-Chevron)
+    @State private var aktienDetailPath: [String] = []
     
     /// Gefilterte Aktien nach gewählter Kursziel-Quelle, optional nur unrealistische
     private var aktienZurAnzeige: [Aktie] {
@@ -401,6 +412,7 @@ struct ContentView: View {
     var body: some View {
         TabView(selection: $selectedTab) {
             NavigationSplitView {
+            NavigationStack(path: $aktienDetailPath) {
             VStack(spacing: 0) {
                 DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
             ScrollViewReader { proxy in
@@ -510,19 +522,19 @@ struct ContentView: View {
                 if sortiereNachAbstandKursziel {
                     Section {
                         ForEach(aktienSortiertNachAbstandKursziel) { aktie in
-                            NavigationLink {
-                                AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+                            Button {
+                                aktienDetailPath.append(aktie.isin)
                             } label: {
-                                aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: true)
+                                HStack {
+                                    aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: true)
+                                    Spacer(minLength: 8)
+                                    Image(systemName: "chevron.right")
+                                        .font(.body.weight(.semibold))
+                                        .foregroundColor(.secondary)
+                                }
                             }
-                            .simultaneousGesture(TapGesture().onEnded {
-                                #if os(iOS)
-                                UIPasteboard.general.string = aktie.bezeichnung
-                                #elseif os(macOS)
-                                NSPasteboard.general.clearContents()
-                                NSPasteboard.general.setString(aktie.bezeichnung, forType: .string)
-                                #endif
-                            })
+                            .buttonStyle(.plain)
+                            .transaction { t in t.animation = .easeOut(duration: 0.22) }
                             .id(aktie.isin)
                             .onAppear { visibleISINsOnAktienList.insert(aktie.isin) }
                             .onDisappear { visibleISINsOnAktienList.remove(aktie.isin) }
@@ -536,19 +548,19 @@ struct ContentView: View {
                     ForEach(Array(gruppierteAktien.enumerated()), id: \.offset) { _, group in
                         Section {
                             ForEach(group.aktien) { aktie in
-                                NavigationLink {
-                                    AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+                                Button {
+                                    aktienDetailPath.append(aktie.isin)
                                 } label: {
-                                    aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: false)
+                                    HStack {
+                                        aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: false)
+                                        Spacer(minLength: 8)
+                                        Image(systemName: "chevron.right")
+                                            .font(.body.weight(.semibold))
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
-                                .simultaneousGesture(TapGesture().onEnded {
-                                    #if os(iOS)
-                                    UIPasteboard.general.string = aktie.bezeichnung
-                                    #elseif os(macOS)
-                                    NSPasteboard.general.clearContents()
-                                    NSPasteboard.general.setString(aktie.bezeichnung, forType: .string)
-                                    #endif
-                                })
+                                .buttonStyle(.plain)
+                                .transaction { t in t.animation = .easeOut(duration: 0.22) }
                                 .id(aktie.isin)
                                 .onAppear { visibleISINsOnAktienList.insert(aktie.isin) }
                                 .onDisappear { visibleISINsOnAktienList.remove(aktie.isin) }
@@ -601,6 +613,12 @@ struct ContentView: View {
                 }
             }
             }
+        }
+        .navigationDestination(for: String.self) { isin in
+            if let aktie = aktien.first(where: { $0.isin == isin }) {
+                AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+            }
+        }
         }
 #if os(macOS)
             .navigationSplitViewColumnWidth(min: 300, ideal: 350)
@@ -801,7 +819,7 @@ struct ContentView: View {
                 .allowsHitTesting(false)
             }
         }
-        .confirmationDialog("OpenAI-Ersatz übernehmen?", isPresented: $unrealistischConfirm.isPresented) {
+        .confirmationDialog(unrealistischConfirm.dialogTitle.isEmpty ? "OpenAI-Ersatz übernehmen?" : unrealistischConfirm.dialogTitle, isPresented: $unrealistischConfirm.isPresented) {
             Button("Ja, übernehmen") {
                 unrealistischConfirm.choose(true)
             }
@@ -813,7 +831,8 @@ struct ContentView: View {
             }
         } message: {
             if let orig = unrealistischConfirm.original, let repl = unrealistischConfirm.replacement {
-                Text("Original: \(String(format: "%.2f", orig.kursziel)) \(orig.waehrung ?? "EUR"). OpenAI-Ersatz: \(String(format: "%.2f", repl.kursziel)) \(repl.waehrung ?? "EUR"). Übernehmen?")
+                let name = unrealistischConfirm.aktienBezeichnung.isEmpty ? "Aktie" : unrealistischConfirm.aktienBezeichnung
+                Text("\(name): Original \(String(format: "%.2f", orig.kursziel)) \(orig.waehrung ?? "EUR"). OpenAI-Ersatz: \(String(format: "%.2f", repl.kursziel)) \(repl.waehrung ?? "EUR"). Übernehmen?")
             }
         }
     }
@@ -847,12 +866,14 @@ struct ContentView: View {
         let gesamtwertVoreinlesung = alteAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
         
         // 1. Alle CSV-Daten einlesen und als neue Zeilen einfügen
+        var csvHadKursziele = false
         for url in urls {
             do {
                 _ = url.startAccessingSecurityScopedResource()
                 defer { url.stopAccessingSecurityScopedResource() }
                 
-                let (neueAktien, zeilenGesamt, zeilenImportiert) = try CSVParser.parseCSVWithStats(from: url)
+                let (neueAktien, zeilenGesamt, zeilenImportiert, hadKursziele) = try CSVParser.parseCSVWithStats(from: url)
+                csvHadKursziele = csvHadKursziele || hadKursziele
                 zeilenVerarbeitet += zeilenImportiert
                 if zeilenGesamt > zeilenImportiert {
                     parseHinweise.append("\(url.lastPathComponent): \(zeilenGesamt) Zeilen, \(zeilenImportiert) importiert (\(zeilenGesamt - zeilenImportiert) übersprungen)")
@@ -876,6 +897,10 @@ struct ContentView: View {
         
         // Gespeicherte manuelle Kursziele (nach „Löschen und Kursziele merken“) wieder zuordnen
         let wiederZugeordnet = applySavedManualKursziele(to: alleNeuenAktien)
+        
+        // Abgleich pro Bankleistungsnummer: Nur Konten, die in der CSV vorkommen, werden aktualisiert.
+        // Alte Positionen dieser Konten werden entfernt (Verkäufe) – andere Konten (BL nicht in CSV) bleiben unverändert.
+        let csvBankleistungsnummern = Set(alleNeuenAktien.map { $0.bankleistungsnummer.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
         
         // 2. Vergleiche alt/neu: previousMarktwertEUR, previousBestand, previousKurs, Kursziel etc. von alter Position übernehmen
         // Matching erfolgt über bankleistungsnummer UND (WKN ODER ISIN)
@@ -927,9 +952,12 @@ struct ContentView: View {
             }
         }
         
-        // 3. Alte Zeilen löschen
+        // 3. Alte Zeilen nur für die in der CSV vorkommenden Bankleistungsnummern löschen (Abgleich: verkaufte/entfernte Positionen weg)
         for alte in alteAktien {
-            modelContext.delete(alte)
+            let alteBL = alte.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
+            if !alteBL.isEmpty && csvBankleistungsnummern.contains(alteBL) {
+                modelContext.delete(alte)
+            }
         }
         
         let gesamtwertAktuelleEinlesung = alleNeuenAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
@@ -965,14 +993,15 @@ struct ContentView: View {
         importMessage = message
         showImportMessage = true
         
-        // Kurszielermittlung erst nach OK auf dem Import-Alert starten; bei Daten vor Tagesdatum vorher abfragen
+        // Kurszielermittlung erst nach OK auf dem Import-Alert starten; bei Daten vor Tagesdatum vorher abfragen.
+        // CSV ohne Kursziele: alle Werte neu berechnen (auch mit C gekennzeichnete), daher forceOverwrite.
         let sollAktualisieren: (Aktie) -> Bool = { a in
-            if forceOverwriteAllKursziele { return !a.kurszielManuellGeaendert }
+            if forceOverwriteAllKursziele || !csvHadKursziele { return !a.kurszielManuellGeaendert }
             return !a.kurszielManuellGeaendert && a.kurszielQuelle != "C" && a.kursziel == nil
         }
-        let brauchtKursziel = !alleNeuenAktien.filter(sollAktualisieren).isEmpty
+        let brauchtKursziel = !csvHadKursziele || !alleNeuenAktien.filter(sollAktualisieren).isEmpty
         if brauchtKursziel {
-            pendingKurszielForceOverwrite = forceOverwriteAllKursziele
+            pendingKurszielForceOverwrite = forceOverwriteAllKursziele || !csvHadKursziele
             let startOfToday = Calendar.current.startOfDay(for: Date())
             if einleseDatum < startOfToday {
                 showKurszielAbfrageBeiAltemDatum = true
@@ -983,6 +1012,7 @@ struct ContentView: View {
     }
     
     private func startPendingKurszielFetch() {
+        KurszielService.clearCachesForApiCalls()
         let forceOverwrite = pendingKurszielForceOverwrite
         let sollAktualisieren: (Aktie) -> Bool = { a in
             if forceOverwrite { return !a.kurszielManuellGeaendert }
@@ -995,6 +1025,7 @@ struct ContentView: View {
     }
     
     private func fetchKurszieleViaOpenAI() {
+        KurszielService.clearCachesForApiCalls()
         guard !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         KurszielService.openAIAPIKey = openAIAPIKeyStore.trimmingCharacters(in: .whitespaces)
         isImportingKurszieleOpenAI = true
@@ -1005,15 +1036,19 @@ struct ContentView: View {
                 await MainActor.run {
                     aktuelleKurszielAktie = (bezeichnung: aktie.bezeichnung, wkn: aktie.wkn)
                 }
-                if let info = await KurszielService.fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                    await MainActor.run {
-                        aktie.kursziel = info.kursziel
-                        aktie.kurszielDatum = info.datum
-                        aktie.kurszielAbstand = info.spalte4Durchschnitt
-                        aktie.kurszielQuelle = info.quelle.rawValue
-                        aktie.kurszielWaehrung = info.waehrung
-                        aktie.kurszielManuellGeaendert = false
-                        try? modelContext.save()
+                if var info = await KurszielService.fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                    info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
+                    let refPrice = aktie.kurs ?? aktie.einstandskurs
+                    if KurszielService.isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
+                        await MainActor.run {
+                            aktie.kursziel = info.kursziel
+                            aktie.kurszielDatum = info.datum
+                            aktie.kurszielAbstand = info.spalte4Durchschnitt
+                            aktie.kurszielQuelle = info.quelle.rawValue
+                            aktie.kurszielWaehrung = info.waehrung
+                            aktie.kurszielManuellGeaendert = false
+                            try? modelContext.save()
+                        }
                     }
                 }
             }
@@ -1025,17 +1060,22 @@ struct ContentView: View {
     }
     
     private func fetchKurszieleForAktien(_ aktienListe: [Aktie], forceOverwrite: Bool = false) async {
+        KurszielService.clearCachesForApiCalls()
         await MainActor.run { 
             isImportingKursziele = true
             aktuelleKurszielAktie = nil
         }
         KurszielService.clearDebugLog()
-        KurszielService.onUnrealistischErsatzBestätigen = { original, replacement in
-            await UnrealistischConfirmHelper.shared.confirm(original: original, replacement: replacement)
-        }
+        // Bei automatischer Einlesung: keinen Dialog anzeigen, OpenAI-Ersatz nicht übernehmen (nur Werte übernehmen, die realistisch sind)
+        KurszielService.onUnrealistischErsatzBestätigen = { _, _, _ in false }
         
-        // Nicht überschreiben: manuell geändert oder aus CSV (C), außer „Alle überschreiben“ ist an
-        let sollUeberschreiben: (Aktie) -> Bool = { forceOverwrite || (!$0.kurszielManuellGeaendert && $0.kurszielQuelle != "C") }
+        // Nicht überschreiben: manuell geändert; oder aus CSV (C) mit Wert – außer „Alle überschreiben“. Ohne Kursziel immer abrufen (auch bei Quelle C), damit FMP/OpenAI etc. einen Wert liefern können.
+        let sollUeberschreiben: (Aktie) -> Bool = { a in
+            if forceOverwrite { return !a.kurszielManuellGeaendert }
+            if a.kurszielManuellGeaendert { return false }
+            if a.kursziel == nil { return true }
+            return a.kurszielQuelle != "C"
+        }
         let listToProcess = aktienListe.filter(sollUeberschreiben)
         
         // 1. FMP Bulk-Abruf für die zu bearbeitenden Aktien
@@ -1068,7 +1108,8 @@ struct ContentView: View {
                 info = await KurszielService.fetchKursziel(for: aktie)
             }
             
-            if let info = info {
+            let refPrice = aktie.kurs ?? aktie.einstandskurs
+            if let info = info, KurszielService.isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
                 await MainActor.run {
                     aktie.kursziel = info.kursziel
                     aktie.kurszielDatum = info.datum
@@ -1262,6 +1303,7 @@ private struct KurszielZeileView: View {
     var onRowEdited: ((String) -> Void)? = nil
     var onKurszielSuchenTapped: ((String) -> Void)? = nil
     @State private var showZwischenablageFeedback = false
+    @State private var showChatGPTPromptFeedback = false
     @State private var showFMPTest = false
     @State private var showFinanzenNetTest = false
     @State private var showSnippetTest = false
@@ -1272,6 +1314,8 @@ private struct KurszielZeileView: View {
     @State private var showKurszielFromFileConfirm = false
     @State private var pendingOpenAIInfo: KurszielInfo? = nil
     @State private var showOpenAIÜbernehmenConfirm = false
+    /// Generation des letzten OpenAI-Abrufs – nur dessen Ergebnis anzeigen (verhindert Mischung bei mehrfachem Tippen)
+    @State private var openAIRequestGeneration: Int = 0
     
     private var istFonds: Bool { aktie.gattung.localizedCaseInsensitiveContains("Fonds") }
     
@@ -1305,12 +1349,40 @@ private struct KurszielZeileView: View {
     }
     
     private static let chatGPTURL = URL(string: "https://chat.openai.com/")!
+    /// Baut exakten Prompt für ChatGPT: „ISIN … durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert“ (nur ISIN/WKN, keine Bezeichnung).
+    private func buildChatGPTPrompt(for aktie: Aktie) -> String {
+        let isin = aktie.isin.trimmingCharacters(in: .whitespaces)
+        let wkn = aktie.wkn.trimmingCharacters(in: .whitespaces)
+        let kennung = isin.count >= 10 ? "ISIN \(isin)" : (wkn.isEmpty ? "ISIN \(isin)" : "WKN \(wkn)")
+        return "\(kennung) durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert"
+    }
     private func openChatGPT() {
+        let prompt = buildChatGPTPrompt(for: aktie)
+        showChatGPTPromptFeedback = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            showChatGPTPromptFeedback = false
+        }
+        // Zwischenablage sofort und direkt vor dem Öffnen setzen, damit beim Laden/Einfügen der Prompt (nicht die Bezeichnung) verwendet wird
         #if os(iOS)
-        UIApplication.shared.open(Self.chatGPTURL)
+        UIPasteboard.general.string = prompt
         #elseif os(macOS)
-        NSWorkspace.shared.open(Self.chatGPTURL)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(prompt, forType: .string)
         #endif
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            // Nochmals setzen, damit nichts anderes (z. B. Bezeichnung) die Zwischenablage überschrieben hat
+            #if os(iOS)
+            UIPasteboard.general.string = prompt
+            #elseif os(macOS)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(prompt, forType: .string)
+            #endif
+            #if os(iOS)
+            UIApplication.shared.open(Self.chatGPTURL)
+            #elseif os(macOS)
+            NSWorkspace.shared.open(Self.chatGPTURL)
+            #endif
+        }
     }
     
     var body: some View {
@@ -1345,7 +1417,17 @@ private struct KurszielZeileView: View {
                     Button("ChatGPT") { openChatGPT() }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+                    if showChatGPTPromptFeedback {
+                        Text("Zwischenablage")
+                            .font(.caption2)
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 3)
+                            .background(Color.accentColor.opacity(0.9))
+                            .cornerRadius(4)
                     }
+                    }
+                    .animation(.easeInOut(duration: 0.2), value: showChatGPTPromptFeedback)
                     Text(aktie.bezeichnung)
                         .font(.subheadline)
                         .fontWeight(.medium)
@@ -1362,7 +1444,7 @@ private struct KurszielZeileView: View {
                         .foregroundColor(aktie.zeigeAlsUnrealistisch ? .orange : .green)
                     if let q = aktie.kurszielQuelle {
                         VStack(alignment: .trailing, spacing: 2) {
-                            Text(quelleLabel(q, manuell: aktie.kurszielManuellGeaendert))
+                            Text("\(q) · \(quelleLabel(q, manuell: aktie.kurszielManuellGeaendert))")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                             if q == KurszielQuelle.suchmaschine.rawValue,
@@ -1530,7 +1612,7 @@ private struct KurszielZeileView: View {
                 Text("Kursziel \(String(format: "%.2f", kz)) EUR aus Datei übernehmen?")
             }
         }
-        .confirmationDialog("Kursziel übernehmen?", isPresented: $showOpenAIÜbernehmenConfirm) {
+        .confirmationDialog("Kursziel übernehmen? – \(aktie.bezeichnung)", isPresented: $showOpenAIÜbernehmenConfirm) {
             Button("Ja, übernehmen") {
                 if let info = pendingOpenAIInfo {
                     aktie.kursziel = info.kursziel
@@ -1552,8 +1634,13 @@ private struct KurszielZeileView: View {
             }
         } message: {
             if let info = pendingOpenAIInfo {
-                Text("Kursziel \(String(format: "%.2f", info.kursziel)) \(info.waehrung ?? "EUR") von OpenAI übernehmen?")
+                Text("\(aktie.bezeichnung): Kursziel \(String(format: "%.2f", info.kursziel)) \(info.waehrung ?? "EUR") von OpenAI übernehmen?")
             }
+        }
+        .onChange(of: aktie.isin) { _, _ in
+            openAIRequestGeneration = 0
+            pendingOpenAIInfo = nil
+            showOpenAIÜbernehmenConfirm = false
         }
     }
     
@@ -1650,11 +1737,17 @@ private struct KurszielZeileView: View {
     }
     
     private func loadKurszielViaOpenAI() {
+        KurszielService.clearCachesForApiCalls()
         guard KurszielService.openAIAPIKey != nil else {
             KurszielService.clearDebugLog()
             KurszielService.debugLog.append("[\(DateFormatter.localizedString(from: Date(), dateStyle: .none, timeStyle: .medium))] ❌ OpenAI API-Key nicht konfiguriert (Einstellungen)")
             return
         }
+        // Alte Dialog-Daten und vorherige Abrufe ignorieren – nur dieser Abruf zählt
+        pendingOpenAIInfo = nil
+        showOpenAIÜbernehmenConfirm = false
+        openAIRequestGeneration += 1
+        let generation = openAIRequestGeneration
         isLoadingOpenAI = true
         KurszielService.clearDebugLog()
         KurszielService.debugAppend("━━━ OpenAI Kursziel (Button) ━━━")
@@ -1663,17 +1756,21 @@ private struct KurszielZeileView: View {
             if var info = await KurszielService.fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
                 info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
                 await MainActor.run {
+                    guard generation == openAIRequestGeneration else { return }
                     KurszielService.debugAppend("   ✅ Erfolg: \(info.kursziel) \(info.waehrung ?? "EUR")")
                     pendingOpenAIInfo = info
                     showOpenAIÜbernehmenConfirm = true
                 }
             } else {
                 await MainActor.run {
+                    guard generation == openAIRequestGeneration else { return }
                     KurszielService.debugAppend("   ❌ Kein Kursziel erhalten")
                 }
             }
             await MainActor.run {
-                isLoadingOpenAI = false
+                if generation == openAIRequestGeneration {
+                    isLoadingOpenAI = false
+                }
             }
         }
     }
@@ -1959,6 +2056,7 @@ struct AktieDetailView: View {
         .navigationTitle(aktie.bezeichnung)
         .navigationBarTitleDisplayMode(.inline)
         #if os(iOS)
+        .toolbar(.visible, for: .tabBar)
         .toolbar {
             ToolbarItemGroup(placement: .keyboard) {
                 Spacer()
@@ -1971,6 +2069,7 @@ struct AktieDetailView: View {
     }
     
     private func loadKursziel() {
+        KurszielService.clearCachesForApiCalls()
         guard !aktie.kurszielManuellGeaendert else {
             isLoadingKursziel = false
             return
@@ -1979,6 +2078,12 @@ struct AktieDetailView: View {
         kurszielError = nil
         
         Task {
+            // Dialog „OpenAI-Ersatz übernehmen?“ nur bei manueller Anwahl aus der Kurszielmaske anzeigen
+            KurszielService.onUnrealistischErsatzBestätigen = { original, replacement, aktieIn in
+                await UnrealistischConfirmHelper.shared.confirm(original: original, replacement: replacement, aktie: aktieIn)
+            }
+            defer { KurszielService.onUnrealistischErsatzBestätigen = nil }
+            
             if let kurszielInfo = await KurszielService.fetchKursziel(for: aktie) {
                 await MainActor.run {
                     aktie.kursziel = kurszielInfo.kursziel
@@ -3000,6 +3105,7 @@ struct SettingsView: View {
     }
     
     private func testFMPAlleAPIs() {
+        KurszielService.clearCachesForApiCalls()
         guard !fmpAPIKey.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         KurszielService.fmpAPIKey = fmpAPIKey.trimmingCharacters(in: .whitespaces)
         isTestingFMPAPIs = true
@@ -3014,6 +3120,7 @@ struct SettingsView: View {
     }
     
     private func testFMPConnection() {
+        KurszielService.clearCachesForApiCalls()
         guard !fmpAPIKey.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         KurszielService.fmpAPIKey = fmpAPIKey.trimmingCharacters(in: .whitespaces)
         isTestingFMP = true
@@ -3028,6 +3135,7 @@ struct SettingsView: View {
     }
     
     private func testConnection() {
+        KurszielService.clearCachesForApiCalls()
         guard !openAIAPIKey.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         KurszielService.openAIAPIKey = openAIAPIKey.trimmingCharacters(in: .whitespaces)
         isTestingConnection = true
