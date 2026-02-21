@@ -254,6 +254,48 @@ private struct DevisenkursKopfView: View {
     }
 }
 
+/// Einfacher Balken-Chart: Gesamtwert pro Einlesedatum (nutzt nur vorhandene ImportSummary-Daten)
+private struct EinlesungenChartView: View {
+    var summaries: [ImportSummary]
+    var body: some View {
+        let values = summaries.map(\.gesamtwertAktuelleEinlesung)
+        let minVal = values.min() ?? 0
+        let maxVal = values.max() ?? 1
+        let range = maxVal - minVal
+        VStack(alignment: .leading, spacing: 4) {
+            Text("Gesamtwert pro Einlesung")
+                .font(.caption2)
+                .foregroundColor(.secondary)
+            GeometryReader { geo in
+                let barAreaHeight = max(20, geo.size.height - 38)
+                HStack(alignment: .bottom, spacing: 6) {
+                    ForEach(Array(summaries.enumerated()), id: \.element.importDatum) { _, s in
+                        let val = s.gesamtwertAktuelleEinlesung
+                        let fraction = range > 0 ? (val - minVal) / range : 1.0
+                        VStack(spacing: 2) {
+                            Text("\(val, specifier: "%.0f") €")
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(Color.accentColor.opacity(0.8))
+                                .frame(height: max(4, fraction * barAreaHeight))
+                            Text(s.datumAktuelleEinlesung.formatted(.dateTime.day().month(.abbreviated)))
+                                .font(.system(size: 9))
+                                .foregroundColor(.secondary)
+                                .lineLimit(1)
+                        }
+                        .frame(maxWidth: .infinity)
+                    }
+                }
+            }
+        }
+        .padding(8)
+        .background(Color(.systemGroupedBackground))
+        .cornerRadius(8)
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: [SortDescriptor<Aktie>(\.bankleistungsnummer), SortDescriptor<Aktie>(\.bezeichnung)]) private var aktien: [Aktie]
@@ -303,6 +345,8 @@ struct ContentView: View {
     @State private var visibleISINsOnAktienList: Set<String> = []
     /// true = Liste nach grösster Differenz Kurs ↔ Kursziel sortieren, mit % zum Ziel
     @State private var sortiereNachAbstandKursziel = false
+    /// true = Chart über den 5 Einlesungen (Gesamtwert pro Datum) anzeigen
+    @State private var showEinlesungenChart = false
     /// Pfad für Aktien-Detail (nur unser Chevron, kein System-Chevron)
     @State private var aktienDetailPath: [String] = []
     
@@ -457,6 +501,12 @@ struct ContentView: View {
                 let letzteFuenf = Array(importSummaries.prefix(5)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
                 if !letzteFuenf.isEmpty {
                     Section {
+                        if showEinlesungenChart {
+                            EinlesungenChartView(summaries: letzteFuenf)
+                                .frame(height: 160)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        }
                         let ausgangsbasis = letzteFuenf.first
                         ForEach(Array(letzteFuenf.enumerated()), id: \.element.importDatum) { _, summary in
                             VStack(alignment: .leading, spacing: 6) {
@@ -510,7 +560,14 @@ struct ContentView: View {
                             .padding(.vertical, 4)
                         }
                     } header: {
-                        Text("Gesamtsummen (letzte 5 Einlesungen)")
+                        HStack {
+                            Text("Gesamtsummen (letzte 5 Einlesungen)")
+                            Spacer()
+                            Button(showEinlesungenChart ? "Chart aus" : "Chart") {
+                                showEinlesungenChart.toggle()
+                            }
+                            .font(.caption)
+                        }
                     } footer: {
                         Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis für die Veränderung ist die Einlesung mit dem ältesten Datum – auch wenn Sie zuerst neuere Daten eingelesen haben.")
                             .font(.caption2)
