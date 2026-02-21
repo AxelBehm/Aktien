@@ -166,6 +166,15 @@ enum AktieStatus {
 }
 
 extension Aktie {
+    /// true, wenn Gattung oder Bezeichnung Fonds, Fund oder ETF enthält – diese Positionen sind ggf. manuell mit Kurszielen zu versehen.
+    var istFonds: Bool {
+        func contains(_ s: String) -> Bool {
+            let t = s.trimmingCharacters(in: .whitespaces)
+            return t.localizedCaseInsensitiveContains("Fonds") || t.localizedCaseInsensitiveContains("Fund") || t.localizedCaseInsensitiveContains("ETF")
+        }
+        return contains(gattung) || contains(bezeichnung)
+    }
+    
     /// Prüft ob Kursziel plausibel ist (z.B. nicht 19,77€ bei Amazon ~197€). Abwärts: mind. 50 % des Kurses.
     var isKurszielPlausibel: Bool {
         guard let kz = kursziel, kz >= 1 else { return false }
@@ -358,8 +367,15 @@ struct ContentView: View {
                 .fill(aktie.status.color)
                 .frame(width: 12, height: 12)
             VStack(alignment: .leading, spacing: 4) {
-                Text(aktie.bezeichnung)
-                    .font(.headline)
+                HStack(spacing: 6) {
+                    Text(aktie.bezeichnung)
+                        .font(.headline)
+                    if aktie.istFonds {
+                        Image(systemName: "building.2.fill")
+                            .font(.caption2)
+                            .foregroundColor(.purple)
+                    }
+                }
                 HStack {
                     Text("Bestand: \(aktie.bestand, specifier: "%.2f")")
                     Spacer()
@@ -409,8 +425,21 @@ struct ContentView: View {
         }
     }
 
+    /// Tab-Wechsel: Kursziele-Tab nur, wenn bereits eine Aktie für Grunddaten angewählt wurde
+    private var selectedTabBinding: Binding<Int> {
+        Binding(
+            get: { selectedTab },
+            set: { new in
+                if new == 1, currentDetailISIN == nil {
+                    return
+                }
+                selectedTab = new
+            }
+        )
+    }
+
     var body: some View {
-        TabView(selection: $selectedTab) {
+        TabView(selection: selectedTabBinding) {
             NavigationSplitView {
             NavigationStack(path: $aktienDetailPath) {
             VStack(spacing: 0) {
@@ -420,7 +449,8 @@ struct ContentView: View {
                 // Gesamtsummen der letzten 5 Einlesungen (Datum aus Dateinamen z.B. Bestandsaufstellung_20260205_130835)
                 let letzteFuenf = Array(importSummaries.prefix(5))
                 if !letzteFuenf.isEmpty {
-                    Section("Gesamtsummen (letzte 5 Einlesungen)") {
+                    Section {
+                        let ausgangsbasis = letzteFuenf.last
                         ForEach(Array(letzteFuenf.enumerated()), id: \.element.importDatum) { _, summary in
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
@@ -438,7 +468,18 @@ struct ContentView: View {
                                         .font(.caption)
                                         .fontWeight(.medium)
                                 }
-                                if summary.gesamtwertVoreinlesung > 0 {
+                                if let basis = ausgangsbasis, basis.importDatum != summary.importDatum, basis.gesamtwertAktuelleEinlesung > 0 {
+                                    let differenz = summary.gesamtwertAktuelleEinlesung - basis.gesamtwertAktuelleEinlesung
+                                    HStack {
+                                        Text("Veränderung zur Ausgangsbasis (\(basis.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))):")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                        Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
+                                            .font(.caption)
+                                            .foregroundColor(differenz >= 0 ? .green : .red)
+                                    }
+                                } else if summary.gesamtwertVoreinlesung > 0, ausgangsbasis == nil || ausgangsbasis?.importDatum == summary.importDatum {
                                     HStack {
                                         Text("Voreinlesung:")
                                             .font(.caption)
@@ -461,12 +502,28 @@ struct ContentView: View {
                             }
                             .padding(.vertical, 4)
                         }
+                    } header: {
+                        Text("Gesamtsummen (letzte 5 Einlesungen)")
+                    } footer: {
+                        Text("Ausgangsbasis für die Veränderung ist die Einlesung mit dem ältesten Datum (Datum aus dem Dateinamen der Einlesedatei, z. B. Bestandsaufstellung_20260205_130835).")
+                            .font(.caption2)
                     }
                 }
                 
-                // Legende oben
+                // Legende oben – Fonds/Fund/ETF-Positionen ggf. manuell mit Kurszielen versehen
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
+                        Text("Fonds-, Fund- und ETF-Positionen sind ggf. manuell mit Kurszielen zu versehen.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        HStack(spacing: 8) {
+                            Image(systemName: "building.2.fill")
+                                .font(.caption)
+                                .foregroundColor(.purple)
+                            Text("Fonds / Fund / ETF – Kursziel ggf. manuell setzen")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
                         HStack(spacing: 8) {
                             Circle().fill(Color.green).frame(width: 10, height: 10)
                             Text("Kursziel erreicht oder mind. 2 % am Ziel")
@@ -541,6 +598,10 @@ struct ContentView: View {
                         }
                     } header: {
                         Text("Nach Abstand zum Kursziel (grösste Differenz zuerst)")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } footer: {
+                        Text("Zwischensummen pro BL: Toolbar-Button „Sortierung: Standard“ tippen.")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -1317,7 +1378,7 @@ private struct KurszielZeileView: View {
     /// Generation des letzten OpenAI-Abrufs – nur dessen Ergebnis anzeigen (verhindert Mischung bei mehrfachem Tippen)
     @State private var openAIRequestGeneration: Int = 0
     
-    private var istFonds: Bool { aktie.gattung.localizedCaseInsensitiveContains("Fonds") }
+    private var istFonds: Bool { aktie.istFonds }
     
     private func googleKurszielURL(isin: String) -> URL {
         let query = (isin + " Kursziel").addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? (isin + " Kursziel")
@@ -1754,7 +1815,7 @@ private struct KurszielZeileView: View {
         KurszielService.debugAppend("   Aktie: \(aktie.bezeichnung), WKN: \(aktie.wkn), ISIN: \(aktie.isin)")
         Task {
             if var info = await KurszielService.fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie)
+                info = await KurszielService.kurszielInfoZuEUR(info: info, aktie: aktie, usdToEurFromHeader: AppWechselkurse.shared.usdToEur, gbpToEurFromHeader: AppWechselkurse.shared.gbpToEur)
                 await MainActor.run {
                     guard generation == openAIRequestGeneration else { return }
                     KurszielService.debugAppend("   ✅ Erfolg: \(info.kursziel) \(info.waehrung ?? "EUR")")
@@ -1904,16 +1965,6 @@ struct AktieDetailView: View {
                             #endif
                         }
                         .font(.caption)
-                    }
-                    Button("Kursziel suchen") {
-                        let q = (aktie.isin + " Kursziel").addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? (aktie.isin + " Kursziel")
-                        if let url = URL(string: "https://www.google.com/search?q=\(q)") {
-                            #if os(iOS)
-                            UIApplication.shared.open(url)
-                            #elseif os(macOS)
-                            NSWorkspace.shared.open(url)
-                            #endif
-                        }
                     }
                 }
                 Text("Eingabe = manuell (wird beim nächsten Kursziel-Abruf nicht überschrieben)")

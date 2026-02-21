@@ -206,7 +206,19 @@ class KurszielService {
             }
             debug("   ❌ Kein Kursziel von FMP")
             
-            // 1b. Nur für Fonds: Snippet früh (vor OpenAI/finanzen.net/Yahoo – spart Zeit, da diese für Fonds meist leer)
+            // 1a. OpenAI (gleiche Abfrage-/Parsing-Logik wie Button: Antwort:, Rückgabe:, Ergebnis:, in Euro beträgt: etc.)
+            if openAIAPIKey != nil {
+                debug("1a️⃣ Versuche OpenAI für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
+                if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (OpenAI)")
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
+                }
+                debug("   ❌ Kein Kursziel von OpenAI")
+            }
+            
+            // 1b. Nur für Fonds: Snippet früh (vor finanzen.net/Yahoo – spart Zeit, da diese für Fonds meist leer)
             if istFonds(aktie) {
                 debug("1b️⃣ [Fonds] Versuche Suchsnippet (DuckDuckGo) für \(aktie.bezeichnung)")
                 if let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
@@ -360,7 +372,7 @@ class KurszielService {
     
     /// true wenn Gattung "Fonds" enthält (nur für Fonds wird der Snippet-Fallback genutzt)
     private static func istFonds(_ aktie: Aktie) -> Bool {
-        aktie.gattung.localizedCaseInsensitiveContains("Fonds")
+        aktie.istFonds
     }
     
     /// Öffentlich für FMP-Bulk/Form: Wendet bei unrealistischem Kursziel OpenAI-Versuch an. Gibt Ersatz oder Original zurück.
@@ -1177,9 +1189,26 @@ class KurszielService {
     /// System-Prompt für OpenAI Kursziel (mit web_search)
     private static let openAISystemPrompt = "Rückgabe nur den Wert oder -1 wenn nichts gefunden wird."
     
+    /// Entfernt Leerzeichen als Tausendertrennzeichen (z. B. "2 127,25" → "2127,25"), mehrfach für "1 234 567,89".
+    private static func openAINormalizeThousandSeparatorSpaces(_ s: String) -> String {
+        var t = s
+        let pattern = #"(\d+)\s+(\d{3})(?=,\d|\s\d{3}|$)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return s }
+        while true {
+            let nsRange = NSRange(t.startIndex..<t.endIndex, in: t)
+            let match = regex.firstMatch(in: t, range: nsRange)
+            guard let m = match, m.numberOfRanges >= 3,
+                  let r1 = Range(m.range(at: 1), in: t),
+                  let r2 = Range(m.range(at: 2), in: t) else { break }
+            t.replaceSubrange(r1.upperBound..<r2.lowerBound, with: "")
+        }
+        return t
+    }
+    
     /// Parst Modellantwort zu Kursziel. Findet plausibelste Zahl (ignoriert Jahre 1990–2030, bevorzugt Werte nahe EUR/€).
     private static func openAIParseKursziel(_ s: String) -> Double? {
-        let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        var trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
+        trimmed = openAINormalizeThousandSeparatorSpaces(trimmed)
         if trimmed == "-1" { return nil }
         let pattern = #"-?\d[\d\.,]*"#
         let nsRange = NSRange(trimmed.startIndex..<trimmed.endIndex, in: trimmed)
@@ -1207,12 +1236,22 @@ class KurszielService {
             var score = 0.0
             if val >= 0.01 && val <= 500_000 { score += 10 }
             let pos = trimmed.distance(from: trimmed.startIndex, to: range.lowerBound)
+            let matchEnd = trimmed.index(range.upperBound, offsetBy: 0)
+            let afterMatch = trimmed[matchEnd...].trimmingCharacters(in: .whitespacesAndNewlines)
+            let afterMatchLower = afterMatch.lowercased()
+            // Starker Bonus: Zahl steht direkt vor USD/EUR/GBP/€ (z. B. "**50,11 USD**") – verhindert, dass ISIN-Ziffern (z. B. 982) gewählt werden
+            if afterMatchLower.hasPrefix("usd") || afterMatchLower.hasPrefix("eur") || afterMatchLower.hasPrefix("gbp") || afterMatchLower.hasPrefix("€")
+                || afterMatchLower.hasPrefix("*usd") || afterMatchLower.hasPrefix("*eur") || afterMatchLower.hasPrefix("*gbp")
+                || afterMatchLower.hasPrefix("**usd") || afterMatchLower.hasPrefix("**eur") || afterMatchLower.hasPrefix("**gbp") {
+                score += 25
+            }
             let ctxStart = max(0, pos - 40)
             let ctxEnd = min(trimmed.count, pos + numStr.count + 40)
             let startIdx = trimmed.index(trimmed.startIndex, offsetBy: ctxStart)
             let endIdx = trimmed.index(trimmed.startIndex, offsetBy: ctxEnd)
             let context = String(trimmed[startIdx..<endIdx]).lowercased()
             if context.contains("eur") || context.contains("€") || context.contains("kursziel") || context.contains("ziel") || context.contains("angehoben") { score += 5 }
+            if context.contains("usd") { score += 5 }
             if val == floor(val) && val < 1000 { score += 2 }
             if score > bestScore { bestScore = score; best = val }
         }
@@ -1230,12 +1269,13 @@ class KurszielService {
     }
     
     /// Öffentlich: Konvertiert KurszielInfo von USD/GBP in EUR (für Button-Flows wie OpenAI, Aus Datei).
-    static func kurszielInfoZuEUR(info: KurszielInfo, aktie: Aktie) async -> KurszielInfo {
-        return await kurszielZuEUR(info: info, aktie: aktie)
+    /// usdToEurFromHeader/gbpToEurFromHeader: Wechselkurse aus dem App-Kopf; wenn Service keinen Kurs hat (z. B. nach OpenAI-Button), werden diese verwendet.
+    static func kurszielInfoZuEUR(info: KurszielInfo, aktie: Aktie, usdToEurFromHeader: Double? = nil, gbpToEurFromHeader: Double? = nil) async -> KurszielInfo {
+        return await kurszielZuEUR(info: info, aktie: aktie, usdToEurFromHeader: usdToEurFromHeader, gbpToEurFromHeader: gbpToEurFromHeader)
     }
 
     /// Konvertiert KurszielInfo in EUR: USD/GBP mit App-Wechselkurs; andere Währungen mit 1 (keine Umrechnung, manuell zu ändern).
-    private static func kurszielZuEUR(info: KurszielInfo, aktie: Aktie) async -> KurszielInfo {
+    private static func kurszielZuEUR(info: KurszielInfo, aktie: Aktie, usdToEurFromHeader: Double? = nil, gbpToEurFromHeader: Double? = nil) async -> KurszielInfo {
         if info.ohneDevisenumrechnung {
             debug("   💱 Wert unverändert übernommen (keine Umrechnung)")
             return info
@@ -1243,8 +1283,8 @@ class KurszielService {
         let w = (info.waehrung ?? "EUR").uppercased()
         if w == "EUR" { return info }
         if w == "USD" {
-            let rate = rateUSDtoEUR()
-            debug("   💱 USD→EUR mit App-Kurs: \(rate)")
+            let rate = usdToEurFromHeader ?? rateUSDtoEUR()
+            debug("   💱 USD→EUR mit App-Kurs: \(rate)" + (usdToEurFromHeader != nil ? " (aus Kopf)" : ""))
             return KurszielInfo(
                 kursziel: info.kursziel * rate,
                 datum: info.datum,
@@ -1257,8 +1297,8 @@ class KurszielService {
             )
         }
         if w == "GBP" {
-            let rate = rateGBPtoEUR()
-            debug("   💱 GBP→EUR mit App-Kurs: \(rate)")
+            let rate = gbpToEurFromHeader ?? rateGBPtoEUR()
+            debug("   💱 GBP→EUR mit App-Kurs: \(rate)" + (gbpToEurFromHeader != nil ? " (aus Kopf)" : ""))
             return KurszielInfo(
                 kursziel: info.kursziel * rate,
                 datum: info.datum,
@@ -1741,7 +1781,31 @@ class KurszielService {
         do {
             let content = try await openAICallWithFallback(systemPrompt: openAISystemPrompt, userPrompt: prompt, apiKey: apiKey)
             debug("   📥 OpenAI Response (raw): \(content)")
-            let trimmed = content.trimmingCharacters(in: .whitespaces)
+            var trimmed = content.trimmingCharacters(in: .whitespacesAndNewlines)
+            // BOM und Nicht-Breaking Spaces entfernen, damit "Antwort:" am Anfang erkannt wird
+            if trimmed.hasPrefix("\u{FEFF}") { trimmed = String(trimmed.dropFirst()) }
+            trimmed = trimmed.replacingOccurrences(of: "\u{00A0}", with: " ")
+            trimmed = trimmed.trimmingCharacters(in: .whitespacesAndNewlines)
+            // "Antwort:" / "Rückgabe:" / "Ergebnis:" (+ etliche Leerzeichen/Zeilen) + Betrag → alles danach trimmen, Betrag parsen
+            for prefix in ["Antwort:", "Antwort :", "Rückgabe:", "Rückgabe :", "Ergebnis:", "Ergebnis :", "Answer:", "Answer :", "Somit lautet die Antwort:"] {
+                if let r = trimmed.range(of: prefix, options: [.caseInsensitive, .anchored]) {
+                    trimmed = String(trimmed[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            }
+            // Falls "Antwort:" / "Rückgabe:" / "Ergebnis:" nicht am Anfang stand: irgendwo suchen, Rest (etliche Leerzeichen + Wert) übernehmen
+            for fallback in ["Antwort:", "Antwort :", "Rückgabe:", "Rückgabe :", "Ergebnis:", "Ergebnis :", "Answer:", "Answer :"] {
+                if let r = trimmed.range(of: fallback, options: .caseInsensitive) {
+                    trimmed = String(trimmed[r.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+                    break
+                }
+            }
+            // "in Euro beträgt:" + ggf. 1–2 Zeilen nur Leerzeichen + Betrag (EUR) → alles nach "in Euro beträgt:" trimmen und Betrag parsen
+            if let euroRange = trimmed.range(of: "in Euro beträgt:", options: .caseInsensitive) {
+                trimmed = String(trimmed[euroRange.upperBound...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            // Markdown-Bold **Wert** oder *Wert* entfernen, damit z. B. "**10,45**" zu "10,45" wird
+            trimmed = trimmed.trimmingCharacters(in: CharacterSet(charactersIn: "*"))
             debug("   📥 OpenAI Response (content): \(trimmed)")
             guard let kursziel = openAIParseKursziel(trimmed), kursziel > 0 else {
                 debug("   ❌ OpenAI: Antwort konnte nicht geparst werden oder < 0")
