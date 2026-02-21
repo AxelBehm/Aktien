@@ -362,11 +362,11 @@ struct ContentView: View {
     
     @ViewBuilder
     private func aktienZeileLabel(aktie: Aktie, zeigeProzentZumZiel: Bool) -> some View {
-        HStack(spacing: 12) {
+        HStack(alignment: .top, spacing: 12) {
             Circle()
                 .fill(aktie.status.color)
                 .frame(width: 12, height: 12)
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(aktie.bezeichnung)
                         .font(.headline)
@@ -376,49 +376,56 @@ struct ContentView: View {
                             .foregroundColor(.purple)
                     }
                 }
-                HStack {
-                    Text("Bestand: \(aktie.bestand, specifier: "%.2f")")
-                    Spacer()
-                    if let gewinn = aktie.gewinnVerlustEUR {
-                        Text(gewinn >= 0 ? "+\(gewinn, specifier: "%.2f") €" : "\(gewinn, specifier: "%.2f") €")
-                            .foregroundColor(gewinn >= 0 ? .green : .red)
+                // Zeile 1: Bestand + Anzahl, Marktwert + Wert (gekürzte Labels)
+                HStack(spacing: 12) {
+                    Text("Stück \(aktie.bestand, specifier: "%.0f")")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    if let mw = aktie.marktwertEUR {
+                        Text("Marktw. \(mw, specifier: "%.2f") €")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                     }
                 }
-                .font(.caption)
-                .foregroundColor(.secondary)
-                if zeigeProzentZumZiel, let kurs = aktie.kurs ?? aktie.devisenkurs, let kz = aktie.kursziel, kurs > 0 {
-                    let pct = (kz - kurs) / kurs * 100
-                    HStack {
-                        Text("Zum Kursziel:")
+                // Zeile 2: Kurs alt, Kurs neu (nur wenn mindestens einer vorhanden)
+                if aktie.previousKurs != nil || (aktie.kurs ?? aktie.devisenkurs) != nil {
+                    HStack(spacing: 12) {
+                        if let alt = aktie.previousKurs {
+                            Text("Kurs alt \(alt, specifier: "%.2f")")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                        if let neu = aktie.kurs ?? aktie.devisenkurs {
+                            Text("Kurs neu \(neu, specifier: "%.2f")")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                // Zeile 3: Veränderung in % (auf Marktwert zur Voreinlesung)
+                if let prev = aktie.previousMarktwertEUR, let curr = aktie.marktwertEUR, prev > 0 {
+                    let pct = ((curr - prev) / prev) * 100
+                    HStack(spacing: 4) {
+                        Text("Veränd.")
                             .font(.caption2)
                             .foregroundColor(.secondary)
-                        Text("\(pct >= 0 ? "+" : "")\(pct, specifier: "%.1f")%")
+                        Text("\(pct >= 0 ? "+" : "")\(pct, specifier: "%.2f")%")
                             .font(.caption2)
                             .fontWeight(.medium)
                             .foregroundColor(pct >= 0 ? .green : .red)
                     }
                 }
-                if let prev = aktie.previousMarktwertEUR, let curr = aktie.marktwertEUR {
-                    let diff = curr - prev
-                    HStack {
-                        Text("Zur Voreinlesung:")
+                // Zeile 4: Kursziel, Abstand zum Kursziel (immer anzeigen wenn vorhanden)
+                if let kurs = aktie.kurs ?? aktie.devisenkurs, let kz = aktie.kursziel, kurs > 0 {
+                    let abstandPct = (kz - kurs) / kurs * 100
+                    HStack(spacing: 12) {
+                        Text("Kursziel \(kz, specifier: "%.2f")")
                             .font(.caption2)
                             .foregroundColor(.secondary)
-                        Text("\(diff >= 0 ? "+" : "")\(diff, specifier: "%.2f") €")
+                        Text("Abstand \(abstandPct >= 0 ? "+" : "")\(abstandPct, specifier: "%.1f")%")
                             .font(.caption2)
-                            .foregroundColor(diff >= 0 ? .green : .red)
-                    }
-                }
-                if let kursAlt = aktie.previousKurs, let kursAktuell = aktie.kurs ?? aktie.devisenkurs {
-                    let kursDiff = kursAktuell - kursAlt
-                    let kursDiffProzent = kursAlt > 0 ? (kursDiff / kursAlt) * 100 : 0
-                    HStack {
-                        Text("Kurs-Änderung:")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        Text("\(kursDiff >= 0 ? "+" : "")\(kursDiff, specifier: "%.4f") (\(kursDiff >= 0 ? "+" : "")\(kursDiffProzent, specifier: "%.2f")%)")
-                            .font(.caption2)
-                            .foregroundColor(kursDiff >= 0 ? .green : .red)
+                            .fontWeight(.medium)
+                            .foregroundColor(abstandPct >= 0 ? .green : .red)
                     }
                 }
             }
@@ -446,11 +453,11 @@ struct ContentView: View {
                 DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
             ScrollViewReader { proxy in
             List {
-                // Gesamtsummen der letzten 5 Einlesungen (Datum aus Dateinamen z.B. Bestandsaufstellung_20260205_130835)
-                let letzteFuenf = Array(importSummaries.prefix(5))
+                // Gesamtsummen der letzten 5 Einlesungen – sortiert nach Datum der Einlesedatei (ältestes zuerst), unabhängig von der Import-Reihenfolge
+                let letzteFuenf = Array(importSummaries.prefix(5)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
                 if !letzteFuenf.isEmpty {
                     Section {
-                        let ausgangsbasis = letzteFuenf.last
+                        let ausgangsbasis = letzteFuenf.first
                         ForEach(Array(letzteFuenf.enumerated()), id: \.element.importDatum) { _, summary in
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
@@ -505,7 +512,7 @@ struct ContentView: View {
                     } header: {
                         Text("Gesamtsummen (letzte 5 Einlesungen)")
                     } footer: {
-                        Text("Ausgangsbasis für die Veränderung ist die Einlesung mit dem ältesten Datum (Datum aus dem Dateinamen der Einlesedatei, z. B. Bestandsaufstellung_20260205_130835).")
+                        Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis für die Veränderung ist die Einlesung mit dem ältesten Datum – auch wenn Sie zuerst neuere Daten eingelesen haben.")
                             .font(.caption2)
                     }
                 }
@@ -923,6 +930,45 @@ struct ContentView: View {
         var errors: [String] = []
         var parseHinweise: [String] = []
         
+        let erstesFilename = urls.first?.lastPathComponent ?? ""
+        let einleseDatum = DateFromFilename.parse(erstesFilename) ?? Date()
+        let neuestesDatum = importSummaries.map(\.datumAktuelleEinlesung).max()
+        
+        // Wenn die Datei ein älteres Datum hat als die bisher neueste Einlesung: nur Gesamtwert für die Vergleichsliste übernehmen, Aktien-Daten nicht überschreiben
+        if !importSummaries.isEmpty, !aktien.isEmpty, let neuestes = neuestesDatum, einleseDatum < neuestes {
+            var gesamtwertNurVergleich = 0.0
+            for url in urls {
+                do {
+                    _ = url.startAccessingSecurityScopedResource()
+                    defer { url.stopAccessingSecurityScopedResource() }
+                    let (neueAktien, _, _, _) = try CSVParser.parseCSVWithStats(from: url)
+                    gesamtwertNurVergleich += neueAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
+                } catch {
+                    importMessage = "Fehler beim Einlesen von \(url.lastPathComponent): \(error.localizedDescription)"
+                    showImportMessage = true
+                    return
+                }
+            }
+            let summary = ImportSummary(gesamtwertVoreinlesung: 0, gesamtwertAktuelleEinlesung: gesamtwertNurVergleich, datumVoreinlesung: nil, datumAktuelleEinlesung: einleseDatum)
+            modelContext.insert(summary)
+            let ueberzaehlige = Array(importSummaries.dropFirst(4))
+            for oldSummary in ueberzaehlige {
+                modelContext.delete(oldSummary)
+            }
+            do {
+                try modelContext.save()
+            } catch {
+                importMessage = "Speicherfehler: \(error.localizedDescription)"
+                showImportMessage = true
+                return
+            }
+            let datumStr = einleseDatum.formatted(date: .abbreviated, time: .shortened)
+            let neuestStr = neuestes.formatted(date: .abbreviated, time: .shortened)
+            importMessage = "Einlesung vom \(datumStr) wurde nur für die Vergleichsliste übernommen (älteres Datum). Die angezeigten Daten stammen weiterhin vom \(neuestStr)."
+            showImportMessage = true
+            return
+        }
+        
         let alteAktien = Array(aktien)
         let gesamtwertVoreinlesung = alteAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
         
@@ -1023,10 +1069,9 @@ struct ContentView: View {
         
         let gesamtwertAktuelleEinlesung = alleNeuenAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
         let datumVoreinlesung = importSummaries.first?.importDatum
-        let erstesFilename = urls.first?.lastPathComponent ?? ""
-        let einleseDatum = DateFromFilename.parse(erstesFilename) ?? Date()
         let summary = ImportSummary(gesamtwertVoreinlesung: gesamtwertVoreinlesung, gesamtwertAktuelleEinlesung: gesamtwertAktuelleEinlesung, datumVoreinlesung: datumVoreinlesung, datumAktuelleEinlesung: einleseDatum)
         modelContext.insert(summary)
+        // Nur die letzten 5 Einlesungen behalten; bei der 6. Einlesung entfällt die älteste (importSummaries hat noch den Stand vor dem Insert)
         let ueberzaehlige = Array(importSummaries.dropFirst(4))
         for oldSummary in ueberzaehlige {
             modelContext.delete(oldSummary)
