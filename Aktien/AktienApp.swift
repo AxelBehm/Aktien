@@ -14,6 +14,7 @@ struct AktienApp: App {
         let schema = Schema([
             Aktie.self,
             ImportSummary.self,
+            ImportPositionSnapshot.self,
         ])
         let storeURL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("Aktien", isDirectory: true)

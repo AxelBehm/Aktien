@@ -296,6 +296,141 @@ private struct EinlesungenChartView: View {
     }
 }
 
+/// Mini-Chart pro Position: Kurs (blau) und Kursziel (grün) über die Einlesungen – pro Datum zwei Balken nebeneinander, alle Balken auf einer Grundlinie; einheitliche Höhe unter den Balken.
+/// currentKursziel: Wenn ein Snapshot kein Kursziel hat, wird dieses angezeigt (grüner Balken für jedes Datum).
+/// Mit zwei Fingern (Pinch) vergrößern/verkleinern; scaleBinding gibt die aktuelle Skalierung an (z. B. für Section-Höhe).
+private struct PositionVerlaufChartView: View {
+    var snapshots: [ImportPositionSnapshot]
+    var currentKursziel: Double? = nil
+    @Binding var zoomScale: CGFloat
+    @State private var zoomScaleAnchor: CGFloat = 1.0
+    @State private var accumulatedPan: CGSize = .zero
+    @State private var currentDrag: CGSize = .zero
+    private let minScale: CGFloat = 0.7
+    private let maxScale: CGFloat = 2.5
+    var body: some View {
+        let sorted = snapshots.sorted(by: { $0.importDatum < $1.importDatum })
+        let allVals = sorted.compactMap { s -> [Double] in
+            var a: [Double] = []
+            if let k = s.kurs { a.append(k) }
+            let kz = s.kursziel ?? currentKursziel
+            if let kz = kz { a.append(kz) }
+            return a
+        }.flatMap { $0 }
+        let minVal = allVals.min() ?? 0
+        let maxVal = allVals.max() ?? 1
+        let range = max(maxVal - minVal, 0.01)
+        let barH: CGFloat = 44
+        let unterBalkenH: CGFloat = 32
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Circle().fill(Color.blue).frame(width: 6, height: 6)
+                Text("Kurs").font(.caption2).foregroundColor(.secondary)
+                Circle().fill(Color.green).frame(width: 6, height: 6)
+                Text("Kursziel").font(.caption2).foregroundColor(.secondary)
+            }
+            GeometryReader { geo in
+                let totalW = geo.size.width
+                let colCount = CGFloat(max(1, sorted.count))
+                let colW = max(10, totalW / colCount - 2)
+                VStack(spacing: 0) {
+                    // Balken zuerst: gleiche Höhe pro Spalte → alle Balken unten auf einer Linie
+                    HStack(alignment: .bottom, spacing: 2) {
+                        ForEach(Array(sorted.enumerated()), id: \.offset) { _, s in
+                            VStack(spacing: 0) {
+                                Spacer(minLength: 0)
+                                let kzEffective = s.kursziel ?? currentKursziel
+                                HStack(alignment: .bottom, spacing: 2) {
+                                    if let kurs = s.kurs, range > 0 {
+                                        RoundedRectangle(cornerRadius: 2)
+                                            .fill(Color.blue.opacity(0.9))
+                                            .frame(width: max(4, (colW - 4) / 2), height: max(3, (kurs - minVal) / range * barH))
+                                    }
+                                    if let kz = kzEffective, range > 0 {
+                                        RoundedRectangle(cornerRadius: 2)
+                                            .fill(Color.green.opacity(0.9))
+                                            .frame(width: max(4, (colW - 4) / 2), height: max(3, (kz - minVal) / range * barH))
+                                    }
+                                }
+                                .frame(maxWidth: .infinity)
+                                .frame(height: barH)
+                            }
+                            .frame(width: colW)
+                        }
+                    }
+                    .frame(height: barH)
+                    // Einheitliche Höhe unter den Balken: Werte + Datum
+                    VStack(spacing: 4) {
+                        HStack(alignment: .top, spacing: 2) {
+                            ForEach(Array(sorted.enumerated()), id: \.offset) { _, s in
+                                let kzEffective = s.kursziel ?? currentKursziel
+                                VStack(spacing: 1) {
+                                    HStack(spacing: 1) {
+                                        if let kurs = s.kurs {
+                                            Text(String(format: "%.2f", kurs))
+                                                .font(.system(size: 6))
+                                                .foregroundColor(.blue)
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.6)
+                                        }
+                                        if s.kurs != nil && (s.kursziel != nil || kzEffective != nil) { Spacer(minLength: 0) }
+                                        if let kz = kzEffective {
+                                            Text(String(format: "%.2f", kz))
+                                                .font(.system(size: 6))
+                                                .foregroundColor(.green)
+                                                .lineLimit(1)
+                                                .minimumScaleFactor(0.6)
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity)
+                                    Text(s.importDatum.formatted(.dateTime.day().month(.abbreviated)))
+                                        .font(.system(size: 8))
+                                        .foregroundColor(.secondary)
+                                }
+                                .frame(width: colW)
+                            }
+                        }
+                        Spacer(minLength: 0)
+                    }
+                    .frame(height: unterBalkenH)
+                }
+            }
+            .frame(height: barH + unterBalkenH)
+        }
+        .padding(6)
+        .scaleEffect(zoomScale, anchor: .center)
+        .offset(x: accumulatedPan.width + currentDrag.width, y: accumulatedPan.height + currentDrag.height)
+        .contentShape(Rectangle())
+        .gesture(
+            MagnificationGesture()
+                .onChanged { value in
+                    let s = min(maxScale, max(minScale, zoomScaleAnchor * value))
+                    zoomScale = s
+                }
+                .onEnded { value in
+                    zoomScaleAnchor = zoomScale
+                }
+        )
+        .simultaneousGesture(
+            DragGesture()
+                .onChanged { value in
+                    currentDrag = value.translation
+                }
+                .onEnded { value in
+                    accumulatedPan.width += value.translation.width
+                    accumulatedPan.height += value.translation.height
+                    currentDrag = .zero
+                }
+        )
+        .onChange(of: zoomScale) { _, newScale in
+            if newScale <= 1.0 {
+                accumulatedPan = .zero
+                currentDrag = .zero
+            }
+        }
+    }
+}
+
 struct ContentView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: [SortDescriptor<Aktie>(\.bankleistungsnummer), SortDescriptor<Aktie>(\.bezeichnung)]) private var aktien: [Aktie]
@@ -321,6 +456,8 @@ struct ContentView: View {
     /// Nach CSV-Import: Kurszielermittlung erst starten, wenn der Nutzer den Import-Alert mit OK geschlossen hat (verhindert blockierten OK-Button).
     @State private var pendingKurszielFetchAfterImport = false
     @State private var pendingKurszielForceOverwrite = false
+    /// Einlese-Datum der letzten Import-Aktion; nach Kursziel-Fetch Snapshots mit diesem Datum aktualisieren (Kursziel nachtragen).
+    @State private var pendingKurszielImportDatum: Date? = nil
     /// Daten liegen vor dem Tagesdatum → nach OK Abfrage anzeigen, ob Kursziele ermittelt werden sollen (zeitaufwendig).
     @State private var showKurszielAbfrageBeiAltemDatum = false
     @State private var showKurszielAbfrageAlert = false
@@ -459,17 +596,36 @@ struct ContentView: View {
                             .foregroundColor(pct >= 0 ? .green : .red)
                     }
                 }
-                // Zeile 4: Kursziel, Abstand zum Kursziel (immer anzeigen wenn vorhanden)
+                // Zeile 4: Kursziel, Abstand zum Kursziel + Mini-Balken Kurs → Kursziel (immer anzeigen wenn vorhanden)
                 if let kurs = aktie.kurs ?? aktie.devisenkurs, let kz = aktie.kursziel, kurs > 0 {
                     let abstandPct = (kz - kurs) / kurs * 100
-                    HStack(spacing: 12) {
-                        Text("Kursziel \(kz, specifier: "%.2f")")
-                            .font(.caption2)
-                            .foregroundColor(.secondary)
-                        Text("Abstand \(abstandPct >= 0 ? "+" : "")\(abstandPct, specifier: "%.1f")%")
-                            .font(.caption2)
-                            .fontWeight(.medium)
-                            .foregroundColor(abstandPct >= 0 ? .green : .red)
+                    VStack(alignment: .leading, spacing: 4) {
+                        HStack(spacing: 12) {
+                            Text("Kursziel \(kz, specifier: "%.2f")")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Text("Abstand \(abstandPct >= 0 ? "+" : "")\(abstandPct, specifier: "%.1f")%")
+                                .font(.caption2)
+                                .fontWeight(.medium)
+                                .foregroundColor(abstandPct >= 0 ? .green : .red)
+                        }
+                        // Mini-Balken: Länge = Abstand % skaliert auf Referenzbereich (wie Gesamtsummen-Chart mit Faktor), damit nicht alle Balken gleich lang wirken
+                        GeometryReader { geo in
+                            let refMin: Double = -40   // Abstand -40 % = Balken kurz
+                            let refMax: Double = 80   // Abstand +80 % = Balken voll
+                            let refSpan = refMax - refMin
+                            let fraction = min(1.0, max(0, (abstandPct - refMin) / refSpan))
+                            let fillWidth = max(4, fraction * geo.size.width)
+                            ZStack(alignment: .leading) {
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(Color.secondary.opacity(0.2))
+                                    .frame(height: 6)
+                                RoundedRectangle(cornerRadius: 2)
+                                    .fill(abstandPct >= 0 ? Color.green : Color.red)
+                                    .frame(width: fillWidth, height: 6)
+                            }
+                        }
+                        .frame(height: 6)
                     }
                 }
             }
@@ -497,18 +653,18 @@ struct ContentView: View {
                 DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
             ScrollViewReader { proxy in
             List {
-                // Gesamtsummen der letzten 5 Einlesungen – sortiert nach Datum der Einlesedatei (ältestes zuerst), unabhängig von der Import-Reihenfolge
-                let letzteFuenf = Array(importSummaries.prefix(5)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
-                if !letzteFuenf.isEmpty {
+                // Gesamtsummen der letzten 10 Einlesungen – sortiert nach Datum der Einlesedatei (ältestes zuerst)
+                let letzteZehn = Array(importSummaries.prefix(10)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
+                if !letzteZehn.isEmpty {
                     Section {
                         if showEinlesungenChart {
-                            EinlesungenChartView(summaries: letzteFuenf)
+                            EinlesungenChartView(summaries: letzteZehn)
                                 .frame(height: 160)
                                 .listRowBackground(Color.clear)
                                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                         }
-                        let ausgangsbasis = letzteFuenf.first
-                        ForEach(Array(letzteFuenf.enumerated()), id: \.element.importDatum) { _, summary in
+                        let ausgangsbasis = letzteZehn.first
+                        ForEach(Array(letzteZehn.enumerated()), id: \.element.importDatum) { _, summary in
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
                                     Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
@@ -536,7 +692,7 @@ struct ContentView: View {
                                             .font(.caption)
                                             .foregroundColor(differenz >= 0 ? .green : .red)
                                     }
-                                } else if summary.gesamtwertVoreinlesung > 0, ausgangsbasis == nil || ausgangsbasis?.importDatum == summary.importDatum {
+                                } else if summary.gesamtwertVoreinlesung > 0, ausgangsbasis?.importDatum == summary.importDatum {
                                     HStack {
                                         Text("Voreinlesung:")
                                             .font(.caption)
@@ -561,7 +717,7 @@ struct ContentView: View {
                         }
                     } header: {
                         HStack {
-                            Text("Gesamtsummen (letzte 5 Einlesungen)")
+                            Text("Gesamtsummen (letzte 10 Einlesungen)")
                             Spacer()
                             Button(showEinlesungenChart ? "Chart aus" : "Chart") {
                                 showEinlesungenChart.toggle()
@@ -569,7 +725,7 @@ struct ContentView: View {
                             .font(.caption)
                         }
                     } footer: {
-                        Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis für die Veränderung ist die Einlesung mit dem ältesten Datum – auch wenn Sie zuerst neuere Daten eingelesen haben.")
+                        Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis = ältestes Datum (bis zu 10 Einlesungen).")
                             .font(.caption2)
                     }
                 }
@@ -577,9 +733,6 @@ struct ContentView: View {
                 // Legende oben – Fonds/Fund/ETF-Positionen ggf. manuell mit Kurszielen versehen
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text("Fonds-, Fund- und ETF-Positionen sind ggf. manuell mit Kurszielen zu versehen.")
-                            .font(.caption)
-                            .foregroundColor(.secondary)
                         HStack(spacing: 8) {
                             Image(systemName: "building.2.fill")
                                 .font(.caption)
@@ -915,6 +1068,16 @@ struct ContentView: View {
                 }
             }
         }
+        #if os(iOS)
+        .toolbar {
+            ToolbarItemGroup(placement: .keyboard) {
+                Spacer()
+                Button("Fertig") {
+                    UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+                }
+            }
+        }
+        #endif
         .overlay {
             if isImportingKursziele || isImportingKurszieleOpenAI {
                 VStack {
@@ -1008,8 +1171,13 @@ struct ContentView: View {
             }
             let summary = ImportSummary(gesamtwertVoreinlesung: 0, gesamtwertAktuelleEinlesung: gesamtwertNurVergleich, datumVoreinlesung: nil, datumAktuelleEinlesung: einleseDatum)
             modelContext.insert(summary)
-            let ueberzaehlige = Array(importSummaries.dropFirst(4))
+            let ueberzaehlige = Array(importSummaries.dropFirst(10))
             for oldSummary in ueberzaehlige {
+                let dateToRemove = oldSummary.datumAktuelleEinlesung
+                let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove })
+                if let toDelete = try? modelContext.fetch(descriptor) {
+                    for s in toDelete { modelContext.delete(s) }
+                }
                 modelContext.delete(oldSummary)
             }
             do {
@@ -1096,6 +1264,7 @@ struct ContentView: View {
                 neue.previousKurs = alte.kurs ?? alte.devisenkurs
                 
                 // Kursziel übernehmen, wenn manuell geändert oder aus CSV (C) – sonst beim Abruf neu ermitteln
+                // Bei Fonds/Fund/ETF werden keine Kursziele ermittelt; gesetzte Werte bei nächster Einlesung übernehmen
                 if let kz = alte.kursziel {
                     if alte.kurszielManuellGeaendert {
                         neue.kursziel = kz
@@ -1110,6 +1279,13 @@ struct ContentView: View {
                         neue.kurszielDatum = alte.kurszielDatum
                         neue.kurszielAbstand = alte.kurszielAbstand
                         neue.kurszielQuelle = "C"
+                        neue.kurszielWaehrung = alte.kurszielWaehrung
+                    } else if neue.istFonds {
+                        // Fonds/Fund/ETF: ermittelte Kursziele gibt es nicht – vorhandenes Kursziel aus Bestand übernehmen
+                        neue.kursziel = kz
+                        neue.kurszielDatum = alte.kurszielDatum
+                        neue.kurszielAbstand = alte.kurszielAbstand
+                        neue.kurszielQuelle = alte.kurszielQuelle
                         neue.kurszielWaehrung = alte.kurszielWaehrung
                     }
                 }
@@ -1128,9 +1304,32 @@ struct ContentView: View {
         let datumVoreinlesung = importSummaries.first?.importDatum
         let summary = ImportSummary(gesamtwertVoreinlesung: gesamtwertVoreinlesung, gesamtwertAktuelleEinlesung: gesamtwertAktuelleEinlesung, datumVoreinlesung: datumVoreinlesung, datumAktuelleEinlesung: einleseDatum)
         modelContext.insert(summary)
-        // Nur die letzten 5 Einlesungen behalten; bei der 6. Einlesung entfällt die älteste (importSummaries hat noch den Stand vor dem Insert)
-        let ueberzaehlige = Array(importSummaries.dropFirst(4))
+        // Pro Position Snapshot für Verlauf/Charts (Kurs, Kursziel, Abstand)
+        for aktie in alleNeuenAktien {
+            let kurs = aktie.kurs ?? aktie.devisenkurs
+            let kz = aktie.kursziel
+            let abstand: Double? = (kurs != nil && kurs! > 0 && kz != nil) ? ((kz! - kurs!) / kurs! * 100) : nil
+            let bl = aktie.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
+            let snap = ImportPositionSnapshot(
+                importDatum: einleseDatum,
+                isin: aktie.isin,
+                wkn: aktie.wkn,
+                bankleistungsnummer: bl,
+                marktwertEUR: aktie.marktwertEUR,
+                kurs: kurs,
+                kursziel: kz,
+                abstandPct: abstand
+            )
+            modelContext.insert(snap)
+        }
+        // Nur die letzten 10 Einlesungen behalten; bei der 11. entfällt die älteste (importSummaries hat noch den Stand vor dem Insert)
+        let ueberzaehlige = Array(importSummaries.dropFirst(10))
         for oldSummary in ueberzaehlige {
+            let dateToRemove = oldSummary.datumAktuelleEinlesung
+            let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove })
+            if let toDelete = try? modelContext.fetch(descriptor) {
+                for s in toDelete { modelContext.delete(s) }
+            }
             modelContext.delete(oldSummary)
         }
         
@@ -1165,6 +1364,7 @@ struct ContentView: View {
         let brauchtKursziel = !csvHadKursziele || !alleNeuenAktien.filter(sollAktualisieren).isEmpty
         if brauchtKursziel {
             pendingKurszielForceOverwrite = forceOverwriteAllKursziele || !csvHadKursziele
+            pendingKurszielImportDatum = einleseDatum
             let startOfToday = Calendar.current.startOfDay(for: Date())
             if einleseDatum < startOfToday {
                 showKurszielAbfrageBeiAltemDatum = true
@@ -1182,9 +1382,11 @@ struct ContentView: View {
             return !a.kurszielManuellGeaendert && a.kurszielQuelle != "C" && a.kursziel == nil
         }
         let list = aktien.filter(sollAktualisieren)
+        let importDate = pendingKurszielImportDatum
         if !list.isEmpty {
-            Task { await fetchKurszieleForAktien(list, forceOverwrite: forceOverwrite) }
+            Task { await fetchKurszieleForAktien(list, forceOverwrite: forceOverwrite, snapshotImportDatum: importDate) }
         }
+        pendingKurszielImportDatum = nil
     }
     
     private func fetchKurszieleViaOpenAI() {
@@ -1222,7 +1424,7 @@ struct ContentView: View {
         }
     }
     
-    private func fetchKurszieleForAktien(_ aktienListe: [Aktie], forceOverwrite: Bool = false) async {
+    private func fetchKurszieleForAktien(_ aktienListe: [Aktie], forceOverwrite: Bool = false, snapshotImportDatum: Date? = nil) async {
         KurszielService.clearCachesForApiCalls()
         await MainActor.run { 
             isImportingKursziele = true
@@ -1264,14 +1466,17 @@ struct ContentView: View {
                 aktie.kurszielAnalysten = nil
             }
             
+            // Gleicher Abruf wie beim Button (FMP, OpenAI mit „Antwort:“/„Rückgabe:“-Parsing, finanzen.net, …)
+            let refPrice = aktie.kurs ?? aktie.einstandskurs
             var info: KurszielInfo? = nil
-            if let fmpInfo = fmpCache[aktie.wkn] {
-                info = await KurszielService.applyOpenAIFallbackBeiUnrealistisch(info: fmpInfo, refPrice: aktie.kurs ?? aktie.einstandskurs, aktie: aktie)
+            if let fmpInfo = fmpCache[aktie.wkn], fmpInfo.kursziel > 0, KurszielService.isKurszielRealistisch(kursziel: fmpInfo.kursziel, refPrice: refPrice) {
+                // FMP hat brauchbares Kursziel → ggf. OpenAI-Ersatz bei unrealistisch
+                info = await KurszielService.applyOpenAIFallbackBeiUnrealistisch(info: fmpInfo, refPrice: refPrice, aktie: aktie)
             } else {
+                // Kein FMP oder FMP wertlos (0/unrealistisch) → volle Kette wie Button: OpenAI, finanzen.net, …
                 info = await KurszielService.fetchKursziel(for: aktie)
             }
-            
-            let refPrice = aktie.kurs ?? aktie.einstandskurs
+            // Bei refPrice nil/0 wird ermitteltes Kursziel trotzdem übernommen (isKurszielRealistisch gibt dann true)
             if let info = info, KurszielService.isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
                 await MainActor.run {
                     aktie.kursziel = info.kursziel
@@ -1305,6 +1510,25 @@ struct ContentView: View {
             aktuelleKurszielAktie = nil
         }
         KurszielService.onUnrealistischErsatzBestätigen = nil
+        
+        // Nach Fetch: Snapshots der gerade bearbeiteten Einlesung mit ermittelten Kurszielen aktualisieren (Chart zeigt sonst nur Blau)
+        if let importDate = snapshotImportDatum {
+            await MainActor.run {
+                let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == importDate })
+                guard let snapshots = try? modelContext.fetch(descriptor) else { return }
+                let blTrim = { (s: String) in s.trimmingCharacters(in: .whitespaces) }
+                for snap in snapshots {
+                    guard let aktie = aktienListe.first(where: { blTrim($0.isin) == blTrim(snap.isin) && blTrim($0.bankleistungsnummer) == blTrim(snap.bankleistungsnummer) }) else { continue }
+                    snap.kursziel = aktie.kursziel
+                    if let kurs = aktie.kurs ?? aktie.devisenkurs, kurs > 0, let kz = aktie.kursziel {
+                        snap.abstandPct = (kz - kurs) / kurs * 100
+                    } else {
+                        snap.abstandPct = nil
+                    }
+                }
+                try? modelContext.save()
+            }
+        }
     }
     
     private func deleteAllAktien() {
@@ -1314,6 +1538,10 @@ struct ContentView: View {
             }
             for summary in importSummaries {
                 modelContext.delete(summary)
+            }
+            let snapDesc = FetchDescriptor<ImportPositionSnapshot>()
+            if let allSnaps = try? modelContext.fetch(snapDesc) {
+                for s in allSnaps { modelContext.delete(s) }
             }
             try? modelContext.save()
         }
@@ -1415,7 +1643,7 @@ struct KurszielListenView: View {
                 } header: {
                     Text("Kursziele")
                 } footer: {
-                    Text("ISIN antippen → Kopieren. Kursziel bearbeiten wirkt wie auf der Detailseite (manuell). Tastatur: «Fertig» oder nach unten scrollen.")
+                    Text("Gelber Stern = zuletzt geöffnete Position. ISIN antippen → Kopieren. Kursziel bearbeiten wirkt wie auf der Detailseite (manuell). Tastatur: «Fertig» oder nach unten scrollen.")
                 }
             }
             .onChange(of: scrollToISIN) { _, isin in
@@ -1959,6 +2187,8 @@ struct AktieDetailView: View {
     var onAppearISIN: ((String) -> Void)? = nil
     @State private var isLoadingKursziel = false
     @State private var kurszielError: String?
+    @State private var positionSnapshots: [ImportPositionSnapshot] = []
+    @State private var verlaufChartZoomScale: CGFloat = 1.0
     
     var body: some View {
         Form {
@@ -1980,6 +2210,14 @@ struct AktieDetailView: View {
                 }
                 LabeledContent("Bestand") {
                     Text("\(aktie.bestand, specifier: "%.2f")")
+                }
+            }
+            
+            if !positionSnapshots.isEmpty {
+                Section("Verlauf Kurs / Kursziel (Einlesungen)") {
+                    PositionVerlaufChartView(snapshots: positionSnapshots, currentKursziel: aktie.kursziel, zoomScale: $verlaufChartZoomScale)
+                        .frame(minHeight: 90)
+                        .frame(height: 120 * verlaufChartZoomScale)
                 }
             }
             
@@ -2201,6 +2439,15 @@ struct AktieDetailView: View {
                     }
                 }
             }
+        }
+        .task(id: "\(aktie.isin)_\(aktie.bankleistungsnummer)") {
+            let isin = aktie.isin.trimmingCharacters(in: .whitespaces)
+            let bl = aktie.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
+            let descriptor = FetchDescriptor<ImportPositionSnapshot>(
+                predicate: #Predicate<ImportPositionSnapshot> { $0.isin == isin && $0.bankleistungsnummer == bl },
+                sortBy: [SortDescriptor(\.importDatum)]
+            )
+            positionSnapshots = (try? modelContext.fetch(descriptor)) ?? []
         }
         .onAppear {
             onAppearISIN?(aktie.isin)
@@ -3305,5 +3552,5 @@ struct SettingsView: View {
 
 #Preview {
     ContentView()
-        .modelContainer(for: [Aktie.self, ImportSummary.self], inMemory: true)
+        .modelContainer(for: [Aktie.self, ImportSummary.self, ImportPositionSnapshot.self], inMemory: true)
 }

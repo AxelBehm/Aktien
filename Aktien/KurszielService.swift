@@ -388,7 +388,7 @@ class KurszielService {
     
     /// Prüft, ob ein Kursziel für einen Referenzkurs „realistisch“ ist (Plausibilität + Abstand ≤ Schwellwert wie zeigeAlsUnrealistisch; Abwärts max. 50 %).
     static func isKurszielRealistisch(kursziel: Double, refPrice: Double?) -> Bool {
-        guard let k = refPrice, k > 0 else { return false }
+        guard let k = refPrice, k > 0 else { return true }
         if kursziel < k * 0.5 || kursziel > k * 50 { return false }
         let pct = abs((kursziel - k) / k * 100)
         let schwellwert = kursziel > k ? 200.0 : 50.0
@@ -873,6 +873,7 @@ class KurszielService {
         let slug = slugFromBezeichnung(aktie.bezeichnung)
         if slug == "sap" { return "SAP" }
         if slug == "siemens" { return "SIE" }
+        if slug == "siemens_energy" || slug == "siemens energy" || slug == "siemensenergy" { return "ENR" }
         if slug == "allianz" { return "ALV" }
         if slug == "adidas" { return "ADS" }
         if slug == "basf" { return "BAS" }
@@ -918,13 +919,14 @@ class KurszielService {
         return raw
     }
     
-    /// FMP search-isin API: ISIN → Symbol. Global (US, DE, JE, …). Nur wenn API-Key hinterlegt.
+    /// FMP search-isin API: ISIN → Symbol. Global (US, DE, JE, …). Nur wenn API-Key hinterlegt. ISIN wird URL-encodiert (Buchstaben z. B. DE000ENER6Y0).
     private static func fmpSymbolFromSearchISIN(isin: String) async -> String? {
         let isinNorm = isin.trimmingCharacters(in: .whitespaces).uppercased()
         guard isinNorm.count >= 12 else { return nil }
         guard let apiKey = fmpExtractAPIKey() else { return nil }
         let isin12 = String(isinNorm.prefix(12))
-        guard let url = URL(string: "https://financialmodelingprep.com/stable/search-isin?isin=\(isin12)&apikey=\(apiKey)") else { return nil }
+        let isinEncoded = isin12.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&"))) ?? isin12
+        guard let url = URL(string: "https://financialmodelingprep.com/stable/search-isin?isin=\(isinEncoded)&apikey=\(apiKey)") else { return nil }
         do {
             var request = URLRequest(url: url)
             request.timeoutInterval = 15
@@ -1187,7 +1189,7 @@ class KurszielService {
     }
     
     /// System-Prompt für OpenAI Kursziel (mit web_search)
-    private static let openAISystemPrompt = "Rückgabe nur den Wert oder -1 wenn nichts gefunden wird."
+    private static let openAISystemPrompt = "Rückgabe nur den Wert oder -1 wenn nichts gefunden wird. Es geht um das Kursziel (Analysten-Zielkurs), nicht um den aktuellen Börsenkurs."
     
     /// Entfernt Leerzeichen als Tausendertrennzeichen (z. B. "2 127,25" → "2127,25"), mehrfach für "1 234 567,89".
     private static func openAINormalizeThousandSeparatorSpaces(_ s: String) -> String {
@@ -1771,9 +1773,9 @@ class KurszielService {
         
         let prompt: String
         if hasISIN, let isin = isinTrimmed {
-            prompt = "ISIN \(isin) durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert oder -1 wenn nichts gefunden wird"
+            prompt = "ISIN \(isin): durchschnittliches Kursziel (Analysten-Zielkurs) in EUR – nicht der aktuelle Börsenkurs. Rückgabe nur den Wert oder -1 wenn nichts gefunden wird."
         } else {
-            prompt = "WKN \(wkn) durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert oder -1 wenn nichts gefunden wird"
+            prompt = "WKN \(wkn): durchschnittliches Kursziel (Analysten-Zielkurs) in EUR – nicht der aktuelle Börsenkurs. Rückgabe nur den Wert oder -1 wenn nichts gefunden wird."
         }
         debug("   📤 OpenAI Request (Responses API): \(prompt)")
         debug("   📡 Sende an https://api.openai.com/v1/responses ...")
