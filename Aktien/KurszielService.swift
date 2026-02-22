@@ -53,18 +53,21 @@ class KurszielService {
     static var debugMode = true
     static var debugLog: [String] = []
     
-    /// Zuletzt ermittelte Wechselkurse (Frankfurter API) – nur Puffer für rateUSDtoEUR/rateGBPtoEUR; vor jeder Nutzung per fetchAppWechselkurse() direkt neu geladen.
+    /// Zuletzt ermittelte Wechselkurse (Frankfurter API) – nur Puffer für rateUSDtoEUR/rateGBPtoEUR/rateDKKtoEUR; vor jeder Nutzung per fetchAppWechselkurse() direkt neu geladen.
     static var appWechselkursUSDtoEUR: Double?
     static var appWechselkursGBPtoEUR: Double?
+    static var appWechselkursDKKtoEUR: Double?
     
-    /// Lädt USD→EUR und GBP→EUR (direkter API-Zugriff, keine Zwischenspeicherung zwischen Abrufen). Setzt appWechselkursUSDtoEUR / appWechselkursGBPtoEUR. Rückgabe für UI-Anzeige.
+    /// Lädt USD→EUR, GBP→EUR und DKK→EUR (direkter API-Zugriff). Setzt appWechselkurs*; Rückgabe für UI-Anzeige.
     static func fetchAppWechselkurse() async -> (usdToEur: Double?, gbpToEur: Double?) {
         async let usd = fetchUSDtoEURRateInternal()
         async let gbp = fetchGBPtoEURRateInternal()
-        let (usdVal, gbpVal) = await (usd, gbp)
+        async let dkk = fetchDKKtoEURRateInternal()
+        let (usdVal, gbpVal, dkkVal) = await (usd, gbp, dkk)
         appWechselkursUSDtoEUR = usdVal
         appWechselkursGBPtoEUR = gbpVal
-        debug("   💱 App-Wechselkurse: USD→EUR \(usdVal), GBP→EUR \(gbpVal)")
+        appWechselkursDKKtoEUR = dkkVal
+        debug("   💱 App-Wechselkurse: USD→EUR \(usdVal), GBP→EUR \(gbpVal), DKK→EUR \(dkkVal)")
         return (usdVal, gbpVal)
     }
     
@@ -76,6 +79,11 @@ class KurszielService {
     /// Für Umrechnung: GBP→EUR (nach fetchAppWechselkurse oder Fallback 1.17)
     static func rateGBPtoEUR() -> Double {
         appWechselkursGBPtoEUR ?? 1.17
+    }
+    
+    /// Für Umrechnung: DKK→EUR (dänische Kronen, z. B. Novo Nordisk; Fallback ca. 0.13)
+    static func rateDKKtoEUR() -> Double {
+        appWechselkursDKKtoEUR ?? 0.13
     }
     
     static func clearDebugLog() {
@@ -199,39 +207,19 @@ class KurszielService {
             // 1. FMP (Symbol oder search-isin per ISIN) – wenn API-Key hinterlegt
             debug("1️⃣ Versuche FMP für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
             if let info = await fetchKurszielFromFMP(for: aktie) {
-                debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (FMP)")
-                let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                return eurInfo
-            }
-            debug("   ❌ Kein Kursziel von FMP")
-            
-            // 1a. OpenAI (gleiche Abfrage-/Parsing-Logik wie Button: Antwort:, Rückgabe:, Ergebnis:, in Euro beträgt: etc.)
-            if openAIAPIKey != nil {
-                debug("1a️⃣ Versuche OpenAI für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
-                if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (OpenAI)")
+                if info.kursziel > 0 {
+                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (FMP)")
                     let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
                     if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
                     return eurInfo
                 }
-                debug("   ❌ Kein Kursziel von OpenAI")
+                debug("   → FMP Satz gefunden, aber Kursziel = 0 – versuche finanzen.net")
+            } else {
+                debug("   ❌ Kein Kursziel von FMP")
             }
             
-            // 1b. Nur für Fonds: Snippet früh (vor finanzen.net/Yahoo – spart Zeit, da diese für Fonds meist leer)
-            if istFonds(aktie) {
-                debug("1b️⃣ [Fonds] Versuche Suchsnippet (DuckDuckGo) für \(aktie.bezeichnung)")
-                if let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
-                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (Snippet)")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                }
-                debug("   ❌ Kein Betrag im Snippet")
-            }
-            
-            // 2. finanzen.net Kursziel-Seite (OpenAI nur bei unrealistischem Ergebnis – zu langsam) – Slug-URL (wie Testroutine, gleiche URL = gleiches Ergebnis)
-            // Ohne Plausibilitätsprüfung, damit identisch zur Testroutine (finanzen.net/kursziele/rheinmetall)
+            // 1b. Bei FMP 0 oder kein FMP: zuerst finanzen.net (automatische Einlesung), dann ggf. OpenAI
+            // 2. finanzen.net Kursziel-Seite (Slug-URL)
             let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
             for slugVersuch in slugKandidaten {
                 guard !slugVersuch.isEmpty else { continue }
@@ -246,7 +234,7 @@ class KurszielService {
                 }
             }
             
-            // 3. finanzen.net mit WKN
+            // 3. finanzen.net mit WKN (Kursziel-Seite)
             debug("3️⃣ Versuche finanzen.net/kursziele/\(aktie.wkn)")
             if let info = await fetchKurszielVonFinanzenNetKursziele(wkn: aktie.wkn) {
                 debug("   → Gefunden: \(info.kursziel) €")
@@ -294,7 +282,7 @@ class KurszielService {
                 debug("   ❌ Kein Kursziel gefunden")
             }
             
-            // 5b. finanzen.net Suchseite mit ISIN (z. B. Deutsche Bank DE0005140008, wenn WKN/Slug abweichen)
+            // 5b. finanzen.net Suchseite mit ISIN
             if !aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
                 debug("5b️⃣ Versuche finanzen.net Suche für ISIN \(aktie.isin)")
                 if let info = await fetchKurszielVonFinanzenNetSearch(searchTerm: aktie.isin) {
@@ -312,7 +300,31 @@ class KurszielService {
                 }
             }
             
-            // 6. ariva.de mit Firmen-Slug (Slug-URLs für finanzen.net bereits in Schritt 3)
+            // 1a. OpenAI (gleiche Abfrage-/Parsing-Logik wie Button: Antwort:, Rückgabe:, Ergebnis:, in Euro beträgt: etc.)
+            if openAIAPIKey != nil {
+                debug("1a️⃣ Versuche OpenAI für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
+                if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (OpenAI)")
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
+                }
+                debug("   ❌ Kein Kursziel von OpenAI")
+            }
+            
+            // 1b. Nur für Fonds: Snippet früh (vor finanzen.net/Yahoo – spart Zeit, da diese für Fonds meist leer)
+            if istFonds(aktie) {
+                debug("1b️⃣ [Fonds] Versuche Suchsnippet (DuckDuckGo) für \(aktie.bezeichnung)")
+                if let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
+                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (Snippet)")
+                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                    return eurInfo
+                }
+                debug("   ❌ Kein Betrag im Snippet")
+            }
+            
+            // 6. ariva.de mit Firmen-Slug (Slug-URLs für finanzen.net bereits in Schritt 2/3)
             if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty {
                 debug("6️⃣ Versuche ariva.de/\(ersterSlug)-aktie/kursziele")
                 if let info = await fetchKurszielVonAriva(slug: ersterSlug) {
@@ -1069,6 +1081,10 @@ class KurszielService {
                     debug("   ⚠️ FMP \(sym): Keine Daten")
                     continue
                 }
+                guard parsed.consensus > 0 else {
+                    debug("   ⚠️ FMP \(sym): Satz gefunden, aber Kursziel = 0 – bei Einzelabruf wird finanzen.net versucht")
+                    continue
+                }
                 let istUSD = usTicker.contains(sym)
                 let istGBP = gbpTicker.contains(sym)
                 var consensus = parsed.consensus
@@ -1345,6 +1361,20 @@ class KurszielService {
                 kurszielAnalysten: info.kurszielAnalysten
             )
         }
+        if w == "DKK" {
+            let rate = rateDKKtoEUR()
+            debug("   💱 DKK→EUR mit App-Kurs: \(rate)")
+            return KurszielInfo(
+                kursziel: info.kursziel * rate,
+                datum: info.datum,
+                spalte4Durchschnitt: info.spalte4Durchschnitt,
+                quelle: info.quelle,
+                waehrung: "EUR",
+                kurszielHigh: info.kurszielHigh.map { $0 * rate },
+                kurszielLow: info.kurszielLow.map { $0 * rate },
+                kurszielAnalysten: info.kurszielAnalysten
+            )
+        }
         // Andere Währung: mit 1 bewerten, keine Umrechnung – manuell zu ändern
         debug("   💱 Andere Währung \(w): keine Umrechnung (manuell anpassen)")
         return KurszielInfo(
@@ -1398,6 +1428,27 @@ class KurszielService {
             }
         } catch {
             debug("   💱 GBP→EUR Fallback 1.17: \(error.localizedDescription)")
+        }
+        return fallback
+    }
+    
+    /// Frankfurter API: DKK → EUR (dänische Kronen, z. B. Novo Nordisk)
+    private static func fetchDKKtoEURRateInternal() async -> Double {
+        let fallback: Double = 0.13
+        guard let url = URL(string: "https://api.frankfurter.dev/v1/latest?base=DKK&symbols=EUR") else { return fallback }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 5
+            let (data, response) = try await URLSession.shared.data(for: request)
+            let status = (response as? HTTPURLResponse)?.statusCode ?? -1
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let rates = json["rates"] as? [String: Any],
+               let eur = rates["EUR"] as? Double, eur > 0 {
+                debug("   💱 DKK→EUR: \(eur) (API HTTP \(status))")
+                return eur
+            }
+        } catch {
+            debug("   💱 DKK→EUR Fallback 0.13: \(error.localizedDescription)")
         }
         return fallback
     }
@@ -1475,16 +1526,18 @@ class KurszielService {
             var consensus = parsed.consensus
             var high = parsed.high
             var low = parsed.low
-            if gbpTicker.contains(symbol) {
-                let rate = rateGBPtoEUR()
-                consensus = parsed.consensus * rate
-                high = parsed.high.map { $0 * rate }
-                low = parsed.low.map { $0 * rate }
-            } else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
-                let rate = rateUSDtoEUR()
-                consensus = parsed.consensus * rate
-                high = parsed.high.map { $0 * rate }
-                low = parsed.low.map { $0 * rate }
+            if consensus > 0 {
+                if gbpTicker.contains(symbol) {
+                    let rate = rateGBPtoEUR()
+                    consensus = parsed.consensus * rate
+                    high = parsed.high.map { $0 * rate }
+                    low = parsed.low.map { $0 * rate }
+                } else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
+                    let rate = rateUSDtoEUR()
+                    consensus = parsed.consensus * rate
+                    high = parsed.high.map { $0 * rate }
+                    low = parsed.low.map { $0 * rate }
+                }
             }
             let waehrung: String
             if gbpTicker.contains(symbol) || usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
@@ -1511,7 +1564,8 @@ class KurszielService {
     
     /// Parst FMP price-target-consensus Response (stable: targetHigh, targetLow, targetConsensus, targetMedian)
     /// FMP: targetConsensus = Durchschnitt aller Analysten, targetMedian = Median (robuster bei Ausreißern)
-    /// Bevorzugt targetMedian wenn vorhanden – oft näher am Kurs bei UK-Aktien mit wenigen Analysten
+    /// Bevorzugt targetMedian wenn vorhanden – oft näher am Kurs bei UK-Aktien mit wenigen Analysten.
+    /// Liefert bei vorhandenem Satz aber Kursziel 0 ein Tuple mit consensus 0, damit Aufrufer finanzen.net nachziehen kann.
     private static func parseFMPConsensusItem(_ item: [String: Any], symbol: String) -> (consensus: Double, high: Double?, low: Double?, analysts: Int?, datum: Date?)? {
         let median = (item["targetMedian"] as? Double) ?? (item["adjMedian"] as? Double) ?? (item["medianPriceTarget"] as? Double)
         let consensus = (item["targetConsensus"] as? Double) ?? (item["adjConsensus"] as? Double) ?? (item["consensus"] as? Double) ?? (item["consensusPriceTarget"] as? Double) ?? (item["publishedPriceTarget"] as? Double)
@@ -1522,9 +1576,6 @@ class KurszielService {
         } else {
             kz = consensus
         }
-        guard let kursziel = kz, kursziel > 0 else { return nil }
-        let high = (item["targetHigh"] as? Double) ?? (item["adjHighTargetPrice"] as? Double) ?? (item["high"] as? Double) ?? (item["highPriceTarget"] as? Double)
-        let low = (item["targetLow"] as? Double) ?? (item["adjLowTargetPrice"] as? Double) ?? (item["low"] as? Double) ?? (item["lowPriceTarget"] as? Double)
         let analysts = item["numberOfAnalysts"] as? Int ?? item["analystCount"] as? Int
         var datum: Date? = nil
         if let d = (item["publishedDate"] as? String) ?? (item["date"] as? String) {
@@ -1532,7 +1583,13 @@ class KurszielService {
             fmt.formatOptions = [.withFullDate, .withDashSeparatorInDate]
             datum = fmt.date(from: String(d.prefix(10)))
         }
-        return (kursziel, high, low, analysts, datum)
+        if let kursziel = kz, kursziel > 0 {
+            let high = (item["targetHigh"] as? Double) ?? (item["adjHighTargetPrice"] as? Double) ?? (item["high"] as? Double) ?? (item["highPriceTarget"] as? Double)
+            let low = (item["targetLow"] as? Double) ?? (item["adjLowTargetPrice"] as? Double) ?? (item["low"] as? Double) ?? (item["lowPriceTarget"] as? Double)
+            return (kursziel, high, low, analysts, datum)
+        }
+        // Satz gefunden, aber Kursziel 0 oder fehlend → Aufrufer kann finanzen.net versuchen
+        return (0, nil, nil, analysts, datum)
     }
     
     /// Testet mehrere FMP-APIs und schreibt alle Ergebnisse in den Debug-Log
@@ -2038,8 +2095,9 @@ class KurszielService {
                             if aktieCell.contains(slug) || slug.contains(aktieCell.replacingOccurrences(of: " ", with: "")) {
                                 let betragStr = row[kIdx]
                                 let abstandStr = row[aIdx]
+                                let naechsteZelle = row.count > kIdx + 1 ? row[kIdx + 1] : ""
                                 if let betrag = parseNumberFromTable(betragStr), betrag > 0 {
-                                    let w = waehrungAusZelle(betragStr) ?? "EUR"
+                                    let w = waehrungAusZelle(betragStr) ?? waehrungAusZelle(naechsteZelle) ?? "EUR"
                                     let abstand = parseNumberFromTable(abstandStr)
                                     debug("   ✅ Variant 2: Zeile gefunden – \(betrag) \(w), Abstand \(abstand.map { "\($0)%" } ?? "–")" + ((w == "USD" || w == "GBP") ? " (wird in EUR umgerechnet)" : ""))
                                     return (betrag, abstand, w, false)
@@ -2176,9 +2234,11 @@ class KurszielService {
                 var summeEUR: Decimal = 0
                 var summeUSD: Decimal = 0
                 var summeGBP: Decimal = 0
+                var summeDKK: Decimal = 0
                 var anzahlEUR = 0
                 var anzahlUSD = 0
                 var anzahlGBP = 0
+                var anzahlDKK = 0
                 var summeSpalte4: Decimal = 0
                 var anzahlZeilenSpalte4 = 0
                 var anzahlSpalten = 0
@@ -2245,6 +2305,10 @@ class KurszielService {
                                 summeGBP += Decimal(betrag)
                                 anzahlGBP += 1
                                 debug("   ✅ Betrag: \(betrag) GBP")
+                            } else if w == "DKK" {
+                                summeDKK += Decimal(betrag)
+                                anzahlDKK += 1
+                                debug("   ✅ Betrag: \(betrag) DKK")
                             } else {
                                 summeEUR += Decimal(betrag)
                                 anzahlEUR += 1
@@ -2262,9 +2326,9 @@ class KurszielService {
                     }
                 }
                 
-                // Bei gemischten Währungen: EUR bevorzugt. USD/GBP werden immer in EUR umgerechnet.
+                // Bei gemischten Währungen: EUR bevorzugt. USD/GBP/DKK werden immer in EUR umgerechnet.
                 let (summeBetrag, anzahlZeilen, erkannteWaehrung, ohneUmrechnung): (Decimal, Int, String?, Bool) = {
-                    if anzahlEUR > 0 && (anzahlUSD > 0 || anzahlGBP > 0) {
+                    if anzahlEUR > 0 && (anzahlUSD > 0 || anzahlGBP > 0 || anzahlDKK > 0) {
                         debug("   ⚠️  Gemischte Währungen – nur EUR-Zeilen (\(anzahlEUR)) werden bewertet")
                         return (summeEUR, anzahlEUR, "EUR", false)
                     }
@@ -2277,11 +2341,15 @@ class KurszielService {
                         debug("   📌 Nur USD-Zeilen – wird in EUR umgerechnet")
                         return (summeUSD, anzahlUSD, "USD", false)
                     }
+                    if anzahlDKK > 0 {
+                        debug("   📌 Nur DKK-Zeilen – wird in EUR umgerechnet")
+                        return (summeDKK, anzahlDKK, "DKK", false)
+                    }
                     return (0, 0, nil, false)
                 }()
                 
                 // Ergebnis: Summen getrennt + finale Währung – im Debug anzeigen
-                debug("   📊 Ergebnis – EUR: Summe=\(summeEUR), Anzahl=\(anzahlEUR) | GBP: Summe=\(summeGBP), Anzahl=\(anzahlGBP) | USD: Summe=\(summeUSD), Anzahl=\(anzahlUSD)")
+                debug("   📊 Ergebnis – EUR: Summe=\(summeEUR), Anzahl=\(anzahlEUR) | GBP: Summe=\(summeGBP), Anzahl=\(anzahlGBP) | USD: Summe=\(summeUSD), Anzahl=\(anzahlUSD) | DKK: Summe=\(summeDKK), Anzahl=\(anzahlDKK)")
                 let waehrungDebug = erkannteWaehrung ?? "EUR"
                 debug("   📊 Ergebnis – Verwendet: Summe=\(summeBetrag) \(waehrungDebug), Anzahl=\(anzahlZeilen)")
                 let durchschnittSp4 = anzahlZeilenSpalte4 > 0 ? summeSpalte4 / Decimal(anzahlZeilenSpalte4) : nil
@@ -2416,6 +2484,9 @@ class KurszielService {
         cleaned = cleaned.replacingOccurrences(of: "EUR", with: "")
         cleaned = cleaned.replacingOccurrences(of: "USD", with: "")
         cleaned = cleaned.replacingOccurrences(of: "$", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "DKK", with: "")
+        cleaned = cleaned.replacingOccurrences(of: "DKR", with: "")
+        if cleaned.lowercased().hasSuffix("kr") { cleaned = String(cleaned.dropLast(2)) }
         cleaned = cleaned.replacingOccurrences(of: "%", with: "")
         cleaned = cleaned.replacingOccurrences(of: " ", with: "")
         
@@ -2450,6 +2521,7 @@ class KurszielService {
         let upper = text.uppercased()
         if upper.contains("USD") || upper.contains("US$") || text.contains("$") { return "USD" }
         if upper.contains("GBP") || upper.contains("£") || upper.contains("PENCE") { return "GBP" }
+        if upper.contains("DKK") || upper.contains("DKR") || upper.contains(" KR") || upper.hasSuffix(" KR") || text.contains(" kr.") || text.contains(" kr,") { return "DKK" }
         if upper.contains("EUR") || upper.contains("€") { return "EUR" }
         return nil
     }
@@ -2590,6 +2662,272 @@ class KurszielService {
             }
         }
         
+        return nil
+    }
+    
+    // MARK: - Watchlist-Lookup (ISIN/WKN → Bezeichnung, Kurs, Kursziel)
+    
+    /// Ergebnis eines Watchlist-Lookups: Bezeichnung, WKN, ISIN, aktueller Kurs (optional), Kursziel (optional)
+    struct WatchlistLookupResult {
+        let bezeichnung: String
+        let wkn: String
+        let isin: String
+        let kurs: Double?
+        let kursziel: Double?
+    }
+    
+    /// Sucht zu ISIN oder WKN Bezeichnung, aktuellen Kurs und Kursziel (z. B. für Watchlist-Eingabe).
+    /// Kurs und Kursziel werden bei Fremdwährung (USD/GBP) in EUR umgerechnet.
+    static func lookupWatchlist(searchTerm: String) async -> WatchlistLookupResult? {
+        let term = searchTerm.trimmingCharacters(in: .whitespaces)
+        guard !term.isEmpty else { return nil }
+        _ = await fetchAppWechselkurse()
+        let encoded = term.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? term
+        let searchURL = "https://www.finanzen.net/suchergebnis.asp?frmAktiensucheTextfeld=\(encoded)"
+        guard let url = URL(string: searchURL) else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+            request.setValue("de-DE,de;q=0.9", forHTTPHeaderField: "Accept-Language")
+            request.timeoutInterval = 10.0
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let html = String(data: data, encoding: .utf8) else { return nil }
+            // Suchergebnisse: Link zu /aktien/XXX-aktie oder /kursziele/XXX, Linktext = Bezeichnung (bei reiner WKN oft leer oder nur Ziffern)
+            let linkPattern = "<a[^>]+href=\"(/aktien/[^\"]+-aktie|/kursziele/[^\"]+)\"[^>]*>([^<]+)</a>"
+            guard let regex = try? NSRegularExpression(pattern: linkPattern, options: .caseInsensitive) else { return nil }
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, options: [], range: range)
+            var href = ""
+            var bezeichnung = ""
+            for match in matches {
+                guard match.numberOfRanges >= 3,
+                      let hrefR = Range(match.range(at: 1), in: html),
+                      let textR = Range(match.range(at: 2), in: html) else { continue }
+                let h = String(html[hrefR])
+                let t = String(html[textR]).trimmingCharacters(in: .whitespaces)
+                if isUngueltigeWatchlistBezeichnung(t) { continue }
+                // Bevorzuge Linktext, der wie ein Firmenname aussieht (Buchstaben, Länge > 4, nicht nur die WKN)
+                let siehtNachNameAus = t.count > 4 && t.contains(where: { $0.isLetter }) && t != term && !t.allSatisfy(\.isNumber)
+                if !t.isEmpty && (bezeichnung.isEmpty || siehtNachNameAus) {
+                    href = h
+                    bezeichnung = t
+                    if siehtNachNameAus { break }
+                } else if href.isEmpty {
+                    href = h
+                    if bezeichnung.isEmpty { bezeichnung = t }
+                }
+            }
+            if bezeichnung.isEmpty || isUngueltigeWatchlistBezeichnung(bezeichnung) { bezeichnung = term } else { bezeichnung = bereinigeWatchlistBezeichnung(bezeichnung) }
+            var slug = ""
+            if href.contains("/aktien/") {
+                slug = href.replacingOccurrences(of: "/aktien/", with: "").replacingOccurrences(of: "-aktie", with: "")
+            } else if href.contains("/kursziele/") {
+                slug = href.replacingOccurrences(of: "/kursziele/", with: "")
+            }
+            if slug.isEmpty { return WatchlistLookupResult(bezeichnung: bezeichnung, wkn: term, isin: term, kurs: nil, kursziel: nil) }
+            let detailURL = "https://www.finanzen.net/kursziele/\(slug)"
+            guard let detailUrl = URL(string: detailURL) else { return WatchlistLookupResult(bezeichnung: bezeichnung, wkn: term, isin: term, kurs: nil, kursziel: nil) }
+            var req2 = URLRequest(url: detailUrl)
+            req2.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
+            req2.timeoutInterval = 10.0
+            let (data2, _) = try await URLSession.shared.data(for: req2)
+            guard let html2 = String(data: data2, encoding: .utf8) else { return WatchlistLookupResult(bezeichnung: bezeichnung, wkn: term, isin: term, kurs: nil, kursziel: nil) }
+            // Bezeichnung aus Detailseite holen, wenn Suchseite nur WKN/leer oder ungültig (z. B. „Snapshot“) geliefert hat
+            if bezeichnung.isEmpty || bezeichnung == term || (bezeichnung.count <= 8 && bezeichnung.allSatisfy(\.isNumber)) || isUngueltigeWatchlistBezeichnung(bezeichnung),
+               let nameFromPage = parseBezeichnungFromFinanzenNetDetailPage(html2), !nameFromPage.isEmpty, !isUngueltigeWatchlistBezeichnung(nameFromPage) {
+                bezeichnung = bereinigeWatchlistBezeichnung(nameFromPage)
+                debug("   📌 Watchlist Bezeichnung aus Detailseite: \(bezeichnung)")
+            } else if isUngueltigeWatchlistBezeichnung(bezeichnung) {
+                bezeichnung = ""
+            }
+            // Bei WKN-Eingabe (6 Ziffern): ISIN aus Detailseite ermitteln; bei ISIN-Eingabe: WKN aus Detailseite ermitteln
+            let termIstWKN = term.count == 6 && term.allSatisfy(\.isNumber)
+            let termIstISIN = term.count >= 12 && term.prefix(2).allSatisfy(\.isLetter)
+            var isinErmittelt = ""
+            var wknErmittelt = ""
+            if termIstWKN, let parsedISIN = parseISINFromFinanzenNetHTML(html2), parsedISIN.count >= 12 {
+                isinErmittelt = String(parsedISIN.prefix(12))
+                debug("   📌 Watchlist ISIN aus Detailseite: \(isinErmittelt)")
+            } else if termIstISIN, let parsedWKN = parseWKNFromFinanzenNetHTML(html2), parsedWKN.count == 6 {
+                wknErmittelt = parsedWKN
+                debug("   📌 Watchlist WKN aus Detailseite: \(wknErmittelt)")
+            }
+            // Dänische Seite? (DKK/Kopenhagen/Novo) – dann Werte als DKK interpretieren falls nicht erkannt
+            let seiteWirktDaenisch = html2.uppercased().contains("DKK") || html2.contains("Kopenhagen") || html2.contains("Copenhagen") || detailURL.lowercased().contains("novo-nordisk")
+            // Kursziel: Währung aus HTML nutzen und in EUR umrechnen
+            var kurszielEUR: Double?
+            if let (kz, _, waehrung, _) = parseKurszielFromHTML(html2, urlString: detailURL) {
+                var w = (waehrung ?? "EUR").uppercased()
+                if w == "EUR" && seiteWirktDaenisch { w = "DKK" }
+                if w == "USD" {
+                    kurszielEUR = kz * rateUSDtoEUR()
+                    debug("   💱 Watchlist Kursziel: \(kz) USD → \(kurszielEUR.map { String(format: "%.2f", $0) } ?? "?") EUR")
+                } else if w == "GBP" {
+                    kurszielEUR = kz * rateGBPtoEUR()
+                    debug("   💱 Watchlist Kursziel: \(kz) GBP → \(kurszielEUR.map { String(format: "%.2f", $0) } ?? "?") EUR")
+                } else if w == "DKK" {
+                    kurszielEUR = kz * rateDKKtoEUR()
+                    debug("   💱 Watchlist Kursziel: \(kz) DKK → \(kurszielEUR.map { String(format: "%.2f", $0) } ?? "?") EUR")
+                } else {
+                    kurszielEUR = kz
+                }
+            }
+            // Kurs: mit Währung parsen und in EUR umrechnen
+            var kursEUR: Double?
+            if let (kursVal, waehrungKurs) = parseAktuellerKursUndWaehrungFromFinanzenNetHTML(html2) {
+                var w = (waehrungKurs ?? "EUR").uppercased()
+                if w == "EUR" && seiteWirktDaenisch { w = "DKK" }
+                if w == "USD" {
+                    kursEUR = kursVal * rateUSDtoEUR()
+                    debug("   💱 Watchlist Kurs: \(kursVal) USD → \(kursEUR.map { String(format: "%.2f", $0) } ?? "?") EUR")
+                } else if w == "GBP" {
+                    kursEUR = kursVal * rateGBPtoEUR()
+                    debug("   💱 Watchlist Kurs: \(kursVal) GBP → \(kursEUR.map { String(format: "%.2f", $0) } ?? "?") EUR")
+                } else {
+                    kursEUR = kursVal
+                }
+            }
+            let wknFinal: String
+            let isinFinal: String
+            if termIstWKN {
+                wknFinal = term
+                isinFinal = isinErmittelt.isEmpty ? "" : isinErmittelt
+            } else {
+                wknFinal = wknErmittelt.isEmpty ? "" : wknErmittelt
+                isinFinal = term
+            }
+            let bezBereinigt = bereinigeWatchlistBezeichnung(bezeichnung)
+            let bezFinal = isUngueltigeWatchlistBezeichnung(bezBereinigt) ? "" : bezBereinigt
+            return WatchlistLookupResult(bezeichnung: bezFinal, wkn: wknFinal, isin: isinFinal, kurs: kursEUR, kursziel: kurszielEUR)
+        } catch {
+            return nil
+        }
+    }
+    
+    /// Bereinigt Bezeichnungen wie „Alle Adidas Kursziele“ → „Adidas“ (finanzen.net-Linktext/Seitentitel).
+    private static func bereinigeWatchlistBezeichnung(_ s: String) -> String {
+        var t = s.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty { return t }
+        if t.range(of: "Alle ", options: .caseInsensitive)?.lowerBound == t.startIndex {
+            t = String(t.dropFirst(5)).trimmingCharacters(in: .whitespaces)
+        }
+        if t.hasSuffix(" Kursziele") || t.hasSuffix(" kursziele") {
+            t = String(t.dropLast(10)).trimmingCharacters(in: .whitespaces)
+        }
+        if t.hasSuffix(" - Kursziele") || t.hasSuffix(" - kursziele") {
+            t = String(t.dropLast(12)).trimmingCharacters(in: .whitespaces)
+        }
+        return t
+    }
+    
+    /// Ungültige/generische Bezeichnungen von finanzen.net (z. B. „Snapshot“, „Suche“) – als leer behandeln, damit Fallback „WKN …“ genutzt wird.
+    private static func isUngueltigeWatchlistBezeichnung(_ s: String) -> Bool {
+        let t = s.trimmingCharacters(in: .whitespaces).lowercased()
+        if t.isEmpty { return true }
+        let ungueltig = ["snapshot", "suche", "suchergebnis", "suchergebnisse", "finanzen.net", "aktie", "aktien", "kursziele", "übersicht", "search", "results"]
+        if ungueltig.contains(t) { return true }
+        if t.count <= 2 { return true }
+        return false
+    }
+    
+    /// Parst ISIN aus finanzen.net HTML (z. B. in Tabellen oder Meta: DE0007164600). Standard: 2 Buchstaben + 9 alphanumerisch + 1 Ziffer.
+    private static func parseISINFromFinanzenNetHTML(_ html: String) -> String? {
+        let pattern = "[A-Z]{2}[A-Z0-9]{9}[0-9]"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+              match.numberOfRanges >= 0,
+              let r = Range(match.range(at: 0), in: html) else { return nil }
+        return String(html[r])
+    }
+    
+    /// Parst WKN (6 Ziffern) aus finanzen.net HTML, z. B. in Tabellen oder nach „WKN“.
+    private static func parseWKNFromFinanzenNetHTML(_ html: String) -> String? {
+        let patterns = [
+            "WKN[^0-9]*([0-9]{6})\\b",
+            "\\b([0-9]{6})\\b.*?ISIN",
+            ">([0-9]{6})<"
+        ]
+        for pattern in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+                  let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+                  match.numberOfRanges >= 1,
+                  let r = Range(match.range(at: 1), in: html) else { continue }
+            return String(html[r])
+        }
+        return nil
+    }
+    
+    /// Parst Firmenbezeichnung aus der Titelzeile der finanzen.net Detailseite (z. B. „Kursziele zu Rheinmetall AG“ oder „Rheinmetall AG - Kursziele | Finanzen.net“).
+    private static func parseBezeichnungFromFinanzenNetDetailPage(_ html: String) -> String? {
+        guard let titleRegex = try? NSRegularExpression(pattern: "<title>([^<]+)</title>", options: .caseInsensitive),
+              let match = titleRegex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+              match.numberOfRanges >= 1,
+              let r = Range(match.range(at: 1), in: html) else { return nil }
+        var title = String(html[r]).trimmingCharacters(in: .whitespaces)
+        if title.isEmpty { return nil }
+        // "Kursziele zu Rheinmetall AG" oder "Kursziele zu SAP SE | Finanzen.net"
+        if title.lowercased().hasPrefix("kursziele zu ") {
+            let nachPrefix = title.dropFirst("kursziele zu ".count)
+            if let pipe = nachPrefix.range(of: " | ") {
+                return String(nachPrefix[..<pipe.lowerBound]).trimmingCharacters(in: .whitespaces)
+            }
+            return String(nachPrefix).trimmingCharacters(in: .whitespaces)
+        }
+        // "Rheinmetall AG - Kursziele | Finanzen.net"
+        if let dash = title.range(of: " - ") {
+            return String(title[..<dash.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
+        if let pipe = title.range(of: " | ") {
+            return String(title[..<pipe.lowerBound]).trimmingCharacters(in: .whitespaces)
+        }
+        return title
+    }
+    
+    /// Parst aktuellen Kurs aus finanzen.net HTML (z. B. „31,09 EUR“ in der Kurszeile).
+    private static func parseAktuellerKursFromFinanzenNetHTML(_ html: String) -> Double? {
+        parseAktuellerKursUndWaehrungFromFinanzenNetHTML(html)?.0
+    }
+    
+    /// Parst aktuellen Kurs inkl. Währung (EUR/USD/GBP/DKK) aus finanzen.net HTML. Rückgabe (Wert, Währung).
+    private static func parseAktuellerKursUndWaehrungFromFinanzenNetHTML(_ html: String) -> (Double, String?)? {
+        func parseKursZahl(_ raw: String) -> Double? {
+            var s = raw.trimmingCharacters(in: .whitespaces)
+            // Deutsches Format: 1.234,56 → 1234.56
+            if s.contains(".") && s.contains(",") {
+                s = s.replacingOccurrences(of: ".", with: "").replacingOccurrences(of: ",", with: ".")
+            } else {
+                s = s.replacingOccurrences(of: ",", with: ".")
+            }
+            guard let d = Double(s), d > 0, d < 1_000_000 else { return nil }
+            return d
+        }
+        let patterns: [(String, String)] = [
+            (">([0-9]+[.,][0-9]+)\\s*EUR\\s*[+<]", "EUR"),
+            ("([0-9]+[.,][0-9]+)\\s*EUR\\s*\\+", "EUR"),
+            ("Schlusskurs[^0-9]*([0-9]+[.,][0-9]+)", "EUR"),
+            (">([0-9]+[.,][0-9]+)\\s*USD\\s*[+<]", "USD"),
+            ("([0-9]+[.,][0-9]+)\\s*USD\\s*\\+", "USD"),
+            (">([0-9]+[.,][0-9]+)\\s*GBP\\s*[+<]", "GBP"),
+            ("([0-9]+[.,][0-9]+)\\s*GBP\\s*\\+", "GBP"),
+            (">([0-9]+[.,][0-9]+)\\s*DKK\\s*[+<\" ]", "DKK"),
+            ("([0-9]+[.,][0-9]+)\\s*DKK\\s*\\+", "DKK"),
+            (">([0-9]+[.,][0-9]+)\\s*kr\\.?\\s*[+<\" ]", "DKK"),
+            ("([0-9]+[.,][0-9]+)\\s*kr\\.?\\s*\\+", "DKK"),
+            ("([0-9]+[.,][0-9]+)\\s*kr\\b", "DKK"),
+            ("([0-9]{1,3}(?:\\.[0-9]{3})*,[0-9]+)\\s*DKK", "DKK"),
+            ("([0-9]{1,3}(?:\\.[0-9]{3})*,[0-9]+)\\s*kr\\.?", "DKK"),
+            (">([0-9]+[.,][0-9]+)\\s*\\$\\s*[+<]", "USD"),
+            ("([0-9]+[.,][0-9]+)\\s*\\$\\s*\\+", "USD")
+        ]
+        for (pattern, waehrung) in patterns {
+            guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+                  let match = regex.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+                  match.numberOfRanges >= 1,
+                  let r = Range(match.range(at: 1), in: html) else { continue }
+            let raw = String(html[r])
+            guard let d = parseKursZahl(raw) else { continue }
+            return (d, waehrung)
+        }
         return nil
     }
 }

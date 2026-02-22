@@ -10,6 +10,8 @@ import Foundation
 class CSVParser {
     
     private static let csvColumnMappingUserDefaultsKey = "CSVColumnMapping"
+    private static let csvFieldSeparatorUserDefaultsKey = "CSVFieldSeparator"
+    private static let csvDecimalSeparatorUserDefaultsKey = "CSVDecimalSeparator"
     
     /// Liefert die benutzerdefinierte Spaltenzuordnung (Feld-ID → CSV-Header). Wenn nicht vorhanden oder zu wenige Pflichtfelder, nil.
     private static func loadCustomColumnMapping() -> [String: String]? {
@@ -59,7 +61,7 @@ class CSVParser {
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         let dataLines = lines.count > 1 ? Array(lines.dropFirst()) : []
-        let delimiter = detectDelimiter(firstLine: lines.first ?? "")
+        let delimiter = resolveDelimiter(firstLine: lines.first ?? "")
         let headerMap = buildHeaderMap(firstLine: lines.first ?? "", delimiter: delimiter)
         let customMapping = loadCustomColumnMapping()
         var aktien: [Aktie] = []
@@ -120,12 +122,25 @@ class CSVParser {
     /// Ermittelt Trennzeichen aus der ersten Zeile (Header) – einheitlich für die ganze Datei.
     /// Deutsche CSV-Exporte nutzen meist Semikolon (wegen Komma als Dezimaltrennzeichen).
     private static func detectDelimiter(firstLine: String) -> Character {
+        let tabs = firstLine.filter { $0 == "\t" }.count
         let semicolons = firstLine.filter { $0 == ";" }.count
         let commas = firstLine.filter { $0 == "," }.count
+        if tabs > semicolons && tabs > commas { return "\t" }
         if semicolons > 0 || commas > 0 {
             return semicolons >= commas ? ";" : ","
         }
         return ";" // Standard für deutsche CSV
+    }
+    
+    /// Liefert das zu verwendende Feldtrennzeichen: Nutzereinstellung oder Auto-Erkennung.
+    private static func resolveDelimiter(firstLine: String) -> Character {
+        let key = UserDefaults.standard.string(forKey: csvFieldSeparatorUserDefaultsKey) ?? "auto"
+        switch key {
+        case "semicolon": return ";"
+        case "comma": return ","
+        case "tab": return "\t"
+        default: return detectDelimiter(firstLine: firstLine)
+        }
     }
     
     /// Parst CSV-String und gibt ein Array von Aktien zurück
@@ -137,7 +152,7 @@ class CSVParser {
             .filter { !$0.isEmpty }
         guard lines.count > 1 else { return aktien }
         let dataLines = Array(lines.dropFirst())
-        let delimiter = detectDelimiter(firstLine: lines.first ?? "")
+        let delimiter = resolveDelimiter(firstLine: lines.first ?? "")
         let headerMap = buildHeaderMap(firstLine: lines.first ?? "", delimiter: delimiter)
         let customMapping = loadCustomColumnMapping()
         for line in dataLines {
@@ -325,25 +340,39 @@ class CSVParser {
         )
     }
     
-    /// Konvertiert einen String mit deutschem Format (Komma als Dezimaltrennzeichen) zu Double
+    /// Konvertiert einen String zu Double. Format abhängig von Einstellung: Deutsch (1.234,56) oder Englisch (1,234.56).
     private static func parseDouble(_ value: String) -> Double? {
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        
-        // Prüfe ob es ein Komma gibt (Dezimaltrennzeichen)
+        let decimalStyle = UserDefaults.standard.string(forKey: csvDecimalSeparatorUserDefaultsKey) ?? "german"
+        if decimalStyle == "english" {
+            return parseDoubleEnglish(trimmed)
+        }
+        return parseDoubleGerman(trimmed)
+    }
+    
+    /// Deutsch: Komma = Dezimaltrennzeichen, Punkt = Tausender (1.234,56)
+    private static func parseDoubleGerman(_ trimmed: String) -> Double? {
         if let commaIndex = trimmed.firstIndex(of: ",") {
-            // Es gibt ein Komma, also ist das Dezimaltrennzeichen
             let beforeComma = String(trimmed[..<commaIndex])
             let afterComma = String(trimmed[trimmed.index(after: commaIndex)...])
-            // Entferne Tausender-Trennzeichen (Punkte) vor dem Komma
             let cleanedBefore = beforeComma.replacingOccurrences(of: ".", with: "")
-            // Kombiniere zu "Zahl.Zahl" Format
             return Double("\(cleanedBefore).\(afterComma)")
-        } else {
-            // Kein Komma, also entferne alle Punkte (Tausender-Trennzeichen)
-            let cleaned = trimmed.replacingOccurrences(of: ".", with: "")
-            return Double(cleaned)
         }
+        let cleaned = trimmed.replacingOccurrences(of: ".", with: "")
+        return Double(cleaned)
+    }
+    
+    /// Englisch: Punkt = Dezimaltrennzeichen, Komma = Tausender (1,234.56)
+    private static func parseDoubleEnglish(_ trimmed: String) -> Double? {
+        if let pointIndex = trimmed.firstIndex(of: ".") {
+            let beforePoint = String(trimmed[..<pointIndex])
+            let afterPoint = String(trimmed[trimmed.index(after: pointIndex)...])
+            let cleanedBefore = beforePoint.replacingOccurrences(of: ",", with: "")
+            return Double("\(cleanedBefore).\(afterPoint)")
+        }
+        let cleaned = trimmed.replacingOccurrences(of: ",", with: "")
+        return Double(cleaned)
     }
     
     /// Parst ein Datum im Format DD.MM.YYYY

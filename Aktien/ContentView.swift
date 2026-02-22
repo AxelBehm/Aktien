@@ -67,6 +67,8 @@ private let savedManualKurszieleUserDefaultsKey = "SavedManualKursziele"
 
 // MARK: - CSV-Spaltenzuordnung (andere Banken)
 private let csvColumnMappingUserDefaultsKey = "CSVColumnMapping"
+private let csvFieldSeparatorUserDefaultsKey = "CSVFieldSeparator"  // "auto" | "semicolon" | "comma" | "tab"
+private let csvDecimalSeparatorUserDefaultsKey = "CSVDecimalSeparator"  // "german" | "english"
 
 /// Eine Spalte unserer App für die CSV-Zuordnung (Vorgabe links, User gibt rechts den CSV-Header ein)
 private struct CSVSpaltenField: Identifiable {
@@ -499,6 +501,7 @@ struct ContentView: View {
     @State private var isTestingWKN = false
     @State private var showSettings = false
     @State private var showRechtliches = false
+    @State private var showWatchlist = false
     @AppStorage(KurszielService.openAIAPIKeyKey) private var openAIAPIKeyStore: String = ""
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
@@ -536,6 +539,8 @@ struct ContentView: View {
     @State private var showEinlesungenChart = false
     /// Pfad für Aktien-Detail (nur unser Chevron, kein System-Chevron)
     @State private var aktienDetailPath: [String] = []
+    /// Beim Start kurz Splash anzeigen statt weißen Bildschirm
+    @State private var showSplash = true
     
     /// Gefilterte Aktien nach gewählter Kursziel-Quelle, optional nur unrealistische
     private var aktienZurAnzeige: [Aktie] {
@@ -553,14 +558,21 @@ struct ContentView: View {
         return byQuelle
     }
     
-    /// Sortiert nach grösstem Abstand (abs. %) zum Kursziel; ohne Kursziel ans Ende
+    /// Sortiert nach Abstand (%) zum Kursziel: positive % (Aufwärtspotenzial) oben, grösste zuerst; negative % (Abwärtspotenzial) unten; ohne Kursziel ans Ende
     private var aktienSortiertNachAbstandKursziel: [Aktie] {
         aktienZurAnzeige.sorted { a, b in
             let kursA = a.kurs ?? a.devisenkurs ?? 0
             let kursB = b.kurs ?? b.devisenkurs ?? 0
-            let pctA: Double = (a.kursziel != nil && kursA > 0) ? abs((a.kursziel! - kursA) / kursA * 100) : -1
-            let pctB: Double = (b.kursziel != nil && kursB > 0) ? abs((b.kursziel! - kursB) / kursB * 100) : -1
-            return pctA > pctB
+            let pctA: Double? = (a.kursziel != nil && kursA > 0) ? (a.kursziel! - kursA) / kursA * 100 : nil
+            let pctB: Double? = (b.kursziel != nil && kursB > 0) ? (b.kursziel! - kursB) / kursB * 100 : nil
+            // Ohne Kursziel ans Ende
+            guard let pa = pctA else { return false }
+            guard let pb = pctB else { return true }
+            // Positive % (Aufwärtspotenzial) vor negative % (Abwärtspotenzial)
+            if pa >= 0 && pb < 0 { return true }
+            if pa < 0 && pb >= 0 { return false }
+            if pa >= 0 && pb >= 0 { return pa > pb }
+            return pa > pb  // beide negativ: weniger negativ zuerst (z. B. -5 % vor -20 %)
         }
     }
     
@@ -788,6 +800,7 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
             .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
+            .sheet(isPresented: $showWatchlist) { WatchlistView() }
         } detail: {
             Text("Aktie auswählen")
         }
@@ -804,6 +817,9 @@ struct ContentView: View {
             Button(action: { sortiereNachAbstandKursziel.toggle() }) {
                 Label(sortiereNachAbstandKursziel ? "Sortierung: Standard" : "Nach Abstand zum Kursziel", systemImage: sortiereNachAbstandKursziel ? "list.bullet" : "chart.line.uptrend.xyaxis")
             }
+        }
+        ToolbarItem {
+            Button(action: { showWatchlist = true }) { Label("Watchlist", systemImage: "eye") }
         }
         ToolbarItem {
             Button(action: importCSVFiles) { Label("CSV importieren", systemImage: "doc.badge.plus") }
@@ -934,13 +950,16 @@ struct ContentView: View {
                         }
                     }
                 } footer: {
-                    if letzteZehn.isEmpty {
-                        Text("Nach einem CSV-Import erscheinen hier die Gesamtsummen pro Einlesung.")
-                            .font(.caption2)
-                    } else {
-                        Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis = ältestes Datum (bis zu 10 Einlesungen).")
-                            .font(.caption2)
+                    VStack(alignment: .leading, spacing: 4) {
+                        if letzteZehn.isEmpty {
+                            Text("Nach einem CSV-Import erscheinen hier die Gesamtsummen pro Einlesung.")
+                        } else {
+                            Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis = ältestes Datum (bis zu 10 Einlesungen).")
+                        }
+                        Text("Bitte alle .csv-Dateien des Tages auf einmal anklicken (wegen der Gesamtsummen-Darstellung).")
+                            .fontWeight(.medium)
                     }
+                    .font(.caption2)
                 }
                 
                 // Legende oben – Fonds/Fund/ETF-Positionen ggf. manuell mit Kurszielen versehen
@@ -1014,6 +1033,16 @@ struct ContentView: View {
                             } label: {
                                 HStack {
                                     aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: true)
+                                    if aktie.isWatchlist {
+                                        Text("Watchlist")
+                                            .font(.caption2)
+                                            .fontWeight(.medium)
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.orange.opacity(0.9))
+                                            .cornerRadius(4)
+                                    }
                                     Spacer(minLength: 8)
                                     Image(systemName: "chevron.right")
                                         .font(.body.weight(.semibold))
@@ -1028,7 +1057,7 @@ struct ContentView: View {
                         }
                     } header: {
                         Text("Nach Abstand zum Kursziel (grösste Differenz zuerst)")
-                            .font(.caption)
+                            .font(.caption.weight(.bold))
                             .foregroundColor(.secondary)
                     } footer: {
                         Text("Zwischensummen pro BL: Toolbar-Button „Sortierung: Standard“ tippen.")
@@ -1044,6 +1073,16 @@ struct ContentView: View {
                                 } label: {
                                     HStack {
                                         aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: false)
+                                        if aktie.isWatchlist {
+                                            Text("Watchlist")
+                                                .font(.caption2)
+                                                .fontWeight(.medium)
+                                                .foregroundColor(.white)
+                                                .padding(.horizontal, 6)
+                                                .padding(.vertical, 2)
+                                                .background(Color.orange.opacity(0.9))
+                                                .cornerRadius(4)
+                                        }
                                         Spacer(minLength: 8)
                                         Image(systemName: "chevron.right")
                                             .font(.body.weight(.semibold))
@@ -1060,7 +1099,7 @@ struct ContentView: View {
                                 deleteAktienInGroup(group.aktien, offsets: offsets)
                             }
                         } header: {
-                            Text("BL \(group.bl)")
+                            Text(group.bl == watchlistBankleistungsnummer ? "Watchlist" : "BL \(group.bl)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         } footer: {
@@ -1094,7 +1133,38 @@ struct ContentView: View {
     }
 
     var body: some View {
-        AnyView(contentView)
+        ZStack {
+            contentView
+            if showSplash {
+                splashOverlay
+            }
+        }
+        .animation(.easeOut(duration: 0.25), value: showSplash)
+        .onAppear {
+            // Kurz Splash zeigen, damit nie nur ein weißes Bild erscheint
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                showSplash = false
+            }
+        }
+    }
+    
+    /// Beim Laden anzeigen statt weißem Bildschirm
+    private var splashOverlay: some View {
+        ZStack {
+            Color(.systemGroupedBackground)
+                .ignoresSafeArea()
+            VStack(spacing: 16) {
+                Image(systemName: "chart.line.uptrend.xyaxis")
+                    .font(.system(size: 44))
+                    .foregroundStyle(.secondary)
+                Text("Aktien")
+                    .font(.title2.bold())
+                ProgressView()
+                    .scaleEffect(0.9)
+                    .padding(.top, 4)
+            }
+        }
+        .transition(.opacity)
     }
 
     @ViewBuilder
@@ -1260,6 +1330,17 @@ struct ContentView: View {
                     parseHinweise.append("\(url.lastPathComponent): \(zeilenGesamt) Zeilen in Datei, \(zeilenImportiert) als Positionen importiert. \(u) Zeile(n) konnten nicht zugeordnet werden (z. B. anderes Format oder fehlende Pflichtfelder).")
                 }
                 for neueAktie in neueAktien {
+                    let nIsin = neueAktie.isin.trimmingCharacters(in: .whitespaces)
+                    let nWkn = neueAktie.wkn.trimmingCharacters(in: .whitespaces)
+                    if let watchlist = alteAktien.first(where: { w in
+                        w.isWatchlist && ((!nIsin.isEmpty && w.isin.trimmingCharacters(in: .whitespaces) == nIsin) || (!nWkn.isEmpty && w.wkn.trimmingCharacters(in: .whitespaces) == nWkn))
+                    }) {
+                        watchlist.kurs = neueAktie.kurs
+                        watchlist.devisenkurs = neueAktie.devisenkurs
+                        watchlist.marktwertEUR = neueAktie.marktwertEUR
+                        if neueAktie.bezeichnung.isEmpty == false { watchlist.bezeichnung = neueAktie.bezeichnung }
+                        continue
+                    }
                     modelContext.insert(neueAktie)
                     alleNeuenAktien.append(neueAktie)
                 }
@@ -1341,8 +1422,9 @@ struct ContentView: View {
             }
         }
         
-        // 3. Alte Zeilen nur für die in der CSV vorkommenden Bankleistungsnummern löschen (Abgleich: verkaufte/entfernte Positionen weg)
+        // 3. Alte Zeilen nur für die in der CSV vorkommenden Bankleistungsnummern löschen (Abgleich: verkaufte/entfernte Positionen weg). Watchlist-Positionen nie löschen.
         for alte in alteAktien {
+            if alte.isWatchlist { continue }
             let alteBL = alte.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
             if !alteBL.isEmpty && csvBankleistungsnummern.contains(alteBL) {
                 modelContext.delete(alte)
@@ -1411,7 +1493,8 @@ struct ContentView: View {
             return !a.kurszielManuellGeaendert && a.kurszielQuelle != "C" && a.kursziel == nil
         }
         let brauchtKursziel = !csvHadKursziele || !alleNeuenAktien.filter(sollAktualisieren).isEmpty
-        if brauchtKursziel {
+        let hatFMPOderOpenAI = !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty || !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty
+        if brauchtKursziel, hatFMPOderOpenAI {
             pendingKurszielForceOverwrite = forceOverwriteAllKursziele || !csvHadKursziele
             pendingKurszielImportDatum = einleseDatum
             let startOfToday = Calendar.current.startOfDay(for: Date())
@@ -1501,6 +1584,29 @@ struct ContentView: View {
             // Aktuelle Aktie anzeigen
             await MainActor.run {
                 aktuelleKurszielAktie = (bezeichnung: aktie.bezeichnung, wkn: aktie.wkn)
+            }
+            
+            // Watchlist: Kurs kommt nicht aus der CSV – bei Einlesung aktuellen Kurs ermitteln
+            if aktie.isWatchlist {
+                let term = (aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty ? aktie.wkn : aktie.isin).trimmingCharacters(in: .whitespaces)
+                if !term.isEmpty, let lookup = await KurszielService.lookupWatchlist(searchTerm: term) {
+                    await MainActor.run {
+                        if let k = lookup.kurs {
+                            aktie.kurs = k
+                            if aktie.bestand == 0 { aktie.marktwertEUR = 0 } else { aktie.marktwertEUR = k * Double(aktie.bestand) }
+                        }
+                        // Bezeichnung für Watchlist erzeugen, wenn fehlend oder nur WKN/ISIN (kommt nicht aus CSV)
+                        let aktuelleBez = aktie.bezeichnung.trimmingCharacters(in: .whitespaces)
+                        let lookupBez = lookup.bezeichnung.trimmingCharacters(in: .whitespaces)
+                        if !lookupBez.isEmpty,
+                           aktuelleBez.isEmpty || aktuelleBez == aktie.wkn || aktuelleBez == aktie.isin || (aktuelleBez.count <= 8 && aktuelleBez.allSatisfy(\.isNumber)) {
+                            aktie.bezeichnung = lookupBez
+                        } else if aktuelleBez.isEmpty || aktuelleBez == aktie.wkn || aktuelleBez == aktie.isin {
+                            aktie.bezeichnung = watchlistBezeichnungFallback(wkn: aktie.wkn, isin: aktie.isin)
+                        }
+                        try? modelContext.save()
+                    }
+                }
             }
             
             // WICHTIG: Setze Kursziel erst auf nil, damit nicht das alte Kursziel bestehen bleibt
@@ -1761,6 +1867,8 @@ private struct KurszielZeileView: View {
     var onCopyISIN: ((String) -> Void)? = nil
     var onRowEdited: ((String) -> Void)? = nil
     var onKurszielSuchenTapped: ((String) -> Void)? = nil
+    @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
+    @AppStorage(KurszielService.openAIAPIKeyKey) private var openAIAPIKeyStore: String = ""
     @State private var showZwischenablageFeedback = false
     @State private var showChatGPTPromptFeedback = false
     @State private var showFMPTest = false
@@ -1802,11 +1910,12 @@ private struct KurszielZeileView: View {
         #endif
         onCopyISIN?(aktie.isin)
         showZwischenablageFeedback = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.zwischenablageFeedbackDauer) {
             showZwischenablageFeedback = false
         }
     }
     
+    private static let zwischenablageFeedbackDauer: TimeInterval = 4.0
     private static let chatGPTURL = URL(string: "https://chat.openai.com/")!
     /// Baut exakten Prompt für ChatGPT: „ISIN … durchschnittliches Kursziel in EUR ? Rückgabe nur den Wert“ (nur ISIN/WKN, keine Bezeichnung).
     private func buildChatGPTPrompt(for aktie: Aktie) -> String {
@@ -1818,18 +1927,18 @@ private struct KurszielZeileView: View {
     private func openChatGPT() {
         let prompt = buildChatGPTPrompt(for: aktie)
         showChatGPTPromptFeedback = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.zwischenablageFeedbackDauer) {
             showChatGPTPromptFeedback = false
         }
-        // Zwischenablage sofort und direkt vor dem Öffnen setzen, damit beim Laden/Einfügen der Prompt (nicht die Bezeichnung) verwendet wird
+        // Zwischenablage sofort setzen – Hinweis erscheint zuerst in der App
         #if os(iOS)
         UIPasteboard.general.string = prompt
         #elseif os(macOS)
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(prompt, forType: .string)
         #endif
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-            // Nochmals setzen, damit nichts anderes (z. B. Bezeichnung) die Zwischenablage überschrieben hat
+        // ChatGPT erst nach 1,5 s öffnen, damit der Zwischenablage-Text sichtbar ist, bevor die App wechselt
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
             #if os(iOS)
             UIPasteboard.general.string = prompt
             #elseif os(macOS)
@@ -1877,13 +1986,18 @@ private struct KurszielZeileView: View {
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                     if showChatGPTPromptFeedback {
-                        Text("Zwischenablage")
-                            .font(.caption2)
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 3)
-                            .background(Color.accentColor.opacity(0.9))
-                            .cornerRadius(4)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Zwischenablage")
+                            Text("Einfügen per Klick – direkt in ChatGPT")
+                                .font(.caption2)
+                                .opacity(0.95)
+                        }
+                        .font(.caption2)
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 3)
+                        .background(Color.accentColor.opacity(0.9))
+                        .cornerRadius(4)
                     }
                     }
                     .animation(.easeInOut(duration: 0.2), value: showChatGPTPromptFeedback)
@@ -2001,13 +2115,14 @@ private struct KurszielZeileView: View {
                     .font(.caption)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
+                    .disabled(fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
                     Button("OpenAI") {
                         loadKurszielViaOpenAI()
                     }
                     .font(.caption)
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .disabled(isLoadingOpenAI)
+                    .disabled(openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty || isLoadingOpenAI)
                     Button("Aus Datei") {
                         showOpenAIFileImporter = true
                     }
@@ -2265,8 +2380,11 @@ struct AktieDetailView: View {
                     Text(aktie.bankleistungsnummer)
                 }
                 LabeledContent("Bezeichnung") {
-                    Text(aktie.bezeichnung)
+                    Text(aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty && aktie.isWatchlist
+                          ? watchlistBezeichnungFallback(wkn: aktie.wkn, isin: aktie.isin)
+                          : aktie.bezeichnung)
                 }
+                .lineLimit(1)
                 LabeledContent("WKN") {
                     Text(aktie.wkn)
                 }
@@ -2521,7 +2639,7 @@ struct AktieDetailView: View {
             onAppearISIN?(aktie.isin)
         }
         .scrollDismissesKeyboard(.interactively)
-        .navigationTitle(aktie.bezeichnung)
+        .navigationTitle(aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty ? watchlistBezeichnungFallback(wkn: aktie.wkn, isin: aktie.isin) : aktie.bezeichnung)
         .navigationBarTitleDisplayMode(.inline)
         #if os(iOS)
         .toolbar(.visible, for: .tabBar)
@@ -3106,6 +3224,8 @@ struct RechtlichesSheetView: View {
 
 struct CSVSpaltenZuordnungView: View {
     @State private var mapping: [String: String] = loadCSVColumnMapping()
+    @AppStorage(csvFieldSeparatorUserDefaultsKey) private var fieldSeparator = "auto"
+    @AppStorage(csvDecimalSeparatorUserDefaultsKey) private var decimalSeparator = "german"
     @Environment(\.dismiss) private var dismiss
     
     private func binding(for id: String) -> Binding<String> {
@@ -3152,6 +3272,22 @@ struct CSVSpaltenZuordnungView: View {
                 Text("Basis: Ohne Zuordnung (oder nach „Zurücksetzen“) verwendet die App wie bisher das normale Layout (Deutsche Bank / maxblue). Mindestens Bankleistungsnummer, Bestand, Bezeichnung und WKN sollten Sie zuordnen, sobald Sie eine andere Bank nutzen.")
             }
             Section {
+                Picker("Feldtrenner", selection: $fieldSeparator) {
+                    Text("Automatisch (; oder , oder Tab)").tag("auto")
+                    Text("Semikolon (;)").tag("semicolon")
+                    Text("Komma (,)").tag("comma")
+                    Text("Tab").tag("tab")
+                }
+                Picker("Dezimaltrennzeichen", selection: $decimalSeparator) {
+                    Text("Deutsch (1.234,56)").tag("german")
+                    Text("Englisch (1,234.56)").tag("english")
+                }
+            } header: {
+                Text("Format der CSV-Datei")
+            } footer: {
+                Text("Feldtrenner: Zeichen zwischen den Spalten. „Automatisch“ erkennt ; oder , oder Tab aus der ersten Zeile. Dezimaltrennzeichen: Komma (deutsch) oder Punkt (englisch) bei Zahlen.")
+            }
+            Section {
                 Button("Zurücksetzen (Standard Deutsche Bank / maxblue)") {
                     mapping = [:]
                 }
@@ -3172,6 +3308,231 @@ struct CSVSpaltenZuordnungView: View {
             if mapping.isEmpty {
                 mapping = loadCSVColumnMapping()
             }
+        }
+    }
+}
+
+// MARK: - Watchlist
+/// Fallback-Bezeichnung für Watchlist, wenn Lookup keine liefert (z. B. „WKN 710000“ oder „ISIN DE000…“).
+private func watchlistBezeichnungFallback(wkn: String, isin: String) -> String {
+    let w = wkn.trimmingCharacters(in: .whitespaces)
+    let i = isin.trimmingCharacters(in: .whitespaces)
+    if w.count == 6, w.allSatisfy(\.isNumber) { return "WKN \(w)" }
+    if i.count >= 12 { return "ISIN \(i)" }
+    if !w.isEmpty { return "WKN \(w)" }
+    if !i.isEmpty { return "ISIN \(i)" }
+    return "Watchlist"
+}
+
+struct WatchlistView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @Query(sort: [SortDescriptor<Aktie>(\.bezeichnung)]) private var alleAktien: [Aktie]
+    @State private var isinWknEingabe = ""
+    @State private var lookupResult: KurszielService.WatchlistLookupResult?
+    @State private var isLookingUp = false
+    @State private var bearbeiteterKurs: String = ""
+    @State private var bearbeitetesKursziel: String = ""
+    /// ISIN der Aktie, für die gerade „Bezeichnung ermitteln“ läuft (in der Liste)
+    @State private var aktualisiereAktieId: String?
+    
+    private var watchlistAktien: [Aktie] {
+        alleAktien.filter { $0.isWatchlist }
+    }
+    
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    TextField("ISIN oder WKN", text: $isinWknEingabe)
+                        .textContentType(.none)
+                        .autocapitalization(.allCharacters)
+                        .disableAutocorrection(true)
+                    Button {
+                        Task { await ermitteln() }
+                    } label: {
+                        HStack {
+                            Text("Bezeichnung, Kurs und Kursziel ermitteln")
+                            if isLookingUp {
+                                Spacer()
+                                ProgressView()
+                                    .scaleEffect(0.9)
+                            }
+                        }
+                    }
+                    .disabled(isinWknEingabe.trimmingCharacters(in: .whitespaces).isEmpty || isLookingUp)
+                } header: {
+                    Text("Neuer Eintrag")
+                }
+                if let r = lookupResult {
+                    Section {
+                        LabeledContent("Bezeichnung", value: r.bezeichnung)
+                        if let k = r.kurs {
+                            LabeledContent("Kurs", value: String(format: "%.2f €", k))
+                        } else {
+                            TextField("Kurs (optional)", text: $bearbeiteterKurs)
+                                .keyboardType(.decimalPad)
+                        }
+                        if let kz = r.kursziel {
+                            LabeledContent("Kursziel", value: String(format: "%.2f €", kz))
+                        } else {
+                            TextField("Kursziel (optional)", text: $bearbeitetesKursziel)
+                                .keyboardType(.decimalPad)
+                        }
+                        Button("Zur Watchlist hinzufügen") {
+                            zurWatchlistHinzufuegen(result: r)
+                            lookupResult = nil
+                            isinWknEingabe = ""
+                            bearbeiteterKurs = ""
+                            bearbeitetesKursziel = ""
+                        }
+                    } header: {
+                        Text("Ergebnis")
+                    }
+                }
+                Section {
+                    ForEach(watchlistAktien) { aktie in
+                        HStack {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(aktie.bezeichnung)
+                                    .font(.headline)
+                                Text(aktie.isin.isEmpty ? aktie.wkn : aktie.isin)
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                if let k = aktie.kurs ?? aktie.devisenkurs, let kz = aktie.kursziel {
+                                    Text("Kurs \(String(format: "%.2f", k)) € · Kursziel \(String(format: "%.2f", kz)) €")
+                                        .font(.caption2)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer()
+                            if aktualisiereAktieId == (aktie.isin.isEmpty ? aktie.wkn : aktie.isin) {
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                            }
+                        }
+                        .contextMenu {
+                            Button {
+                                Task { await bezeichnungErmittelnFuer(aktie: aktie) }
+                            } label: {
+                                Label("Bezeichnung & Kurs aktualisieren", systemImage: "arrow.clockwise")
+                            }
+                            .disabled(aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty && aktie.wkn.trimmingCharacters(in: .whitespaces).isEmpty)
+                        }
+                    }
+                    .onDelete(perform: deleteWatchlistItems)
+                } header: {
+                    Text("Watchlist (\(watchlistAktien.count))")
+                } footer: {
+                    Text("Einträge erscheinen in der Aktien-Liste unter Bankleistungsnummer 999999 mit Kennzeichnung „Watchlist“ und werden bei der normalen CSV-Einlesung aktualisiert.")
+                }
+            }
+            .navigationTitle("Watchlist")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Schließen") { dismiss() }
+                }
+            }
+        }
+        .onAppear {
+            if let r = lookupResult {
+                if r.kurs == nil, bearbeiteterKurs.isEmpty { bearbeiteterKurs = "" }
+                if r.kursziel == nil, bearbeitetesKursziel.isEmpty { bearbeitetesKursziel = "" }
+            }
+        }
+    }
+    
+    private func ermitteln() async {
+        let term = isinWknEingabe.trimmingCharacters(in: .whitespaces)
+        guard !term.isEmpty else { return }
+        isLookingUp = true
+        defer { isLookingUp = false }
+        let result = await KurszielService.lookupWatchlist(searchTerm: term)
+        await MainActor.run {
+            lookupResult = result
+            if let r = result {
+                bearbeiteterKurs = r.kurs.map { String(format: "%.2f", $0) } ?? ""
+                bearbeitetesKursziel = r.kursziel.map { String(format: "%.2f", $0) } ?? ""
+            }
+        }
+    }
+    
+    /// Bezeichnung, Kurs und Kursziel für einen bestehenden Watchlist-Eintrag ermitteln und speichern.
+    private func bezeichnungErmittelnFuer(aktie: Aktie) async {
+        let term = (aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty ? aktie.wkn : aktie.isin).trimmingCharacters(in: .whitespaces)
+        guard !term.isEmpty else { return }
+        let id = aktie.isin.isEmpty ? aktie.wkn : aktie.isin
+        await MainActor.run { aktualisiereAktieId = id }
+        let result = await KurszielService.lookupWatchlist(searchTerm: term)
+        await MainActor.run {
+            aktualisiereAktieId = nil
+            guard let r = result else { return }
+            let neueBez = r.bezeichnung.trimmingCharacters(in: .whitespaces)
+            if !neueBez.isEmpty {
+                aktie.bezeichnung = neueBez
+            } else if aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty || aktie.bezeichnung == aktie.wkn || aktie.bezeichnung == aktie.isin {
+                aktie.bezeichnung = watchlistBezeichnungFallback(wkn: aktie.wkn, isin: aktie.isin)
+            }
+            if !r.wkn.trimmingCharacters(in: .whitespaces).isEmpty { aktie.wkn = r.wkn }
+            if !r.isin.trimmingCharacters(in: .whitespaces).isEmpty { aktie.isin = r.isin }
+            if let k = r.kurs { aktie.kurs = k }
+            if let kz = r.kursziel {
+                aktie.kursziel = kz
+                aktie.kurszielQuelle = "F"
+                aktie.kurszielWaehrung = "EUR"
+            }
+            try? modelContext.save()
+        }
+    }
+    
+    private func zurWatchlistHinzufuegen(result: KurszielService.WatchlistLookupResult) {
+        let kurs: Double? = Double(bearbeiteterKurs.replacingOccurrences(of: ",", with: ".")) ?? result.kurs
+        let kursziel: Double? = Double(bearbeitetesKursziel.replacingOccurrences(of: ",", with: ".")) ?? result.kursziel
+        let wkn = result.wkn.trimmingCharacters(in: .whitespaces)
+        let isin = result.isin.trimmingCharacters(in: .whitespaces)
+        let bez = result.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty
+            ? watchlistBezeichnungFallback(wkn: wkn, isin: isin)
+            : result.bezeichnung
+        let a = Aktie(
+            bankleistungsnummer: watchlistBankleistungsnummer,
+            bestand: 0,
+            bezeichnung: bez,
+            wkn: wkn.isEmpty ? isin : wkn,
+            isin: isin.isEmpty ? wkn : isin,
+            waehrung: "EUR",
+            hinweisEinstandskurs: "",
+            einstandskurs: nil,
+            deviseneinstandskurs: nil,
+            kurs: kurs,
+            devisenkurs: nil,
+            gewinnVerlustEUR: nil,
+            gewinnVerlustProzent: nil,
+            marktwertEUR: nil,
+            stueckzinsenEUR: nil,
+            anteilProzent: nil,
+            datumLetzteBewegung: nil,
+            gattung: "Aktie",
+            branche: "-",
+            risikoklasse: "-",
+            depotPortfolioName: "Watchlist",
+            kursziel: kursziel,
+            kurszielQuelle: kursziel != nil ? "F" : nil,
+            kurszielWaehrung: kursziel != nil ? "EUR" : nil,
+            isWatchlist: true
+        )
+        modelContext.insert(a)
+        try? modelContext.save()
+    }
+    
+    private func deleteWatchlistItems(offsets: IndexSet) {
+        withAnimation {
+            for i in offsets {
+                if i < watchlistAktien.count {
+                    modelContext.delete(watchlistAktien[i])
+                }
+            }
+            try? modelContext.save()
         }
     }
 }
@@ -3584,7 +3945,7 @@ struct SettingsView: View {
                 } header: {
                     Text("Kursziel-Quellen (Basis)")
                 } footer: {
-                    Text("Optionale API-URL unten eintragen (FMP oder OpenAI). Der Nutzer muss sich einen passenden API-Schlüssel beim Anbieter besorgen und diesen in die komplette URL einsetzen (Varianten: per ISIN, Kürzel oder Kennung).\n\nVorschläge FMP:\n• Preisziele (Symbol): https://financialmodelingprep.com/stable/price-target-consensus?symbol=SYMBOL&apikey=KEY\n• Suche ISIN: https://financialmodelingprep.com/stable/search-isin?isin=ISIN&apikey=KEY\n\nOpenAI: API-Key im Abschnitt „OpenAI“ eintragen; die App nutzt ihn für Kursziel-Abfragen. Zusätzlich kann die Portfolio-CSV extern mit OpenAI bearbeitet werden (Kursziele in neue CSV schreiben) und die erzeugte CSV hier importiert werden.\n\nWenn keine URL/Key eingetragen wird: Kursziele werden über finanzen.net, ariva.de, Yahoo o. Ä. ermittelt (ggf. ungenauer).\n\nCSV-Import: Enthält die CSV in der letzten Spalte oder in einer Spalte „Kursziel“ bzw. „Kursziel_EUR“ bereits einen Wert, wird keine Ermittlung durchgeführt und dieser Wert übernommen.")
+                    Text("Optionale API-URL unten eintragen (FMP oder OpenAI). Der Nutzer muss sich einen passenden API-Schlüssel beim Anbieter besorgen und diesen in die komplette URL einsetzen (Varianten: per ISIN, Kürzel oder Kennung).\n\nWenn keine URL/Key eingetragen wird: Kursziele werden über finanzen.net, ariva.de, Yahoo o. Ä. ermittelt (ggf. ungenauer).\n\nVorschläge FMP:\n• Preisziele (Symbol): https://financialmodelingprep.com/stable/price-target-consensus?symbol=SYMBOL&apikey=KEY\n• Suche ISIN: https://financialmodelingprep.com/stable/search-isin?isin=ISIN&apikey=KEY\n\nOpenAI: API-Key im Abschnitt „OpenAI“ eintragen; die App nutzt ihn für Kursziel-Abfragen. Zusätzlich kann die Portfolio-CSV extern mit OpenAI bearbeitet werden (Kursziele in neue CSV schreiben) und die erzeugte CSV hier importiert werden.\n\nCSV-Import: Enthält die CSV in der letzten Spalte oder in einer Spalte „Kursziel“ bzw. „Kursziel_EUR“ bereits einen Wert, wird keine Ermittlung durchgeführt und dieser Wert übernommen.")
                 }
                 
                 Section {
@@ -3682,7 +4043,10 @@ struct SettingsView: View {
                 } header: {
                     Text("OpenAI")
                 } footer: {
-                    Text("API-Key für Kursziele via OpenAI. «Befehl»: z.B. „Gib mir das aktuelle Datum zurück“ – nur ein Rückgabewert. Befehl anpassen, dann «Verbindung testen». Im Ergebnis wird der komplette Link angezeigt.")
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("API-Key für Kursziele via OpenAI. «Befehl»: z.B. „Gib mir das aktuelle Datum zurück“ – nur ein Rückgabewert. Befehl anpassen, dann «Verbindung testen». Im Ergebnis wird der komplette Link angezeigt.")
+                        Text("Nach der Generierung in OpenAI wird der API-Key zum Kopieren angeboten. Falls das direkte Einfügen in die Einstellung nicht klappt: Key kopieren und in eine E-Mail einfügen (nicht in eine separate Datei). Auf dem iPhone die Mail öffnen und den Key von dort in die Einstellung einfügen – das funktioniert.")
+                    }
                 }
             }
             .navigationTitle("Einstellungen")

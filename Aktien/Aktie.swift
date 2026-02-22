@@ -54,6 +54,8 @@ final class Aktie {
     var previousBestand: Double?
     /// Kurs aus der Voreinlesung (für Vergleich bei Ersetzung)
     var previousKurs: Double?
+    /// true = Eintrag aus der Watchlist (BL 999999), nicht aus CSV-Import
+    var isWatchlist: Bool = false
     
     init(
         bankleistungsnummer: String,
@@ -88,7 +90,8 @@ final class Aktie {
         kurszielManuellGeaendert: Bool = false,
         previousMarktwertEUR: Double? = nil,
         previousBestand: Double? = nil,
-        previousKurs: Double? = nil
+        previousKurs: Double? = nil,
+        isWatchlist: Bool = false
     ) {
         self.bankleistungsnummer = bankleistungsnummer
         self.bestand = bestand
@@ -124,5 +127,9 @@ final class Aktie {
         self.previousMarktwertEUR = previousMarktwertEUR
         self.previousBestand = previousBestand
         self.previousKurs = previousKurs
+        self.isWatchlist = isWatchlist
     }
 }
+
+/// Bankleistungsnummer für Watchlist-Positionen (werden in der Liste unter „Watchlist“ geführt)
+let watchlistBankleistungsnummer = "999999"
