@@ -278,7 +278,7 @@ class KurszielService {
                 debug("   ❌ Kein Kursziel gefunden")
             }
             
-            // 5. finanzen.net Suchseite
+            // 5. finanzen.net Suchseite (WKN)
             debug("5️⃣ Versuche finanzen.net Suche für \(aktie.wkn)")
             if let info = await fetchKurszielVonFinanzenNetSearch(wkn: aktie.wkn) {
                 debug("   → Gefunden: \(info.kursziel) €")
@@ -292,6 +292,24 @@ class KurszielService {
                 }
             } else {
                 debug("   ❌ Kein Kursziel gefunden")
+            }
+            
+            // 5b. finanzen.net Suchseite mit ISIN (z. B. Deutsche Bank DE0005140008, wenn WKN/Slug abweichen)
+            if !aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
+                debug("5b️⃣ Versuche finanzen.net Suche für ISIN \(aktie.isin)")
+                if let info = await fetchKurszielVonFinanzenNetSearch(searchTerm: aktie.isin) {
+                    debug("   → Gefunden: \(info.kursziel) €")
+                    if isValidKursziel(info.kursziel, referencePrice: refPrice) {
+                        debug("   ✅ Plausibilitätsprüfung bestanden")
+                        let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+                        return eurInfo
+                    } else {
+                        debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
+                    }
+                } else {
+                    debug("   ❌ Kein Kursziel gefunden")
+                }
             }
             
             // 6. ariva.de mit Firmen-Slug (Slug-URLs für finanzen.net bereits in Schritt 3)
@@ -568,6 +586,15 @@ class KurszielService {
             .replacingOccurrences(of: "ü", with: "ue")
             .replacingOccurrences(of: "ß", with: "ss")
         
+        // Typische Börsen-/Wertpapierbezeichnungen entfernen (z. B. Deutsche Bank AG Inhaber-Aktien o.N. -> Deutsche Bank)
+        for suffix in [" inhaber-aktien o.n.", " inhaber-aktien", " na o.n.", " o.n.", " vink. namens-aktien", " namens-aktien"] {
+            if slug.hasSuffix(suffix) {
+                slug = String(slug.dropLast(suffix.count)).trimmingCharacters(in: .whitespaces)
+            }
+            slug = slug.replacingOccurrences(of: suffix, with: " ")
+        }
+        slug = slug.trimmingCharacters(in: .whitespaces)
+        
         // Firmenrechtsformen entfernen (als Wort, nicht nur am Ende)
         for suffix in [" ag ", " se ", " gmbh ", " kg ", " co. ", " inc. ", " plc "] {
             slug = slug.replacingOccurrences(of: suffix, with: " ")
@@ -816,9 +843,15 @@ class KurszielService {
         return urls
     }
     
-    /// Ruft Kursziel von finanzen.net ab (Suchseite mit WKN – leitet oft zur Aktienseite weiter)
+    /// Ruft Kursziel von finanzen.net ab (Suchseite mit WKN oder ISIN – leitet oft zur Aktienseite weiter)
     private static func fetchKurszielVonFinanzenNetSearch(wkn: String) async -> KurszielInfo? {
-        let searchURL = "https://www.finanzen.net/suchergebnis.asp?frmAktiensucheTextfeld=\(wkn)"
+        await fetchKurszielVonFinanzenNetSearch(searchTerm: wkn)
+    }
+    
+    /// Ruft Kursziel von finanzen.net ab (Suchseite mit Suchbegriff, z. B. WKN oder ISIN)
+    private static func fetchKurszielVonFinanzenNetSearch(searchTerm: String) async -> KurszielInfo? {
+        let encoded = searchTerm.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? searchTerm
+        let searchURL = "https://www.finanzen.net/suchergebnis.asp?frmAktiensucheTextfeld=\(encoded)"
         debug("   📡 HTTP GET: \(searchURL)")
         let result = await fetchKurszielFromURL(searchURL)
         if let info = result {

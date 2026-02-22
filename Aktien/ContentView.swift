@@ -65,6 +65,53 @@ private struct SavedManualKursziel: Codable {
 }
 private let savedManualKurszieleUserDefaultsKey = "SavedManualKursziele"
 
+// MARK: - CSV-Spaltenzuordnung (andere Banken)
+private let csvColumnMappingUserDefaultsKey = "CSVColumnMapping"
+
+/// Eine Spalte unserer App für die CSV-Zuordnung (Vorgabe links, User gibt rechts den CSV-Header ein)
+private struct CSVSpaltenField: Identifiable {
+    let id: String
+    let label: String
+    var optional: Bool { id == "kursziel" || id == "kursziel_quelle" || id == "hinweisEinstandskurs" || id == "branche" || id == "risikoklasse" || id == "depotPortfolioName" }
+}
+
+private let csvSpaltenFields: [CSVSpaltenField] = [
+    CSVSpaltenField(id: "bankleistungsnummer", label: "Bankleistungsnummer / Depotnummer"),
+    CSVSpaltenField(id: "bestand", label: "Bestand (Stück)"),
+    CSVSpaltenField(id: "bezeichnung", label: "Bezeichnung"),
+    CSVSpaltenField(id: "wkn", label: "WKN"),
+    CSVSpaltenField(id: "isin", label: "ISIN"),
+    CSVSpaltenField(id: "waehrung", label: "Währung"),
+    CSVSpaltenField(id: "hinweisEinstandskurs", label: "Hinweis Einstandskurs"),
+    CSVSpaltenField(id: "einstandskurs", label: "Einstandskurs"),
+    CSVSpaltenField(id: "deviseneinstandskurs", label: "Deviseneinstandskurs"),
+    CSVSpaltenField(id: "kurs", label: "Kurs"),
+    CSVSpaltenField(id: "devisenkurs", label: "Devisenkurs"),
+    CSVSpaltenField(id: "gewinnVerlustEUR", label: "Gewinn/Verlust EUR"),
+    CSVSpaltenField(id: "gewinnVerlustProzent", label: "Gewinn/Verlust %"),
+    CSVSpaltenField(id: "marktwertEUR", label: "Marktwert EUR"),
+    CSVSpaltenField(id: "stueckzinsenEUR", label: "Stückzinsen EUR"),
+    CSVSpaltenField(id: "anteilProzent", label: "Anteil %"),
+    CSVSpaltenField(id: "datumLetzteBewegung", label: "Datum letzte Bewegung"),
+    CSVSpaltenField(id: "gattung", label: "Gattung"),
+    CSVSpaltenField(id: "branche", label: "Branche"),
+    CSVSpaltenField(id: "risikoklasse", label: "Risikoklasse"),
+    CSVSpaltenField(id: "depotPortfolioName", label: "Depot-/Portfolio-Name"),
+    CSVSpaltenField(id: "kursziel", label: "Kursziel (optional)"),
+    CSVSpaltenField(id: "kursziel_quelle", label: "Kursziel Quelle (optional)"),
+]
+
+private func loadCSVColumnMapping() -> [String: String] {
+    guard let data = UserDefaults.standard.data(forKey: csvColumnMappingUserDefaultsKey),
+          let decoded = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
+    return decoded
+}
+
+private func saveCSVColumnMapping(_ mapping: [String: String]) {
+    guard let data = try? JSONEncoder().encode(mapping) else { return }
+    UserDefaults.standard.set(data, forKey: csvColumnMappingUserDefaultsKey)
+}
+
 /// Dezimal-TextField, das beim Löschen nicht zittert – speichert erst beim Verlassen des Feldes
 private struct StableDecimalField: View {
     let placeholder: String
@@ -441,6 +488,8 @@ struct ContentView: View {
     @State private var importMessage = ""
     @State private var showImportMessage = false
     @State private var showDeleteConfirmation = false
+    @State private var einlesungToDelete: ImportSummary? = nil
+    @State private var showDeleteEinlesungConfirmation = false
     @State private var isImportingKursziele = false
     @State private var aktuelleKurszielAktie: (bezeichnung: String, wkn: String)? = nil
     @State private var showWKNTester = false
@@ -449,6 +498,7 @@ struct ContentView: View {
     @State private var testKurszielResult: String? = nil
     @State private var isTestingWKN = false
     @State private var showSettings = false
+    @State private var showRechtliches = false
     @AppStorage(KurszielService.openAIAPIKeyKey) private var openAIAPIKeyStore: String = ""
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
@@ -645,18 +695,164 @@ struct ContentView: View {
         )
     }
 
-    var body: some View {
-        TabView(selection: selectedTabBinding) {
-            NavigationSplitView {
+    @ViewBuilder
+    private var aktienTabContent: some View {
+        NavigationSplitView {
             NavigationStack(path: $aktienDetailPath) {
-            VStack(spacing: 0) {
-                DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
-            ScrollViewReader { proxy in
-            List {
+                VStack(spacing: 0) {
+                    DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
+                    ScrollViewReader { proxy in
+                        aktienListContent(proxy: proxy)
+                            .onChange(of: selectedTab) { _, new in
+                                if new == 0 {
+                                    let isin = scrollToISINWhenReturningFromKursziele ?? scrollToISIN
+                                    scrollToISINWhenReturningFromKursziele = nil
+                                    if let isin = isin {
+                                        DispatchQueue.main.async {
+                                            proxy.scrollTo(isin, anchor: .center)
+                                            scrollToISIN = nil
+                                        }
+                                    }
+                                }
+                            }
+                    }
+                }
+                .navigationDestination(for: String.self) { isin in
+                    if let aktie = aktien.first(where: { $0.isin == isin }) {
+                        AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+                    }
+                }
+            }
+            #if os(macOS)
+            .navigationSplitViewColumnWidth(min: 300, ideal: 350)
+            #endif
+            .navigationTitle("Aktien")
+            .toolbar { aktienToolbarContent }
+            .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
+                Button("Löschen und Kursziele merken", role: .destructive) { saveManualKurszieleAndDeleteAll() }
+                Button("Löschen (Kursziele nicht merken)", role: .destructive) {
+                    UserDefaults.standard.removeObject(forKey: savedManualKurszieleUserDefaultsKey)
+                    deleteAllAktien()
+                }
+                Button("Abbrechen", role: .cancel) { }
+            } message: {
+                let n = aktien.filter { $0.kurszielManuellGeaendert }.count
+                if n > 0 {
+                    Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht. \(n) manuelle Kursziele können gemerkt und nach dem nächsten Einlesen (über ISIN/WKN) wieder zugeordnet werden.")
+                } else {
+                    Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht.")
+                }
+            }
+            .confirmationDialog("Einlesung löschen?", isPresented: $showDeleteEinlesungConfirmation, presenting: einlesungToDelete) { summary in
+                Button("Löschen", role: .destructive) {
+                    deleteEinlesung(summary)
+                    einlesungToDelete = nil
+                }
+                Button("Abbrechen", role: .cancel) { einlesungToDelete = nil }
+            } message: { summary in
+                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) löschen? Alle Aktien und Summen für diesen Tag werden aus den Tabellen entfernt.")
+            }
+            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
+                handleFileImport(result: result)
+            }
+            .alert("Import", isPresented: $showImportMessage) {
+                Button("OK", role: .cancel) {
+                    showImportMessage = false
+                    if pendingKurszielFetchAfterImport {
+                        pendingKurszielFetchAfterImport = false
+                        startPendingKurszielFetch()
+                    } else if showKurszielAbfrageBeiAltemDatum {
+                        showKurszielAbfrageBeiAltemDatum = false
+                        showKurszielAbfrageAlert = true
+                    }
+                }
+            } message: { Text(importMessage) }
+            .alert("Kursziele ermitteln?", isPresented: $showKurszielAbfrageAlert) {
+                Button("Ja") { showKurszielAbfrageAlert = false; startPendingKurszielFetch() }
+                Button("Nein", role: .cancel) { showKurszielAbfrageAlert = false }
+            } message: {
+                Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)")
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
+            }
+            .sheet(isPresented: $showWKNTester) {
+                WKNTesterView(wkn: $testWKN, result: $testKurszielResult, isTesting: $isTestingWKN, urlFromSettings: fmpAPIKeyStore, openAIFromSettings: openAIAPIKeyStore)
+                    .onAppear {
+                        if testWKN.isEmpty, !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty {
+                            testWKN = fmpAPIKeyStore.trimmingCharacters(in: .whitespaces)
+                        } else if testWKN.isEmpty {
+                            testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
+                        }
+                    }
+            }
+            .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
+            .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
+        } detail: {
+            Text("Aktie auswählen")
+        }
+    }
+
+    @ToolbarContentBuilder
+    private var aktienToolbarContent: some ToolbarContent {
+        #if os(iOS)
+        ToolbarItem(placement: .navigationBarTrailing) {
+            Button("Rechtliches") { showRechtliches = true }
+        }
+        #endif
+        ToolbarItem {
+            Button(action: { sortiereNachAbstandKursziel.toggle() }) {
+                Label(sortiereNachAbstandKursziel ? "Sortierung: Standard" : "Nach Abstand zum Kursziel", systemImage: sortiereNachAbstandKursziel ? "list.bullet" : "chart.line.uptrend.xyaxis")
+            }
+        }
+        ToolbarItem {
+            Button(action: importCSVFiles) { Label("CSV importieren", systemImage: "doc.badge.plus") }
+        }
+        ToolbarItem {
+            Button(role: .destructive, action: { showDeleteConfirmation = true }) {
+                Label("Alles löschen", systemImage: "trash")
+            }
+            .disabled(aktien.isEmpty)
+        }
+        ToolbarItem {
+            Button(action: { showSettings = true }) { Label("Einstellungen", systemImage: "gear") }
+        }
+        ToolbarItem {
+            Button(action: {
+                #if os(iOS)
+                if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
+                    let kandidaten = KurszielService.slugKandidaten(from: clipboard)
+                    let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
+                    if !slug.isEmpty { testWKN = "https://www.finanzen.net/kursziele/\(slug)" }
+                }
+                #elseif os(macOS)
+                if let clipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
+                    let kandidaten = KurszielService.slugKandidaten(from: clipboard)
+                    let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
+                    if !slug.isEmpty { testWKN = "https://www.finanzen.net/kursziele/\(slug)" }
+                }
+                #endif
+                if testWKN.isEmpty { testWKN = "https://www.finanzen.net/kursziele/rheinmetall" }
+                showWKNTester = true
+            }) { Label("WKN testen", systemImage: "magnifyingglass") }
+        }
+        ToolbarItem {
+            Button(action: { showDebugLog = true }) { Label("Debug-Log", systemImage: "ladybug") }
+        }
+    }
+
+    @ViewBuilder
+    private func aktienListContent(proxy: ScrollViewProxy) -> some View {
+        List {
                 // Gesamtsummen der letzten 10 Einlesungen – sortiert nach Datum der Einlesedatei (ältestes zuerst)
                 let letzteZehn = Array(importSummaries.prefix(10)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
-                if !letzteZehn.isEmpty {
-                    Section {
+                Section {
+                    if letzteZehn.isEmpty {
+                        Text("Keine Einlesungen vorhanden. Nach einem CSV-Import erscheinen hier die Gesamtsummen (bis zu 10).")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                            .padding(.vertical, 8)
+                    } else {
                         if showEinlesungenChart {
                             EinlesungenChartView(summaries: letzteZehn)
                                 .frame(height: 160)
@@ -665,66 +861,83 @@ struct ContentView: View {
                         }
                         let ausgangsbasis = letzteZehn.first
                         ForEach(Array(letzteZehn.enumerated()), id: \.element.importDatum) { _, summary in
-                            VStack(alignment: .leading, spacing: 6) {
-                                HStack {
-                                    Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
-                                        .font(.caption)
-                                        .fontWeight(.medium)
-                                    Spacer()
-                                }
-                                HStack {
-                                    Text("Gesamtwert:")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                    Spacer()
-                                    Text("\(summary.gesamtwertAktuelleEinlesung, specifier: "%.2f") €")
-                                        .font(.caption)
-                                        .fontWeight(.medium)
-                                }
-                                if let basis = ausgangsbasis, basis.importDatum != summary.importDatum, basis.gesamtwertAktuelleEinlesung > 0 {
-                                    let differenz = summary.gesamtwertAktuelleEinlesung - basis.gesamtwertAktuelleEinlesung
+                            HStack(alignment: .top, spacing: 8) {
+                                VStack(alignment: .leading, spacing: 6) {
                                     HStack {
-                                        Text("Veränderung zur Ausgangsbasis (\(basis.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))):")
+                                        Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
+                                            .font(.caption)
+                                            .fontWeight(.medium)
+                                        Spacer()
+                                    }
+                                    HStack {
+                                        Text("Gesamtwert:")
                                             .font(.caption)
                                             .foregroundColor(.secondary)
                                         Spacer()
-                                        Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
+                                        Text("\(summary.gesamtwertAktuelleEinlesung, specifier: "%.2f") €")
                                             .font(.caption)
-                                            .foregroundColor(differenz >= 0 ? .green : .red)
+                                            .fontWeight(.medium)
                                     }
-                                } else if summary.gesamtwertVoreinlesung > 0, ausgangsbasis?.importDatum == summary.importDatum {
-                                    HStack {
-                                        Text("Voreinlesung:")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Spacer()
-                                        Text("\(summary.gesamtwertVoreinlesung, specifier: "%.2f") €")
-                                            .font(.caption)
-                                    }
-                                    let differenz = summary.gesamtwertAktuelleEinlesung - summary.gesamtwertVoreinlesung
-                                    HStack {
-                                        Text("Veränderung:")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Spacer()
-                                        Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
-                                            .font(.caption)
-                                            .foregroundColor(differenz >= 0 ? .green : .red)
+                                    if let basis = ausgangsbasis, basis.importDatum != summary.importDatum, basis.gesamtwertAktuelleEinlesung > 0 {
+                                        let differenz = summary.gesamtwertAktuelleEinlesung - basis.gesamtwertAktuelleEinlesung
+                                        HStack {
+                                            Text("Veränderung zur Ausgangsbasis (\(basis.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))):")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                            Spacer()
+                                            Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
+                                                .font(.caption)
+                                                .foregroundColor(differenz >= 0 ? .green : .red)
+                                        }
+                                    } else if summary.gesamtwertVoreinlesung > 0, ausgangsbasis?.importDatum == summary.importDatum {
+                                        HStack {
+                                            Text("Voreinlesung:")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                            Spacer()
+                                            Text("\(summary.gesamtwertVoreinlesung, specifier: "%.2f") €")
+                                                .font(.caption)
+                                        }
+                                        let differenz = summary.gesamtwertAktuelleEinlesung - summary.gesamtwertVoreinlesung
+                                        HStack {
+                                            Text("Veränderung:")
+                                                .font(.caption)
+                                                .foregroundColor(.secondary)
+                                            Spacer()
+                                            Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
+                                                .font(.caption)
+                                                .foregroundColor(differenz >= 0 ? .green : .red)
+                                        }
                                     }
                                 }
+                                .padding(.vertical, 4)
+                                Button(role: .destructive) {
+                                    einlesungToDelete = summary
+                                    showDeleteEinlesungConfirmation = true
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.body)
+                                }
+                                .buttonStyle(.borderless)
                             }
-                            .padding(.vertical, 4)
                         }
-                    } header: {
-                        HStack {
-                            Text("Gesamtsummen (letzte 10 Einlesungen)")
-                            Spacer()
+                    }
+                } header: {
+                    HStack {
+                        Text("Gesamtsummen (letzte 10 Einlesungen)")
+                        Spacer()
+                        if !letzteZehn.isEmpty {
                             Button(showEinlesungenChart ? "Chart aus" : "Chart") {
                                 showEinlesungenChart.toggle()
                             }
                             .font(.caption)
                         }
-                    } footer: {
+                    }
+                } footer: {
+                    if letzteZehn.isEmpty {
+                        Text("Nach einem CSV-Import erscheinen hier die Gesamtsummen pro Einlesung.")
+                            .font(.caption2)
+                    } else {
                         Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis = ältestes Datum (bis zu 10 Einlesungen).")
                             .font(.caption2)
                     }
@@ -878,193 +1091,31 @@ struct ContentView: View {
                     .padding(.vertical, 4)
                 }
             }
-            .onChange(of: selectedTab) { _, new in
-                if new == 0 {
-                    let isin = scrollToISINWhenReturningFromKursziele ?? scrollToISIN
-                    scrollToISINWhenReturningFromKursziele = nil
-                    if let isin = isin {
-                        DispatchQueue.main.async {
-                            proxy.scrollTo(isin, anchor: .center)
-                            scrollToISIN = nil
-                        }
-                    }
+    }
+
+    var body: some View {
+        AnyView(contentView)
+    }
+
+    @ViewBuilder
+    private var contentView: some View {
+        TabView(selection: selectedTabBinding) {
+            aktienTabContent
+                .tabItem { Label("Aktien", systemImage: "list.bullet") }
+                .tag(0)
+                .task {
+                    let (usd, gbp) = await KurszielService.fetchAppWechselkurse()
+                    await MainActor.run { AppWechselkurse.shared.set(usd: usd, gbp: gbp) }
                 }
-            }
-            }
-        }
-        .navigationDestination(for: String.self) { isin in
-            if let aktie = aktien.first(where: { $0.isin == isin }) {
-                AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
-            }
-        }
-        }
-#if os(macOS)
-            .navigationSplitViewColumnWidth(min: 300, ideal: 350)
-#endif
-            .navigationTitle("Aktien")
-            .toolbar {
-#if os(iOS)
-                ToolbarItem(placement: .navigationBarTrailing) {
-                    EditButton()
-                }
-#endif
-                ToolbarItem {
-                    Button(action: { sortiereNachAbstandKursziel.toggle() }) {
-                        Label(sortiereNachAbstandKursziel ? "Sortierung: Standard" : "Nach Abstand zum Kursziel", systemImage: sortiereNachAbstandKursziel ? "list.bullet" : "chart.line.uptrend.xyaxis")
-                    }
-                }
-                ToolbarItem {
-                    Button(action: importCSVFiles) {
-                        Label("CSV importieren", systemImage: "doc.badge.plus")
-                    }
-                }
-                ToolbarItem {
-                    Button(role: .destructive, action: { showDeleteConfirmation = true }) {
-                        Label("Alles löschen", systemImage: "trash")
-                    }
-                    .disabled(aktien.isEmpty)
-                }
-                ToolbarItem {
-                    Button(action: { showSettings = true }) {
-                        Label("Einstellungen", systemImage: "gear")
-                    }
-                }
-                ToolbarItem {
-                    Button(action: {
-                        #if os(iOS)
-                        if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
-                            let kandidaten = KurszielService.slugKandidaten(from: clipboard)
-                            let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
-                            if !slug.isEmpty {
-                                testWKN = "https://www.finanzen.net/kursziele/\(slug)"
-                            }
-                        }
-                        #elseif os(macOS)
-                        if let clipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
-                            let kandidaten = KurszielService.slugKandidaten(from: clipboard)
-                            let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
-                            if !slug.isEmpty {
-                                testWKN = "https://www.finanzen.net/kursziele/\(slug)"
-                            }
-                        }
-                        #endif
-                        if testWKN.isEmpty {
-                            testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
-                        }
-                        showWKNTester = true
-                    }) {
-                        Label("WKN testen", systemImage: "magnifyingglass")
-                    }
-                }
-                ToolbarItem {
-                    Button(action: { showDebugLog = true }) {
-                        Label("Debug-Log", systemImage: "ladybug")
-                    }
-                }
-            }
-            .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
-                Button("Löschen und Kursziele merken", role: .destructive) {
-                    saveManualKurszieleAndDeleteAll()
-                }
-                Button("Löschen (Kursziele nicht merken)", role: .destructive) {
-                    UserDefaults.standard.removeObject(forKey: savedManualKurszieleUserDefaultsKey)
-                    deleteAllAktien()
-                }
-                Button("Abbrechen", role: .cancel) { }
-            } message: {
-                let n = aktien.filter { $0.kurszielManuellGeaendert }.count
-                if n > 0 {
-                    Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht. \(n) manuelle Kursziele können gemerkt und nach dem nächsten Einlesen (über ISIN/WKN) wieder zugeordnet werden.")
-                } else {
-                    Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht.")
-                }
-            }
-            .fileImporter(
-                isPresented: $isImporting,
-                allowedContentTypes: [.commaSeparatedText, .text],
-                allowsMultipleSelection: true
-            ) { result in
-                handleFileImport(result: result)
-            }
-            .alert("Import", isPresented: $showImportMessage) {
-                Button("OK", role: .cancel) {
-                    showImportMessage = false
-                    if pendingKurszielFetchAfterImport {
-                        pendingKurszielFetchAfterImport = false
-                        startPendingKurszielFetch()
-                    } else if showKurszielAbfrageBeiAltemDatum {
-                        showKurszielAbfrageBeiAltemDatum = false
-                        showKurszielAbfrageAlert = true
-                    }
-                }
-            } message: {
-                Text(importMessage)
-            }
-            .alert("Kursziele ermitteln?", isPresented: $showKurszielAbfrageAlert) {
-                Button("Ja") {
-                    showKurszielAbfrageAlert = false
-                    startPendingKurszielFetch()
-                }
-                Button("Nein", role: .cancel) {
-                    showKurszielAbfrageAlert = false
-                }
-            } message: {
-                Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)")
-            }
-            .sheet(isPresented: $showSettings) {
-                SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
-            }
-            .sheet(isPresented: $showWKNTester) {
-                WKNTesterView(
-                    wkn: $testWKN,
-                    result: $testKurszielResult,
-                    isTesting: $isTestingWKN,
-                    urlFromSettings: fmpAPIKeyStore,
-                    openAIFromSettings: openAIAPIKeyStore
-                )
-                .onAppear {
-                    if testWKN.isEmpty, !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty {
-                        testWKN = fmpAPIKeyStore.trimmingCharacters(in: .whitespaces)
-                    } else if testWKN.isEmpty {
-                        testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
-                    }
-                }
-            }
-            .sheet(isPresented: $showDebugLog) {
-                DebugLogSheet()
-            }
-        } detail: {
-            Text("Aktie auswählen")
-        }
-            .tabItem {
-                Label("Aktien", systemImage: "list.bullet")
-            }
-            .tag(0)
-            .task {
-                let (usd, gbp) = await KurszielService.fetchAppWechselkurse()
-                await MainActor.run {
-                    AppWechselkurse.shared.set(usd: usd, gbp: gbp)
-                }
-            }
 
             NavigationStack {
-                KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: currentDetailISIN, onCopyISIN: { isin in
-                    scrollToISIN = isin
-                }, onRowEdited: { isin in
-                    scrollToISINWhenReturningFromKursziele = isin
-                }, onKurszielSuchenTapped: { isin in
-                    currentDetailISIN = isin
-                })
+                KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: currentDetailISIN, onCopyISIN: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailISIN = $0 })
             }
-            .tabItem {
-                Label("Kursziele", systemImage: "target")
-            }
+            .tabItem { Label("Kursziele", systemImage: "target") }
             .tag(1)
             .onChange(of: selectedTab) { _, new in
                 if new == 1 {
-                    let target = currentDetailISIN
-                        ?? gruppierteAktien.flatMap(\.aktien).first(where: { visibleISINsOnAktienList.contains($0.isin) })?.isin
-                    scrollToISINOnKurszieleTab = target
+                    scrollToISINOnKurszieleTab = currentDetailISIN ?? gruppierteAktien.flatMap(\.aktien).first(where: { visibleISINsOnAktienList.contains($0.isin) })?.isin
                 }
             }
         }
@@ -1078,50 +1129,47 @@ struct ContentView: View {
             }
         }
         #endif
-        .overlay {
-            if isImportingKursziele || isImportingKurszieleOpenAI {
-                VStack {
-                    Spacer()
-                    VStack(spacing: 8) {
-                        HStack {
-                            ProgressView()
-                            Text(isImportingKurszieleOpenAI ? "Kursziele werden via OpenAI abgerufen…" : "Kursziele werden abgerufen…")
-                                .font(.caption)
-                        }
-                        if let aktie = aktuelleKurszielAktie {
-                            Text("\(aktie.bezeichnung)")
-                                .font(.caption)
-                                .fontWeight(.medium)
-                            if !aktie.wkn.isEmpty {
-                                Text("WKN: \(aktie.wkn)")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            }
-                        }
-                    }
-                    .padding()
-                    .background(.ultraThinMaterial)
-                    .cornerRadius(10)
-                    .padding(.bottom, 40)
-                }
-                .allowsHitTesting(false)
-            }
-        }
+        .overlay { importingOverlay }
         .confirmationDialog(unrealistischConfirm.dialogTitle.isEmpty ? "OpenAI-Ersatz übernehmen?" : unrealistischConfirm.dialogTitle, isPresented: $unrealistischConfirm.isPresented) {
-            Button("Ja, übernehmen") {
-                unrealistischConfirm.choose(true)
-            }
-            Button("Nein, nicht übernehmen") {
-                unrealistischConfirm.choose(false)
-            }
-            Button("Abbrechen", role: .cancel) {
-                unrealistischConfirm.choose(false)
-            }
+            Button("Ja, übernehmen") { unrealistischConfirm.choose(true) }
+            Button("Nein, nicht übernehmen") { unrealistischConfirm.choose(false) }
+            Button("Abbrechen", role: .cancel) { unrealistischConfirm.choose(false) }
         } message: {
             if let orig = unrealistischConfirm.original, let repl = unrealistischConfirm.replacement {
                 let name = unrealistischConfirm.aktienBezeichnung.isEmpty ? "Aktie" : unrealistischConfirm.aktienBezeichnung
                 Text("\(name): Original \(String(format: "%.2f", orig.kursziel)) \(orig.waehrung ?? "EUR"). OpenAI-Ersatz: \(String(format: "%.2f", repl.kursziel)) \(repl.waehrung ?? "EUR"). Übernehmen?")
             }
+        }
+    }
+
+    @ViewBuilder
+    private var importingOverlay: some View {
+        if isImportingKursziele || isImportingKurszieleOpenAI {
+            VStack {
+                Spacer()
+                VStack(spacing: 8) {
+                    HStack {
+                        ProgressView()
+                        Text(isImportingKurszieleOpenAI ? "Kursziele werden via OpenAI abgerufen…" : "Kursziele werden abgerufen…")
+                            .font(.caption)
+                    }
+                    if let aktie = aktuelleKurszielAktie {
+                        Text(aktie.bezeichnung)
+                            .font(.caption)
+                            .fontWeight(.medium)
+                        if !aktie.wkn.isEmpty {
+                            Text("WKN: \(aktie.wkn)")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                .padding()
+                .background(.ultraThinMaterial)
+                .cornerRadius(10)
+                .padding(.bottom, 40)
+            }
+            .allowsHitTesting(false)
         }
     }
 
@@ -1208,7 +1256,8 @@ struct ContentView: View {
                 csvHadKursziele = csvHadKursziele || hadKursziele
                 zeilenVerarbeitet += zeilenImportiert
                 if zeilenGesamt > zeilenImportiert {
-                    parseHinweise.append("\(url.lastPathComponent): \(zeilenGesamt) Zeilen, \(zeilenImportiert) importiert (\(zeilenGesamt - zeilenImportiert) übersprungen)")
+                    let u = zeilenGesamt - zeilenImportiert
+                    parseHinweise.append("\(url.lastPathComponent): \(zeilenGesamt) Zeilen in Datei, \(zeilenImportiert) als Positionen importiert. \(u) Zeile(n) konnten nicht zugeordnet werden (z. B. anderes Format oder fehlende Pflichtfelder).")
                 }
                 for neueAktie in neueAktien {
                     modelContext.insert(neueAktie)
@@ -1544,6 +1593,25 @@ struct ContentView: View {
                 for s in allSnaps { modelContext.delete(s) }
             }
             try? modelContext.save()
+        }
+    }
+    
+    /// Eine Einlesung (ein Tag) löschen: zugehörige Aktien, Snapshots und ImportSummary entfernen
+    private func deleteEinlesung(_ summary: ImportSummary) {
+        let dateToRemove = summary.datumAktuelleEinlesung
+        withAnimation {
+            do {
+                let aktieDescriptor = FetchDescriptor<Aktie>(predicate: #Predicate<Aktie> { $0.importDatum == dateToRemove })
+                let aktienToDelete = try modelContext.fetch(aktieDescriptor)
+                for a in aktienToDelete { modelContext.delete(a) }
+                let snapDescriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove })
+                let snapsToDelete = try modelContext.fetch(snapDescriptor)
+                for s in snapsToDelete { modelContext.delete(s) }
+                modelContext.delete(summary)
+                try modelContext.save()
+            } catch {
+                // Fehler beim Speichern ignorieren oder anzeigen
+            }
         }
     }
     
@@ -2925,6 +2993,189 @@ private struct SnippetTestSheetView: View {
     }
 }
 
+private let defaultRechtlichesText = """
+Programm-technische Beschreibung
+
+Diese App dient der Verwaltung von Wertpapierpositionen (Aktien, Fonds, ETFs) und der Ermittlung von Kurszielen.
+
+Funktionen: CSV-Import von Portfolio-Daten; Abgleich nach Bankleistungsnummer und WKN/ISIN; Ermittlung von Kurszielen über verschiedene Quellen (finanzen.net, Financial Modeling Prep, OpenAI, Yahoo, Suchmaschinen-Snippet); Anzeige von Verlauf und Kennzahlen; Speicherung lokal (SwiftData).
+
+Datenquellen: Kursziele werden je nach Konfiguration von Drittanbietern abgerufen. Es wird keine Gewähr für Richtigkeit oder Verfügbarkeit übernommen. Nutzung auf eigenes Risiko.
+
+Rechtliches: Keine Haftung für Schäden aus der Nutzung. Alle Angaben ohne Gewähr.
+"""
+
+struct RechtlichesSheetView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("RechtlichesText") private var rechtlichesText = ""
+    @AppStorage("Entwicklermodus") private var entwicklermodus = false
+    @State private var editableText = ""
+    @State private var hasLoaded = false
+    
+    private var displayText: String {
+        rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
+    }
+    
+    @ViewBuilder
+    private var rechtlichesLinks: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Link(destination: URL(string: "https://kisoft4you.com/impressum")!) {
+                HStack {
+                    Label("Impressum", systemImage: "doc.text.fill")
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption)
+                }
+            }
+            Link(destination: URL(string: "https://kisoft4you.com/datenschutzerklaerung")!) {
+                HStack {
+                    Label("Datenschutz", systemImage: "lock.shield.fill")
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption)
+                }
+            }
+            Link(destination: URL(string: "https://kisoft4you.com/agb")!) {
+                HStack {
+                    Label("AGB", systemImage: "list.clipboard.fill")
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption)
+                }
+            }
+        }
+        .padding(.horizontal)
+        .padding(.vertical, 12)
+    }
+    
+    var body: some View {
+        NavigationStack {
+            Group {
+                if entwicklermodus {
+                    VStack(spacing: 0) {
+                        TextEditor(text: $editableText)
+                            .font(.body)
+                            .padding(.horizontal, 4)
+                            .onAppear {
+                                if !hasLoaded {
+                                    editableText = rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
+                                    hasLoaded = true
+                                }
+                            }
+                        rechtlichesLinks
+                    }
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 20) {
+                            Text(displayText)
+                                .font(.body)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                            rechtlichesLinks
+                        }
+                        .padding()
+                    }
+                }
+            }
+            .navigationTitle("Rechtliches")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Schließen") {
+                        dismiss()
+                    }
+                }
+                if entwicklermodus {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Speichern") {
+                            rechtlichesText = editableText
+                            dismiss()
+                        }
+                    }
+                }
+            }
+        }
+        .onAppear {
+            if entwicklermodus && !hasLoaded {
+                editableText = rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
+                hasLoaded = true
+            }
+        }
+    }
+}
+
+struct CSVSpaltenZuordnungView: View {
+    @State private var mapping: [String: String] = loadCSVColumnMapping()
+    @Environment(\.dismiss) private var dismiss
+    
+    private func binding(for id: String) -> Binding<String> {
+        Binding(
+            get: { mapping[id] ?? "" },
+            set: { newValue in
+                var m = mapping
+                if newValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                    m.removeValue(forKey: id)
+                } else {
+                    m[id] = newValue.trimmingCharacters(in: .whitespaces)
+                }
+                mapping = m
+            }
+        )
+    }
+    
+    var body: some View {
+        Form {
+            Section {
+                Text("Tragen Sie rechts den exakten Spaltennamen aus Ihrer CSV-Datei ein (so wie in der ersten Zeile Ihrer Datei). Links steht die Bedeutung in der App. Nach „Speichern“ wird beim CSV-Import diese Zuordnung verwendet.")
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            } header: {
+                Text("Anleitung")
+            }
+            Section {
+                ForEach(csvSpaltenFields) { field in
+                    HStack(alignment: .top, spacing: 12) {
+                        Text(field.label)
+                            .font(.subheadline)
+                            .foregroundColor(field.optional ? .secondary : .primary)
+                        Spacer(minLength: 8)
+                        TextField("Spaltenname in Ihrer CSV", text: binding(for: field.id))
+                            .font(.subheadline)
+                            .multilineTextAlignment(.trailing)
+                            .autocapitalization(.none)
+                            .disableAutocorrection(true)
+                    }
+                }
+            } header: {
+                Text("Feld in der App")
+            } footer: {
+                Text("Basis: Ohne Zuordnung (oder nach „Zurücksetzen“) verwendet die App wie bisher das normale Layout (Deutsche Bank / maxblue). Mindestens Bankleistungsnummer, Bestand, Bezeichnung und WKN sollten Sie zuordnen, sobald Sie eine andere Bank nutzen.")
+            }
+            Section {
+                Button("Zurücksetzen (Standard Deutsche Bank / maxblue)") {
+                    mapping = [:]
+                }
+                .foregroundColor(.orange)
+            }
+        }
+        .navigationTitle("CSV-Spalten zuordnen")
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .confirmationAction) {
+                Button("Speichern") {
+                    saveCSVColumnMapping(mapping)
+                    dismiss()
+                }
+            }
+        }
+        .onAppear {
+            if mapping.isEmpty {
+                mapping = loadCSVColumnMapping()
+            }
+        }
+    }
+}
+
 struct DebugLogSheet: View {
     @Environment(\.dismiss) private var dismiss
     @State private var logEntries: [String] = []
@@ -3308,6 +3559,7 @@ struct SettingsView: View {
     @Binding var openAIAPIKey: String
     @Binding var fmpAPIKey: String
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
+    @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @Environment(\.dismiss) private var dismiss
     @State private var showFilePicker = false
     @State private var keyImportMessage: String? = nil
@@ -3349,11 +3601,29 @@ struct SettingsView: View {
                 }
                 
                 Section {
+                    NavigationLink("Spalten anderer Banken zuordnen") {
+                        CSVSpaltenZuordnungView()
+                    }
+                } header: {
+                    Text("CSV-Import")
+                } footer: {
+                    Text("Basis: Wenn nichts eingetragen bzw. keine Zuordnung gespeichert ist, bleibt das normale CSV-Layout wie bisher (Deutsche Bank / maxblue). Nur wenn Sie hier eine Zuordnung anlegen und speichern, wird diese beim Import verwendet.")
+                }
+                
+                Section {
                     Toggle("Alle Kursziele überschreiben", isOn: $forceOverwriteAllKursziele)
                 } header: {
                     Text("Kursziel-Überschreiben")
                 } footer: {
                     Text("Wenn an: Beim nächsten Abruf (z. B. nach CSV-Import oder „Kursziele OpenAI“) werden alle Kursziele neu ermittelt und überschrieben – auch aus CSV oder manuell gesetzte. Wenn aus: Kursziele aus CSV und manuell geänderte werden nicht überschrieben.")
+                }
+                
+                Section {
+                    Toggle("Entwicklermodus", isOn: $entwicklermodus)
+                } header: {
+                    Text("Entwickler")
+                } footer: {
+                    Text("Wenn an: Der Text unter „Rechtliches“ kann in der App bearbeitet und gespeichert werden.")
                 }
                 
                 Section {

@@ -9,6 +9,20 @@ import Foundation
 
 class CSVParser {
     
+    private static let csvColumnMappingUserDefaultsKey = "CSVColumnMapping"
+    
+    /// Liefert die benutzerdefinierte Spaltenzuordnung (Feld-ID → CSV-Header). Wenn nicht vorhanden oder zu wenige Pflichtfelder, nil.
+    private static func loadCustomColumnMapping() -> [String: String]? {
+        guard let data = UserDefaults.standard.data(forKey: csvColumnMappingUserDefaultsKey),
+              let decoded = try? JSONDecoder().decode([String: String].self, from: data) else { return nil }
+        let required = ["bankleistungsnummer", "bestand", "bezeichnung", "wkn"]
+        let hasRequired = required.allSatisfy { key in
+            guard let h = decoded[key] else { return false }
+            return !h.trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        return hasRequired ? decoded : nil
+    }
+    
     // Deutsche Zahlenformate: Komma als Dezimaltrennzeichen
     private static let germanNumberFormatter: NumberFormatter = {
         let formatter = NumberFormatter()
@@ -47,11 +61,16 @@ class CSVParser {
         let dataLines = lines.count > 1 ? Array(lines.dropFirst()) : []
         let delimiter = detectDelimiter(firstLine: lines.first ?? "")
         let headerMap = buildHeaderMap(firstLine: lines.first ?? "", delimiter: delimiter)
+        let customMapping = loadCustomColumnMapping()
         var aktien: [Aktie] = []
         for line in dataLines {
-            if let aktie = parseLine(line, delimiter: delimiter, headerMap: headerMap) {
-                aktien.append(aktie)
+            let aktie: Aktie?
+            if let map = customMapping {
+                aktie = parseLineWithMapping(line, delimiter: delimiter, headerMap: headerMap, columnMapping: map)
+            } else {
+                aktie = parseLine(line, delimiter: delimiter, headerMap: headerMap)
             }
+            if let a = aktie { aktien.append(a) }
         }
         let hadKursziele = aktien.contains { $0.kursziel != nil }
         return (aktien, dataLines.count, aktien.count, hadKursziele)
@@ -120,12 +139,96 @@ class CSVParser {
         let dataLines = Array(lines.dropFirst())
         let delimiter = detectDelimiter(firstLine: lines.first ?? "")
         let headerMap = buildHeaderMap(firstLine: lines.first ?? "", delimiter: delimiter)
+        let customMapping = loadCustomColumnMapping()
         for line in dataLines {
-            if let aktie = parseLine(line, delimiter: delimiter, headerMap: headerMap) {
-                aktien.append(aktie)
+            let aktie: Aktie?
+            if let map = customMapping {
+                aktie = parseLineWithMapping(line, delimiter: delimiter, headerMap: headerMap, columnMapping: map)
+            } else {
+                aktie = parseLine(line, delimiter: delimiter, headerMap: headerMap)
+            }
+            if let a = aktie {
+                aktien.append(a)
             }
         }
         return aktien
+    }
+    
+    /// Kennwörter für Summen-/Kopfzeilen: Zeilen, deren Bezeichnung nur daraus besteht, werden nicht importiert (weder bei Custom-Mapping noch bei festem Layout).
+    private static let summenKopfStichwoerter: [String] = [
+        "zwischensumme", "summe", "gesamtsumme", "gesamt", "bezeichnung", "wertpapierbezeichnung",
+        "depotübersicht", "depotuebersicht", "positionen", "subtotal", "total", "gross total"
+    ]
+    
+    /// Parst eine Zeile nur über die benutzerdefinierte Spaltenzuordnung (CSV-Header → App-Feld).
+    private static func parseLineWithMapping(_ line: String, delimiter: Character, headerMap: [String: Int], columnMapping: [String: String]) -> Aktie? {
+        let columns = splitCSVLine(line, delimiter: delimiter)
+        func valueFor(_ fieldId: String) -> String? {
+            guard let csvHeader = columnMapping[fieldId], !csvHeader.trimmingCharacters(in: .whitespaces).isEmpty,
+                  let idx = headerMap[csvHeader.trimmingCharacters(in: .whitespaces).lowercased()], idx < columns.count else { return nil }
+            let s = columns[idx].trimmingCharacters(in: .whitespaces)
+            return s.isEmpty ? nil : s
+        }
+        guard let bankleistungsnummer = valueFor("bankleistungsnummer"), !bankleistungsnummer.isEmpty,
+              let bezeichnung = valueFor("bezeichnung"), !bezeichnung.isEmpty,
+              let wkn = valueFor("wkn") else { return nil }
+        // Summen- und Kopfzeilen nicht als Position importieren (z. B. „Zwischensumme“, wiederholte Kopfzeile)
+        let bezeichnungNorm = bezeichnung.lowercased().trimmingCharacters(in: .whitespaces)
+        if summenKopfStichwoerter.contains(bezeichnungNorm) { return nil }
+        if bezeichnungNorm.hasPrefix("zwischensumme") || bezeichnungNorm.hasPrefix("summe ") || bezeichnungNorm.hasPrefix("gesamtsumme") { return nil }
+        let bestandVal = valueFor("bestand").flatMap { parseDouble($0) } ?? 0.0
+        guard bestandVal >= 0 else { return nil }
+        let bestand = bestandVal
+        let isin = valueFor("isin") ?? ""
+        let waehrung = (valueFor("waehrung") ?? "").isEmpty ? "EUR" : (valueFor("waehrung") ?? "EUR")
+        let hinweisEinstandskurs = valueFor("hinweisEinstandskurs") ?? ""
+        let einstandskurs = valueFor("einstandskurs").flatMap { parseDouble($0) }
+        let deviseneinstandskurs = valueFor("deviseneinstandskurs").flatMap { parseDouble($0) }
+        let kurs = valueFor("kurs").flatMap { parseDouble($0) }
+        let devisenkurs = valueFor("devisenkurs").flatMap { parseDouble($0) }
+        let gewinnVerlustEUR = valueFor("gewinnVerlustEUR").flatMap { parseDouble($0) }
+        let gewinnVerlustProzent = valueFor("gewinnVerlustProzent").flatMap { parseDouble($0) }
+        let marktwertEUR = valueFor("marktwertEUR").flatMap { parseDouble($0) }
+        let stueckzinsenEUR = valueFor("stueckzinsenEUR").flatMap { parseDouble($0) }
+        let anteilProzent = valueFor("anteilProzent").flatMap { parseDouble($0) }
+        let datumLetzteBewegung = valueFor("datumLetzteBewegung").flatMap { parseDate($0) }
+        let gattung = (valueFor("gattung") ?? "").isEmpty ? "Aktie" : (valueFor("gattung") ?? "Aktie")
+        let branche = (valueFor("branche") ?? "").isEmpty ? "-" : (valueFor("branche") ?? "-")
+        let risikoklasse = (valueFor("risikoklasse") ?? "").isEmpty ? "-" : (valueFor("risikoklasse") ?? "-")
+        let depotPortfolioName = valueFor("depotPortfolioName") ?? ""
+        var kursziel: Double? = valueFor("kursziel").flatMap { parseDouble($0) }.flatMap { $0 > 0 ? $0 : nil }
+        if kursziel == nil, let kzStr = valueFor("kursziel"), let k = parseDouble(kzStr), k > 0 { kursziel = k }
+        var kurszielQuelle: String? = nil
+        if kursziel != nil {
+            kurszielQuelle = mapKurszielQuelle(valueFor("kursziel_quelle"))
+            if kurszielQuelle == nil { kurszielQuelle = "C" }
+        }
+        return Aktie(
+            bankleistungsnummer: bankleistungsnummer,
+            bestand: bestand,
+            bezeichnung: bezeichnung,
+            wkn: wkn,
+            isin: isin,
+            waehrung: waehrung,
+            hinweisEinstandskurs: hinweisEinstandskurs,
+            einstandskurs: einstandskurs,
+            deviseneinstandskurs: deviseneinstandskurs,
+            kurs: kurs,
+            devisenkurs: devisenkurs,
+            gewinnVerlustEUR: gewinnVerlustEUR,
+            gewinnVerlustProzent: gewinnVerlustProzent,
+            marktwertEUR: marktwertEUR,
+            stueckzinsenEUR: stueckzinsenEUR,
+            anteilProzent: anteilProzent,
+            datumLetzteBewegung: datumLetzteBewegung,
+            gattung: gattung,
+            branche: branche,
+            risikoklasse: risikoklasse,
+            depotPortfolioName: depotPortfolioName,
+            kursziel: kursziel,
+            kurszielQuelle: kurszielQuelle,
+            kurszielWaehrung: kursziel != nil ? "EUR" : nil
+        )
     }
     
     /// Parst eine einzelne CSV-Zeile mit dem angegebenen Trennzeichen.
@@ -147,6 +250,8 @@ class CSVParser {
         let bankleistungsnummer = col(0)
         let bestand = parseDouble(col(1)) ?? 0.0
         let bezeichnung = col(2)
+        let bezeichnungNorm = bezeichnung.lowercased().trimmingCharacters(in: .whitespaces)
+        if !bezeichnungNorm.isEmpty && (summenKopfStichwoerter.contains(bezeichnungNorm) || bezeichnungNorm.hasPrefix("zwischensumme") || bezeichnungNorm.hasPrefix("summe ") || bezeichnungNorm.hasPrefix("gesamtsumme")) { return nil }
         let wkn = col(3)
         let isin = colByName("isin") ?? col(4)
         let waehrung = col(5).isEmpty ? "EUR" : col(5)
