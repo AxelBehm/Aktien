@@ -175,7 +175,17 @@ class CSVParser {
         "depotübersicht", "depotuebersicht", "positionen", "subtotal", "total", "gross total"
     ]
     
-    /// Parst eine Zeile nur über die benutzerdefinierte Spaltenzuordnung (CSV-Header → App-Feld).
+    /// Sucht in headerMap nach einem der angegebenen Header-Namen (lowercased) und liefert den ersten nicht-leeren Zellwert aus columns.
+    private static func valueForFirstMatchingHeader(columns: [String], headerMap: [String: Int], names: [String]) -> String {
+        for name in names {
+            guard let idx = headerMap[name], idx < columns.count else { continue }
+            let s = columns[idx].trimmingCharacters(in: .whitespaces)
+            if !s.isEmpty { return s }
+        }
+        return ""
+    }
+    
+    /// Parst eine Zeile nur über die benutzerdefinierte Spaltenzuordnung (CSV-Header → App-Feld). Spaltenreihenfolge ist beliebig – Zuordnung erfolgt rein über die Spaltennamen in der Kopfzeile.
     private static func parseLineWithMapping(_ line: String, delimiter: Character, headerMap: [String: Int], columnMapping: [String: String]) -> Aktie? {
         let columns = splitCSVLine(line, delimiter: delimiter)
         func valueFor(_ fieldId: String) -> String? {
@@ -210,7 +220,21 @@ class CSVParser {
         let gattung = (valueFor("gattung") ?? "").isEmpty ? "Aktie" : (valueFor("gattung") ?? "Aktie")
         let branche = (valueFor("branche") ?? "").isEmpty ? "-" : (valueFor("branche") ?? "-")
         let risikoklasse = (valueFor("risikoklasse") ?? "").isEmpty ? "-" : (valueFor("risikoklasse") ?? "-")
-        let depotPortfolioName = valueFor("depotPortfolioName") ?? ""
+        var depotPortfolioName = valueFor("depotPortfolioName") ?? ""
+        // Fallback: Konto/Depot-Spalte auch über typische CSV-Header finden (z. B. „Konto“, „Neues Konto“, „Depot“)
+        if depotPortfolioName.isEmpty {
+            depotPortfolioName = valueForFirstMatchingHeader(columns: columns, headerMap: headerMap, names: ["konto", "neues konto", "depot", "depotname", "kontonummer", "depotnummer", "portfolio", "kontobezeichnung", "depotbezeichnung"])
+            // Zusätzlich: Jeden Header prüfen, der „konto“, „depot“ oder „portfolio“ enthält
+            if depotPortfolioName.isEmpty {
+                for (headerName, headerIdx) in headerMap {
+                    let lower = headerName.lowercased()
+                    if (lower.contains("konto") || lower.contains("depot") || lower.contains("portfolio")), headerIdx < columns.count {
+                        let s = columns[headerIdx].trimmingCharacters(in: .whitespaces)
+                        if !s.isEmpty { depotPortfolioName = s; break }
+                    }
+                }
+            }
+        }
         var kursziel: Double? = valueFor("kursziel").flatMap { parseDouble($0) }.flatMap { $0 > 0 ? $0 : nil }
         if kursziel == nil, let kzStr = valueFor("kursziel"), let k = parseDouble(kzStr), k > 0 { kursziel = k }
         var kurszielQuelle: String? = nil

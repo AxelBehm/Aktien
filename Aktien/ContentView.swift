@@ -98,7 +98,7 @@ private let csvSpaltenFields: [CSVSpaltenField] = [
     CSVSpaltenField(id: "gattung", label: "Gattung"),
     CSVSpaltenField(id: "branche", label: "Branche"),
     CSVSpaltenField(id: "risikoklasse", label: "Risikoklasse"),
-    CSVSpaltenField(id: "depotPortfolioName", label: "Depot-/Portfolio-Name"),
+    CSVSpaltenField(id: "depotPortfolioName", label: "Depot-/Portfolio-Name (z. B. Konto, Neues Konto)"),
     CSVSpaltenField(id: "kursziel", label: "Kursziel (optional)"),
     CSVSpaltenField(id: "kursziel_quelle", label: "Kursziel Quelle (optional)"),
 ]
@@ -345,6 +345,100 @@ private struct EinlesungenChartView: View {
     }
 }
 
+/// Statistik-Fenster: Einlesestatistik (letzte 10) + Plattform-Zugriffe (FMP, Finanzen.net, Yahoo, OpenAI)
+private struct StatistikSheetView: View {
+    var summaries: [ImportSummary]
+    @Binding var showEinlesungenChart: Bool
+    var onDeleteEinlesung: (ImportSummary) -> Void
+    @Environment(\.dismiss) private var dismiss
+    
+    private var letzteZehn: [ImportSummary] {
+        Array(summaries.prefix(10)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
+    }
+    
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Plattform-Zugriffe (pro Kursziel-Durchlauf)") {
+                    LabeledContent("FMP", value: "\(KurszielService.zugriffeFMP)")
+                    LabeledContent("finanzen.net", value: "\(KurszielService.zugriffeFinanzenNet)")
+                    LabeledContent("Yahoo", value: "\(KurszielService.zugriffeYahoo)")
+                    LabeledContent("OpenAI", value: "\(KurszielService.zugriffeOpenAI)")
+                }
+                Section {
+                    if letzteZehn.isEmpty {
+                        Text("Keine Einlesungen. Nach CSV-Import erscheinen hier die Gesamtsummen (bis zu 10).")
+                            .font(.subheadline)
+                            .foregroundColor(.secondary)
+                    } else {
+                        if showEinlesungenChart {
+                            EinlesungenChartView(summaries: letzteZehn)
+                                .frame(height: 160)
+                                .listRowBackground(Color.clear)
+                                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                        }
+                        let ausgangsbasis = letzteZehn.first
+                        ForEach(Array(letzteZehn.enumerated()), id: \.element.importDatum) { _, summary in
+                            HStack(alignment: .top, spacing: 8) {
+                                VStack(alignment: .leading, spacing: 6) {
+                                    Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
+                                        .font(.caption)
+                                        .fontWeight(.medium)
+                                    HStack {
+                                        Text("Gesamtwert:")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                        Spacer()
+                                        Text("\(summary.gesamtwertAktuelleEinlesung, specifier: "%.2f") €")
+                                            .font(.caption)
+                                            .fontWeight(.medium)
+                                    }
+                                    if let basis = ausgangsbasis, basis.importDatum != summary.importDatum, basis.gesamtwertAktuelleEinlesung > 0 {
+                                        let differenz = summary.gesamtwertAktuelleEinlesung - basis.gesamtwertAktuelleEinlesung
+                                        HStack {
+                                            Text("Veränderung zur Ausgangsbasis")
+                                                .font(.caption2)
+                                                .foregroundColor(.secondary)
+                                            Spacer()
+                                            Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
+                                                .font(.caption2)
+                                                .foregroundColor(differenz >= 0 ? .green : .red)
+                                        }
+                                    }
+                                }
+                                .padding(.vertical, 4)
+                                Button(role: .destructive) {
+                                    onDeleteEinlesung(summary)
+                                    dismiss()
+                                } label: {
+                                    Image(systemName: "trash")
+                                        .font(.body)
+                                }
+                                .buttonStyle(.borderless)
+                            }
+                        }
+                    }
+                } header: {
+                    Text("Einlesestatistik (letzte 10)")
+                } footer: {
+                    if !letzteZehn.isEmpty {
+                        Button(showEinlesungenChart ? "Chart aus" : "Chart") {
+                            showEinlesungenChart.toggle()
+                        }
+                        .font(.caption)
+                    }
+                }
+            }
+            .navigationTitle("Statistik")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Schließen") { dismiss() }
+                }
+            }
+        }
+    }
+}
+
 /// Mini-Chart pro Position: Kurs (blau) und Kursziel (grün) über die Einlesungen – pro Datum zwei Balken nebeneinander, alle Balken auf einer Grundlinie; einheitliche Höhe unter den Balken.
 /// currentKursziel: Wenn ein Snapshot kein Kursziel hat, wird dieses angezeigt (grüner Balken für jedes Datum).
 /// Mit zwei Fingern (Pinch) vergrößern/verkleinern; scaleBinding gibt die aktuelle Skalierung an (z. B. für Section-Höhe).
@@ -514,6 +608,8 @@ struct ContentView: View {
     /// Daten liegen vor dem Tagesdatum → nach OK Abfrage anzeigen, ob Kursziele ermittelt werden sollen (zeitaufwendig).
     @State private var showKurszielAbfrageBeiAltemDatum = false
     @State private var showKurszielAbfrageAlert = false
+    /// Beim Anzeigen von „Kursziele ermitteln?“: Zusatzhinweis, wenn CSV bereits Kursziele enthielt
+    @State private var lastImportHadCSVKursziele = false
     @State private var unrealistischConfirm = UnrealistischConfirmHelper.shared
     
     /// Filter nach Kursziel-Quelle: Aus = alle, sonst nur die gewählte Quelle
@@ -537,10 +633,20 @@ struct ContentView: View {
     @State private var sortiereNachAbstandKursziel = false
     /// true = Chart über den 5 Einlesungen (Gesamtwert pro Datum) anzeigen
     @State private var showEinlesungenChart = false
+    @State private var showStatistik = false
     /// Pfad für Aktien-Detail (nur unser Chevron, kein System-Chevron)
     @State private var aktienDetailPath: [String] = []
     /// Beim Start kurz Splash anzeigen statt weißen Bildschirm
     @State private var showSplash = true
+    /// Auf iPad/Mac: Auswahl für mittlere Spalte im 3-Spalten-Layout (Aktie | Detail | Kursziele)
+    @State private var selectedAktieISINForThreeColumn: String? = nil
+    /// Linke Spalte (Aktienliste) auf iPad/Mac immer sichtbar
+    @State private var threeColumnVisibility: NavigationSplitViewVisibility = .all
+    @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    
+    /// iPad (regular) / Mac: 3-Spalten-Layout; iPhone / schmale iPad: Tabs
+    private var useThreeColumnLayout: Bool { horizontalSizeClass == .regular }
     
     /// Gefilterte Aktien nach gewählter Kursziel-Quelle, optional nur unrealistische
     private var aktienZurAnzeige: [Aktie] {
@@ -736,7 +842,9 @@ struct ContentView: View {
                 }
             }
             #if os(macOS)
-            .navigationSplitViewColumnWidth(min: 300, ideal: 350)
+            .navigationSplitViewColumnWidth(min: 360, ideal: 480, max: 680)
+            #elseif os(iOS)
+            .navigationSplitViewColumnWidth(min: 320, ideal: 420)
             #endif
             .navigationTitle("Aktien")
             .toolbar { aktienToolbarContent }
@@ -783,7 +891,11 @@ struct ContentView: View {
                 Button("Ja") { showKurszielAbfrageAlert = false; startPendingKurszielFetch() }
                 Button("Nein", role: .cancel) { showKurszielAbfrageAlert = false }
             } message: {
-                Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)")
+                if lastImportHadCSVKursziele {
+                    Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)\n\nEs sind bereits Kursziele über die Datei mit eingelesen worden.")
+                } else {
+                    Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)")
+                }
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
@@ -801,9 +913,136 @@ struct ContentView: View {
             .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
             .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
             .sheet(isPresented: $showWatchlist) { WatchlistView() }
+            .sheet(isPresented: $showStatistik) {
+                StatistikSheetView(summaries: importSummaries, showEinlesungenChart: $showEinlesungenChart, onDeleteEinlesung: { summary in
+                    einlesungToDelete = summary
+                    showDeleteEinlesungConfirmation = true
+                    showStatistik = false
+                })
+            }
         } detail: {
             Text("Aktie auswählen")
         }
+    }
+    
+    /// iPad (regular) und Mac: 3 Spalten nebeneinander – Aktien | Detail | Kursziele
+    @ViewBuilder
+    private var threeColumnLayout: some View {
+        NavigationSplitView(columnVisibility: $threeColumnVisibility, preferredCompactColumn: $preferredCompactColumn) {
+            VStack(spacing: 0) {
+                DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
+                ScrollViewReader { proxy in
+                    aktienListContent(proxy: proxy, selectionForThreeColumn: $selectedAktieISINForThreeColumn)
+                }
+            }
+            #if os(macOS)
+            .navigationSplitViewColumnWidth(min: 320, ideal: 380, max: 500)
+            #elseif os(iOS)
+            .navigationSplitViewColumnWidth(min: 280, ideal: 360)
+            #endif
+            .navigationTitle("Aktien")
+            .toolbar { aktienToolbarContent }
+            .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
+                Button("Löschen und Kursziele merken", role: .destructive) { saveManualKurszieleAndDeleteAll() }
+                Button("Löschen (Kursziele nicht merken)", role: .destructive) {
+                    UserDefaults.standard.removeObject(forKey: savedManualKurszieleUserDefaultsKey)
+                    deleteAllAktien()
+                }
+                Button("Abbrechen", role: .cancel) { }
+            } message: {
+                let n = aktien.filter { $0.kurszielManuellGeaendert }.count
+                if n > 0 {
+                    Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht. \(n) manuelle Kursziele können gemerkt und nach dem nächsten Einlesen (über ISIN/WKN) wieder zugeordnet werden.")
+                } else {
+                    Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht.")
+                }
+            }
+            .confirmationDialog("Einlesung löschen?", isPresented: $showDeleteEinlesungConfirmation, presenting: einlesungToDelete) { summary in
+                Button("Löschen", role: .destructive) {
+                    deleteEinlesung(summary)
+                    einlesungToDelete = nil
+                }
+                Button("Abbrechen", role: .cancel) { einlesungToDelete = nil }
+            } message: { summary in
+                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) löschen? Alle Aktien und Summen für diesen Tag werden aus den Tabellen entfernt.")
+            }
+            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
+                handleFileImport(result: result)
+            }
+            .alert("Import", isPresented: $showImportMessage) {
+                Button("OK", role: .cancel) {
+                    showImportMessage = false
+                    if pendingKurszielFetchAfterImport {
+                        pendingKurszielFetchAfterImport = false
+                        startPendingKurszielFetch()
+                    } else if showKurszielAbfrageBeiAltemDatum {
+                        showKurszielAbfrageBeiAltemDatum = false
+                        showKurszielAbfrageAlert = true
+                    }
+                }
+            } message: { Text(importMessage) }
+            .alert("Kursziele ermitteln?", isPresented: $showKurszielAbfrageAlert) {
+                Button("Ja") { showKurszielAbfrageAlert = false; startPendingKurszielFetch() }
+                Button("Nein", role: .cancel) { showKurszielAbfrageAlert = false }
+            } message: {
+                if lastImportHadCSVKursziele {
+                    Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)\n\nEs sind bereits Kursziele über die Datei mit eingelesen worden.")
+                } else {
+                    Text("Die eingelesenen Daten liegen vor dem Tagesdatum. Sollen die Kursziele trotzdem ermittelt werden? (Kann zeitaufwendig sein.)")
+                }
+            }
+            .sheet(isPresented: $showSettings) {
+                SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
+            }
+            .sheet(isPresented: $showWKNTester) {
+                WKNTesterView(wkn: $testWKN, result: $testKurszielResult, isTesting: $isTestingWKN, urlFromSettings: fmpAPIKeyStore, openAIFromSettings: openAIAPIKeyStore)
+                    .onAppear {
+                        if testWKN.isEmpty, !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty {
+                            testWKN = fmpAPIKeyStore.trimmingCharacters(in: .whitespaces)
+                        } else if testWKN.isEmpty {
+                            testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
+                        }
+                    }
+            }
+            .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
+            .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
+            .sheet(isPresented: $showWatchlist) { WatchlistView() }
+            .sheet(isPresented: $showStatistik) {
+                StatistikSheetView(summaries: importSummaries, showEinlesungenChart: $showEinlesungenChart, onDeleteEinlesung: { summary in
+                    einlesungToDelete = summary
+                    showDeleteEinlesungConfirmation = true
+                    showStatistik = false
+                })
+            }
+        } content: {
+            Group {
+                if let isin = selectedAktieISINForThreeColumn, let aktie = aktien.first(where: { $0.isin == isin }) {
+                    AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+                } else {
+                    Text("Aktie wählen")
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                }
+            }
+            #if os(macOS)
+            .navigationSplitViewColumnWidth(min: 320, ideal: 420, max: 600)
+            #elseif os(iOS)
+            .navigationSplitViewColumnWidth(min: 300, ideal: 400)
+            #endif
+            .navigationTitle("Detail")
+        } detail: {
+            KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: selectedAktieISINForThreeColumn ?? currentDetailISIN, onCopyISIN: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailISIN = $0 })
+                .onChange(of: selectedAktieISINForThreeColumn) { _, isin in
+                    if let isin = isin, !isin.isEmpty { scrollToISINOnKurszieleTab = isin }
+                }
+                #if os(macOS)
+                .navigationSplitViewColumnWidth(min: 320, ideal: 440, max: 700)
+                #elseif os(iOS)
+                .navigationSplitViewColumnWidth(min: 300, ideal: 400)
+                #endif
+                .navigationTitle("Kursziele")
+        }
+        .navigationSplitViewStyle(.balanced)
     }
 
     @ToolbarContentBuilder
@@ -834,6 +1073,9 @@ struct ContentView: View {
             Button(action: { showSettings = true }) { Label("Einstellungen", systemImage: "gear") }
         }
         ToolbarItem {
+            Button(action: { showStatistik = true }) { Label("Statistik", systemImage: "chart.bar.doc.horizontal") }
+        }
+        ToolbarItem {
             Button(action: {
                 #if os(iOS)
                 if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
@@ -858,110 +1100,8 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func aktienListContent(proxy: ScrollViewProxy) -> some View {
+    private func aktienListContent(proxy: ScrollViewProxy, selectionForThreeColumn: Binding<String?>? = nil) -> some View {
         List {
-                // Gesamtsummen der letzten 10 Einlesungen – sortiert nach Datum der Einlesedatei (ältestes zuerst)
-                let letzteZehn = Array(importSummaries.prefix(10)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
-                Section {
-                    if letzteZehn.isEmpty {
-                        Text("Keine Einlesungen vorhanden. Nach einem CSV-Import erscheinen hier die Gesamtsummen (bis zu 10).")
-                            .font(.subheadline)
-                            .foregroundColor(.secondary)
-                            .padding(.vertical, 8)
-                    } else {
-                        if showEinlesungenChart {
-                            EinlesungenChartView(summaries: letzteZehn)
-                                .frame(height: 160)
-                                .listRowBackground(Color.clear)
-                                .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
-                        }
-                        let ausgangsbasis = letzteZehn.first
-                        ForEach(Array(letzteZehn.enumerated()), id: \.element.importDatum) { _, summary in
-                            HStack(alignment: .top, spacing: 8) {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    HStack {
-                                        Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
-                                            .font(.caption)
-                                            .fontWeight(.medium)
-                                        Spacer()
-                                    }
-                                    HStack {
-                                        Text("Gesamtwert:")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Spacer()
-                                        Text("\(summary.gesamtwertAktuelleEinlesung, specifier: "%.2f") €")
-                                            .font(.caption)
-                                            .fontWeight(.medium)
-                                    }
-                                    if let basis = ausgangsbasis, basis.importDatum != summary.importDatum, basis.gesamtwertAktuelleEinlesung > 0 {
-                                        let differenz = summary.gesamtwertAktuelleEinlesung - basis.gesamtwertAktuelleEinlesung
-                                        HStack {
-                                            Text("Veränderung zur Ausgangsbasis (\(basis.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))):")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                            Spacer()
-                                            Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
-                                                .font(.caption)
-                                                .foregroundColor(differenz >= 0 ? .green : .red)
-                                        }
-                                    } else if summary.gesamtwertVoreinlesung > 0, ausgangsbasis?.importDatum == summary.importDatum {
-                                        HStack {
-                                            Text("Voreinlesung:")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                            Spacer()
-                                            Text("\(summary.gesamtwertVoreinlesung, specifier: "%.2f") €")
-                                                .font(.caption)
-                                        }
-                                        let differenz = summary.gesamtwertAktuelleEinlesung - summary.gesamtwertVoreinlesung
-                                        HStack {
-                                            Text("Veränderung:")
-                                                .font(.caption)
-                                                .foregroundColor(.secondary)
-                                            Spacer()
-                                            Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
-                                                .font(.caption)
-                                                .foregroundColor(differenz >= 0 ? .green : .red)
-                                        }
-                                    }
-                                }
-                                .padding(.vertical, 4)
-                                Button(role: .destructive) {
-                                    einlesungToDelete = summary
-                                    showDeleteEinlesungConfirmation = true
-                                } label: {
-                                    Image(systemName: "trash")
-                                        .font(.body)
-                                }
-                                .buttonStyle(.borderless)
-                            }
-                        }
-                    }
-                } header: {
-                    HStack {
-                        Text("Gesamtsummen (letzte 10 Einlesungen)")
-                        Spacer()
-                        if !letzteZehn.isEmpty {
-                            Button(showEinlesungenChart ? "Chart aus" : "Chart") {
-                                showEinlesungenChart.toggle()
-                            }
-                            .font(.caption)
-                        }
-                    }
-                } footer: {
-                    VStack(alignment: .leading, spacing: 4) {
-                        if letzteZehn.isEmpty {
-                            Text("Nach einem CSV-Import erscheinen hier die Gesamtsummen pro Einlesung.")
-                        } else {
-                            Text("Sortierung nach Datum der Einlesedatei (ältestes zuerst). Ausgangsbasis = ältestes Datum (bis zu 10 Einlesungen).")
-                        }
-                        Text("Bitte alle .csv-Dateien des Tages auf einmal anklicken (wegen der Gesamtsummen-Darstellung).")
-                            .fontWeight(.medium)
-                    }
-                    .font(.caption2)
-                }
-                
                 // Legende oben – Fonds/Fund/ETF-Positionen ggf. manuell mit Kurszielen versehen
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
@@ -1029,7 +1169,7 @@ struct ContentView: View {
                     Section {
                         ForEach(aktienSortiertNachAbstandKursziel) { aktie in
                             Button {
-                                aktienDetailPath.append(aktie.isin)
+                                if let sel = selectionForThreeColumn { sel.wrappedValue = aktie.isin } else { aktienDetailPath.append(aktie.isin) }
                             } label: {
                                 HStack {
                                     aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: true)
@@ -1069,7 +1209,7 @@ struct ContentView: View {
                         Section {
                             ForEach(group.aktien) { aktie in
                                 Button {
-                                    aktienDetailPath.append(aktie.isin)
+                                    if let sel = selectionForThreeColumn { sel.wrappedValue = aktie.isin } else { aktienDetailPath.append(aktie.isin) }
                                 } label: {
                                     HStack {
                                         aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: false)
@@ -1169,23 +1309,33 @@ struct ContentView: View {
 
     @ViewBuilder
     private var contentView: some View {
-        TabView(selection: selectedTabBinding) {
-            aktienTabContent
-                .tabItem { Label("Aktien", systemImage: "list.bullet") }
-                .tag(0)
-                .task {
-                    let (usd, gbp) = await KurszielService.fetchAppWechselkurse()
-                    await MainActor.run { AppWechselkurse.shared.set(usd: usd, gbp: gbp) }
-                }
+        Group {
+            if useThreeColumnLayout {
+                threeColumnLayout
+                    .task {
+                        let (usd, gbp) = await KurszielService.fetchAppWechselkurse()
+                        await MainActor.run { AppWechselkurse.shared.set(usd: usd, gbp: gbp) }
+                    }
+            } else {
+                TabView(selection: selectedTabBinding) {
+                    aktienTabContent
+                        .tabItem { Label("Aktien", systemImage: "list.bullet") }
+                        .tag(0)
+                        .task {
+                            let (usd, gbp) = await KurszielService.fetchAppWechselkurse()
+                            await MainActor.run { AppWechselkurse.shared.set(usd: usd, gbp: gbp) }
+                        }
 
-            NavigationStack {
-                KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: currentDetailISIN, onCopyISIN: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailISIN = $0 })
-            }
-            .tabItem { Label("Kursziele", systemImage: "target") }
-            .tag(1)
-            .onChange(of: selectedTab) { _, new in
-                if new == 1 {
-                    scrollToISINOnKurszieleTab = currentDetailISIN ?? gruppierteAktien.flatMap(\.aktien).first(where: { visibleISINsOnAktienList.contains($0.isin) })?.isin
+                    NavigationStack {
+                        KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: currentDetailISIN, onCopyISIN: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailISIN = $0 })
+                    }
+                    .tabItem { Label("Kursziele", systemImage: "target") }
+                    .tag(1)
+                    .onChange(of: selectedTab) { _, new in
+                        if new == 1 {
+                            scrollToISINOnKurszieleTab = currentDetailISIN ?? gruppierteAktien.flatMap(\.aktien).first(where: { visibleISINsOnAktienList.contains($0.isin) })?.isin
+                        }
+                    }
                 }
             }
         }
@@ -1217,12 +1367,26 @@ struct ContentView: View {
         if isImportingKursziele || isImportingKurszieleOpenAI {
             VStack {
                 Spacer()
-                VStack(spacing: 8) {
+                VStack(spacing: 10) {
                     HStack {
                         ProgressView()
                         Text(isImportingKurszieleOpenAI ? "Kursziele werden via OpenAI abgerufen…" : "Kursziele werden abgerufen…")
                             .font(.caption)
                     }
+                    // Wo überall gesucht wird; FMP/OpenAI ausgegraut wenn kein API-Key
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Durchsuchte Quellen:")
+                            .font(.caption2)
+                            .fontWeight(.medium)
+                            .foregroundColor(.secondary)
+                        kurszielQuelleZeile(name: "finanzen.net (Slug, WKN, Suche)", brauchtKey: false, hatKey: true)
+                        kurszielQuelleZeile(name: "FMP", brauchtKey: true, hatKey: !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
+                        kurszielQuelleZeile(name: "OpenAI", brauchtKey: true, hatKey: !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
+                        kurszielQuelleZeile(name: "ariva.de", brauchtKey: false, hatKey: true)
+                        kurszielQuelleZeile(name: "Yahoo", brauchtKey: false, hatKey: true)
+                        kurszielQuelleZeile(name: "Suchmaschine (Snippet)", brauchtKey: false, hatKey: true)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     if let aktie = aktuelleKurszielAktie {
                         Text(aktie.bezeichnung)
                             .font(.caption)
@@ -1241,6 +1405,14 @@ struct ContentView: View {
             }
             .allowsHitTesting(false)
         }
+    }
+    
+    private func kurszielQuelleZeile(name: String, brauchtKey: Bool, hatKey: Bool) -> some View {
+        let ausgegraut = brauchtKey && !hatKey
+        return Text("• \(name)\(ausgegraut ? " (kein API-Key)" : "")")
+            .font(.caption2)
+            .foregroundColor(ausgegraut ? .secondary : .primary)
+            .opacity(ausgegraut ? 0.65 : 1)
     }
 
     private func importCSVFiles() {
@@ -1490,14 +1662,21 @@ struct ContentView: View {
         // CSV ohne Kursziele: alle Werte neu berechnen (auch mit C gekennzeichnete), daher forceOverwrite.
         let sollAktualisieren: (Aktie) -> Bool = { a in
             if forceOverwriteAllKursziele || !csvHadKursziele { return !a.kurszielManuellGeaendert }
-            return !a.kurszielManuellGeaendert && a.kurszielQuelle != "C" && a.kursziel == nil
+            guard !a.kurszielManuellGeaendert else { return false }
+            // Auch aus CSV (C): ermitteln, wenn Kursziel fehlt oder 0 ist
+            let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
+            return a.kurszielQuelle != "C" || keinWert
         }
         let brauchtKursziel = !csvHadKursziele || !alleNeuenAktien.filter(sollAktualisieren).isEmpty
-        let hatFMPOderOpenAI = !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty || !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty
-        if brauchtKursziel, hatFMPOderOpenAI {
+        let startOfToday = Calendar.current.startOfDay(for: Date())
+        let alteDatenMitImport = einleseDatum < startOfToday && !alleNeuenAktien.isEmpty
+        // Bei altem Datum immer anbieten (auch wenn CSV schon Kursziele hatte), sonst nur wenn tatsächlich Bedarf
+        let sollAbfragenOderStarten = (brauchtKursziel || alteDatenMitImport)
+        // Auch ohne FMP/OpenAI-Key: Kursziele über finanzen.net, Yahoo, Suchmaschinen-Snippet etc. ermitteln
+        if sollAbfragenOderStarten {
+            lastImportHadCSVKursziele = csvHadKursziele
             pendingKurszielForceOverwrite = forceOverwriteAllKursziele || !csvHadKursziele
             pendingKurszielImportDatum = einleseDatum
-            let startOfToday = Calendar.current.startOfDay(for: Date())
             if einleseDatum < startOfToday {
                 showKurszielAbfrageBeiAltemDatum = true
             } else {
@@ -1511,7 +1690,10 @@ struct ContentView: View {
         let forceOverwrite = pendingKurszielForceOverwrite
         let sollAktualisieren: (Aktie) -> Bool = { a in
             if forceOverwrite { return !a.kurszielManuellGeaendert }
-            return !a.kurszielManuellGeaendert && a.kurszielQuelle != "C" && a.kursziel == nil
+            guard !a.kurszielManuellGeaendert else { return false }
+            // Auch aus CSV (C): ermitteln, wenn Kursziel fehlt oder 0 ist
+            let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
+            return a.kurszielQuelle != "C" || keinWert
         }
         let list = aktien.filter(sollAktualisieren)
         let importDate = pendingKurszielImportDatum
@@ -1523,12 +1705,14 @@ struct ContentView: View {
     
     private func fetchKurszieleViaOpenAI() {
         KurszielService.clearCachesForApiCalls()
+        KurszielService.resetZugriffeStatistik()
         guard !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty else { return }
         KurszielService.openAIAPIKey = openAIAPIKeyStore.trimmingCharacters(in: .whitespaces)
         isImportingKurszieleOpenAI = true
         aktuelleKurszielAktie = nil
         Task {
-            let zuAktualisieren = aktien.filter { forceOverwriteAllKursziele || (!$0.kurszielManuellGeaendert && $0.kurszielQuelle != "C") }
+            let keinKurszielWert: (Aktie) -> Bool = { $0.kursziel == nil || ($0.kursziel ?? 0) == 0 }
+            let zuAktualisieren = aktien.filter { forceOverwriteAllKursziele || (!$0.kurszielManuellGeaendert && ($0.kurszielQuelle != "C" || keinKurszielWert($0))) }
             for aktie in zuAktualisieren {
                 await MainActor.run {
                     aktuelleKurszielAktie = (bezeichnung: aktie.bezeichnung, wkn: aktie.wkn)
@@ -1558,6 +1742,7 @@ struct ContentView: View {
     
     private func fetchKurszieleForAktien(_ aktienListe: [Aktie], forceOverwrite: Bool = false, snapshotImportDatum: Date? = nil) async {
         KurszielService.clearCachesForApiCalls()
+        KurszielService.resetZugriffeStatistik()
         await MainActor.run { 
             isImportingKursziele = true
             aktuelleKurszielAktie = nil
@@ -1566,11 +1751,12 @@ struct ContentView: View {
         // Bei automatischer Einlesung: keinen Dialog anzeigen, OpenAI-Ersatz nicht übernehmen (nur Werte übernehmen, die realistisch sind)
         KurszielService.onUnrealistischErsatzBestätigen = { _, _, _ in false }
         
-        // Nicht überschreiben: manuell geändert; oder aus CSV (C) mit Wert – außer „Alle überschreiben“. Ohne Kursziel immer abrufen (auch bei Quelle C), damit FMP/OpenAI etc. einen Wert liefern können.
+        // Nicht überschreiben: manuell geändert; oder aus CSV (C) mit gültigem Wert. Bei Quelle C mit leer/0 trotzdem ermitteln.
         let sollUeberschreiben: (Aktie) -> Bool = { a in
             if forceOverwrite { return !a.kurszielManuellGeaendert }
             if a.kurszielManuellGeaendert { return false }
             if a.kursziel == nil { return true }
+            if (a.kursziel ?? 0) == 0 { return true }  // CSV-Spalte da, aber Wert 0 → trotzdem ermitteln
             return a.kurszielQuelle != "C"
         }
         let listToProcess = aktienListe.filter(sollUeberschreiben)
@@ -1609,30 +1795,10 @@ struct ContentView: View {
                 }
             }
             
-            // WICHTIG: Setze Kursziel erst auf nil, damit nicht das alte Kursziel bestehen bleibt
-            await MainActor.run {
-                aktie.kursziel = nil
-                aktie.kurszielDatum = nil
-                aktie.kurszielAbstand = nil
-                aktie.kurszielQuelle = nil
-                aktie.kurszielWaehrung = nil
-                aktie.kurszielHigh = nil
-                aktie.kurszielLow = nil
-                aktie.kurszielAnalysten = nil
-            }
-            
-            // Gleicher Abruf wie beim Button (FMP, OpenAI mit „Antwort:“/„Rückgabe:“-Parsing, finanzen.net, …)
-            let refPrice = aktie.kurs ?? aktie.einstandskurs
-            var info: KurszielInfo? = nil
-            if let fmpInfo = fmpCache[aktie.wkn], fmpInfo.kursziel > 0, KurszielService.isKurszielRealistisch(kursziel: fmpInfo.kursziel, refPrice: refPrice) {
-                // FMP hat brauchbares Kursziel → ggf. OpenAI-Ersatz bei unrealistisch
-                info = await KurszielService.applyOpenAIFallbackBeiUnrealistisch(info: fmpInfo, refPrice: refPrice, aktie: aktie)
-            } else {
-                // Kein FMP oder FMP wertlos (0/unrealistisch) → volle Kette wie Button: OpenAI, finanzen.net, …
-                info = await KurszielService.fetchKursziel(for: aktie)
-            }
-            // Bei refPrice nil/0 wird ermitteltes Kursziel trotzdem übernommen (isKurszielRealistisch gibt dann true)
-            if let info = info, KurszielService.isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
+            // Nur bei Treffer eintragen; kein Treffer → Vortag/Kursziel bleibt erhalten (nichts löschen)
+            let fmpVorab = fmpCache[aktie.wkn]
+            let info = await KurszielService.fetchKursziel(for: aktie, fmpResult: fmpVorab)
+            if let info = info {
                 await MainActor.run {
                     aktie.kursziel = info.kursziel
                     aktie.kurszielDatum = info.datum
@@ -1643,18 +1809,6 @@ struct ContentView: View {
                     aktie.kurszielLow = info.kurszielLow
                     aktie.kurszielAnalysten = info.kurszielAnalysten
                     aktie.kurszielManuellGeaendert = false
-                    try? modelContext.save()
-                }
-            } else {
-                await MainActor.run {
-                    aktie.kursziel = nil
-                    aktie.kurszielDatum = nil
-                    aktie.kurszielAbstand = nil
-                    aktie.kurszielQuelle = nil
-                    aktie.kurszielWaehrung = nil
-                    aktie.kurszielHigh = nil
-                    aktie.kurszielLow = nil
-                    aktie.kurszielAnalysten = nil
                     try? modelContext.save()
                 }
             }
@@ -1818,6 +1972,7 @@ struct KurszielListenView: View {
                     Text("Kursziele")
                 } footer: {
                     Text("Gelber Stern = zuletzt geöffnete Position. ISIN antippen → Kopieren. Kursziel bearbeiten wirkt wie auf der Detailseite (manuell). Tastatur: «Fertig» oder nach unten scrollen.")
+                        .foregroundStyle(Color.primary.opacity(0.72))
                 }
             }
             .onChange(of: scrollToISIN) { _, isin in
@@ -1883,6 +2038,9 @@ private struct KurszielZeileView: View {
     @State private var showOpenAIÜbernehmenConfirm = false
     /// Generation des letzten OpenAI-Abrufs – nur dessen Ergebnis anzeigen (verhindert Mischung bei mehrfachem Tippen)
     @State private var openAIRequestGeneration: Int = 0
+    
+    /// Besser lesbar auf iPad (grauer Listen-Hintergrund) als .secondary
+    private var kurszielSecondary: Color { Color.primary.opacity(0.65) }
     
     private var istFonds: Bool { aktie.istFonds }
     
@@ -2007,19 +2165,29 @@ private struct KurszielZeileView: View {
                     if let kurs = aktie.kurs ?? aktie.devisenkurs {
                         Text("Kurs: \(kurs, specifier: "%.4f") \(aktie.waehrung)")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(kurszielSecondary)
                     }
                 }
                 Spacer()
                 VStack(alignment: .trailing, spacing: 2) {
-                    Text(aktie.zeigeAlsUnrealistisch ? "Unrealistisch" : "Realistisch")
-                        .font(.caption)
-                        .foregroundColor(aktie.zeigeAlsUnrealistisch ? .orange : .green)
+                    Group {
+                        if aktie.kursziel == nil || (aktie.kursziel ?? 0) == 0 {
+                            Text("Kein Kursziel")
+                                .foregroundColor(kurszielSecondary)
+                        } else if aktie.zeigeAlsUnrealistisch {
+                            Text("Unrealistisch")
+                                .foregroundColor(.orange)
+                        } else {
+                            Text("Realistisch")
+                                .foregroundColor(.green)
+                        }
+                    }
+                    .font(.caption)
                     if let q = aktie.kurszielQuelle {
                         VStack(alignment: .trailing, spacing: 2) {
                             Text("\(q) · \(quelleLabel(q, manuell: aktie.kurszielManuellGeaendert))")
                                 .font(.caption2)
-                                .foregroundColor(.secondary)
+                                .foregroundColor(kurszielSecondary)
                             if q == KurszielQuelle.suchmaschine.rawValue,
                                let url = KurszielService.snippetSuchergebnisURL(for: aktie) {
                                 Button("Suchergebnis") {
@@ -2035,7 +2203,7 @@ private struct KurszielZeileView: View {
                     } else if aktie.kurszielManuellGeaendert {
                         Text("Manuell")
                             .font(.caption2)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(kurszielSecondary)
                     }
                 }
             }
@@ -2045,7 +2213,7 @@ private struct KurszielZeileView: View {
                 HStack(alignment: .center, spacing: 12) {
                     Text("Kursziel")
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(kurszielSecondary)
                     StableDecimalField(
                         placeholder: "EUR",
                         value: Binding(
@@ -2097,7 +2265,7 @@ private struct KurszielZeileView: View {
                         .frame(maxWidth: 100)
                         Text(aktie.waehrung)
                             .font(.caption)
-                            .foregroundColor(.secondary)
+                            .foregroundColor(kurszielSecondary)
                     }
                 }
                 // finanzen.net testen + FMP testen + OpenAI + Snippet testen (nur Fonds) + Kursziel suchen
@@ -2152,7 +2320,11 @@ private struct KurszielZeileView: View {
             }
         }
         .padding(.vertical, 4)
+        #if os(iOS)
+        .listRowBackground(isMarked ? Color.accentColor.opacity(0.2) : Color(uiColor: .systemBackground))
+        #else
         .listRowBackground(isMarked ? Color.accentColor.opacity(0.2) : Color.clear)
+        #endif
         .sheet(isPresented: $showFMPTest) {
             FMPTestSheetView(aktie: aktie, modelContext: modelContext, onRowEdited: onRowEdited)
         }
@@ -3269,7 +3441,7 @@ struct CSVSpaltenZuordnungView: View {
             } header: {
                 Text("Feld in der App")
             } footer: {
-                Text("Basis: Ohne Zuordnung (oder nach „Zurücksetzen“) verwendet die App wie bisher das normale Layout (Deutsche Bank / maxblue). Mindestens Bankleistungsnummer, Bestand, Bezeichnung und WKN sollten Sie zuordnen, sobald Sie eine andere Bank nutzen.")
+                Text("Basis: Ohne Zuordnung (oder nach „Zurücksetzen“) verwendet die App wie bisher das normale Layout (Deutsche Bank / maxblue). Mindestens Bankleistungsnummer, Bestand, Bezeichnung und WKN sollten Sie zuordnen. Die Spaltenreihenfolge in der CSV ist beliebig – die Zuordnung erfolgt rein über die Spaltennamen in der ersten Zeile.")
             }
             Section {
                 Picker("Feldtrenner", selection: $fieldSeparator) {

@@ -53,6 +53,36 @@ class KurszielService {
     static var debugMode = true
     static var debugLog: [String] = []
     
+    /// Zugriffe pro Plattform (für Statistik-Fenster); in UserDefaults persistiert
+    private static let keyZugriffeFMP = "KurszielService.zugriffeFMP"
+    private static let keyZugriffeFinanzenNet = "KurszielService.zugriffeFinanzenNet"
+    private static let keyZugriffeYahoo = "KurszielService.zugriffeYahoo"
+    private static let keyZugriffeOpenAI = "KurszielService.zugriffeOpenAI"
+    static var zugriffeFMP: Int {
+        get { UserDefaults.standard.integer(forKey: keyZugriffeFMP) }
+        set { UserDefaults.standard.set(newValue, forKey: keyZugriffeFMP) }
+    }
+    static var zugriffeFinanzenNet: Int {
+        get { UserDefaults.standard.integer(forKey: keyZugriffeFinanzenNet) }
+        set { UserDefaults.standard.set(newValue, forKey: keyZugriffeFinanzenNet) }
+    }
+    static var zugriffeYahoo: Int {
+        get { UserDefaults.standard.integer(forKey: keyZugriffeYahoo) }
+        set { UserDefaults.standard.set(newValue, forKey: keyZugriffeYahoo) }
+    }
+    static var zugriffeOpenAI: Int {
+        get { UserDefaults.standard.integer(forKey: keyZugriffeOpenAI) }
+        set { UserDefaults.standard.set(newValue, forKey: keyZugriffeOpenAI) }
+    }
+    
+    /// Setzt die Zugriffsstatistik auf 0 (wird zu Beginn jedes Kursziel-Durchlaufs aufgerufen, damit pro Durchlauf gezählt wird).
+    static func resetZugriffeStatistik() {
+        zugriffeFMP = 0
+        zugriffeFinanzenNet = 0
+        zugriffeYahoo = 0
+        zugriffeOpenAI = 0
+    }
+    
     /// Zuletzt ermittelte Wechselkurse (Frankfurter API) – nur Puffer für rateUSDtoEUR/rateGBPtoEUR/rateDKKtoEUR; vor jeder Nutzung per fetchAppWechselkurse() direkt neu geladen.
     static var appWechselkursUSDtoEUR: Double?
     static var appWechselkursGBPtoEUR: Double?
@@ -189,213 +219,85 @@ class KurszielService {
         return nil
     }
     
-    /// Ruft Kursziel für eine Aktie basierend auf WKN, ISIN und Bezeichnung ab. Wechselkurse: direkter Zugriff (fetchAppWechselkurse), keine alte Zwischenspeicherung.
-    static func fetchKursziel(for aktie: Aktie) async -> KurszielInfo? {
+    /// Ruft Kursziel für eine Aktie ab. Reihenfolge: 1) FMP (wenn Key, gut → Ende), 2) Finanzen.net + Yahoo (gut → Ende), 3) OpenAI (wenn Key, gut → eintragen, sonst nichts). Kein Treffer → nil (nichts eintragen, ggf. Vortag bleibt).
+    /// fmpResult: optionales Vorab-Ergebnis aus Bulk-FMP (wird zuerst geprüft, kein doppelter Abruf).
+    static func fetchKursziel(for aktie: Aktie, fmpResult: KurszielInfo? = nil) async -> KurszielInfo? {
         _ = await fetchAppWechselkurse()
         return await withTimeout(seconds: 20) {
             let refPrice = aktie.kurs ?? aktie.einstandskurs
-            let slug = slugFromBezeichnung(aktie.bezeichnung)
+            debug("🔍 Kursziel-Suche: \(aktie.bezeichnung) (WKN: \(aktie.wkn))")
+            if let ref = refPrice { debug("📊 Referenzkurs: \(ref) €") }
             
-            debug("🔍 Starte Kursziel-Suche für: \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
-            if let ref = refPrice {
-                debug("📊 Referenzkurs: \(ref) €")
+            func nehmenWennRealistisch(_ info: KurszielInfo?) async -> KurszielInfo? {
+                guard let info = info, info.kursziel > 0 else { return nil }
+                let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
+                guard isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) else { return nil }
+                return eurInfo
             }
-            debug("🔗 Slug: \(slug)")
             
-            // Kursziele aus importierter Portfolio-CSV (Quelle „C“) bleiben in der Aktie; keine kursziele.csv mehr beim Abruf (vermeidet abweichende Werte zu ChatGPT/OpenAI).
-            
-            // 1. FMP (Symbol oder search-isin per ISIN) – wenn API-Key hinterlegt
-            debug("1️⃣ Versuche FMP für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
-            if let info = await fetchKurszielFromFMP(for: aktie) {
-                if info.kursziel > 0 {
-                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (FMP)")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+            // 1. FMP – wenn API vorhanden; kommt nichts, 0 oder unrealistisch → weiter bei 2 (Finanzen.net/Yahoo/OpenAI)
+            var fmp: KurszielInfo? = (fmpResult != nil && (fmpResult?.kursziel ?? 0) > 0) ? fmpResult : nil
+            if fmp == nil {
+                fmp = await fetchKurszielFromFMP(for: aktie)
+            }
+            if let fmp = fmp, fmp.kursziel > 0 {
+                let eurInfo = await kurszielZuEUR(info: fmp, aktie: aktie)
+                if isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) {
+                    if fmpResult == nil { zugriffeFMP += 1 }
+                    debug("   → FMP: \(eurInfo.kursziel) € (übernommen)")
                     return eurInfo
                 }
-                debug("   → FMP Satz gefunden, aber Kursziel = 0 – versuche finanzen.net")
+                debug("   → FMP: nichts oder unrealistisch, weiter mit Finanzen.net/Yahoo")
             } else {
-                debug("   ❌ Kein Kursziel von FMP")
+                let hatFMPKey = (fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
+                if !hatFMPKey { debug("   → Kein FMP-Key, übersprungen") }
             }
             
-            // 1b. Bei FMP 0 oder kein FMP: zuerst finanzen.net (automatische Einlesung), dann ggf. OpenAI
-            // 2. finanzen.net Kursziel-Seite (Slug-URL)
+            // 2. Finanzen.net und Yahoo – kommt nichts oder unrealistisch → weiter bei 4
+            if let info = await fetchKurszielFromFinanzenNet(for: aktie), info.kursziel > 0,
+               isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
+                debug("   → Finanzen.net: \(info.kursziel) € (übernommen)")
+                return info
+            }
             let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
-            for slugVersuch in slugKandidaten {
-                guard !slugVersuch.isEmpty else { continue }
-                debug("2️⃣ Versuche finanzen.net/kursziele/\(slugVersuch)")
-                if let info = await fetchKurszielVonFinanzenNetKursziele(slug: slugVersuch) {
-                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (wie Testroutine)")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                } else {
-                    debug("   ❌ Kein Kursziel gefunden")
-                }
-            }
-            
-            // 3. finanzen.net mit WKN (Kursziel-Seite)
-            debug("3️⃣ Versuche finanzen.net/kursziele/\(aktie.wkn)")
-            if let info = await fetchKurszielVonFinanzenNetKursziele(wkn: aktie.wkn) {
-                debug("   → Gefunden: \(info.kursziel) €")
-                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                    debug("   ✅ Plausibilitätsprüfung bestanden")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                } else {
-                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen (Referenz: \(refPrice?.description ?? "keine"))")
-                }
-            } else {
-                debug("   ❌ Kein Kursziel gefunden")
-            }
-            
-            // finanzen.net Aktien-Seite
-            debug("3️⃣ Versuche finanzen.net/aktien/\(aktie.wkn)")
-            if let info = await fetchKurszielVonFinanzenNet(wkn: aktie.wkn) {
-                debug("   → Gefunden: \(info.kursziel) €")
-                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                    debug("   ✅ Plausibilitätsprüfung bestanden")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                } else {
-                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
-                }
-            } else {
-                debug("   ❌ Kein Kursziel gefunden")
-            }
-            
-            // 5. finanzen.net Suchseite (WKN)
-            debug("5️⃣ Versuche finanzen.net Suche für \(aktie.wkn)")
-            if let info = await fetchKurszielVonFinanzenNetSearch(wkn: aktie.wkn) {
-                debug("   → Gefunden: \(info.kursziel) €")
-                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                    debug("   ✅ Plausibilitätsprüfung bestanden")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                } else {
-                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
-                }
-            } else {
-                debug("   ❌ Kein Kursziel gefunden")
-            }
-            
-            // 5b. finanzen.net Suchseite mit ISIN
-            if !aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
-                debug("5b️⃣ Versuche finanzen.net Suche für ISIN \(aktie.isin)")
-                if let info = await fetchKurszielVonFinanzenNetSearch(searchTerm: aktie.isin) {
-                    debug("   → Gefunden: \(info.kursziel) €")
-                    if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                        debug("   ✅ Plausibilitätsprüfung bestanden")
-                        let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                        return eurInfo
-                    } else {
-                        debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
-                    }
-                } else {
-                    debug("   ❌ Kein Kursziel gefunden")
-                }
-            }
-            
-            // 1a. OpenAI (gleiche Abfrage-/Parsing-Logik wie Button: Antwort:, Rückgabe:, Ergebnis:, in Euro beträgt: etc.)
-            if openAIAPIKey != nil {
-                debug("1a️⃣ Versuche OpenAI für \(aktie.bezeichnung) (WKN: \(aktie.wkn), ISIN: \(aktie.isin))")
-                if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (OpenAI)")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                }
-                debug("   ❌ Kein Kursziel von OpenAI")
-            }
-            
-            // 1b. Nur für Fonds: Snippet früh (vor finanzen.net/Yahoo – spart Zeit, da diese für Fonds meist leer)
-            if istFonds(aktie) {
-                debug("1b️⃣ [Fonds] Versuche Suchsnippet (DuckDuckGo) für \(aktie.bezeichnung)")
-                if let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
-                    debug("   → Gefunden: \(info.kursziel) \(info.waehrung ?? "EUR") (Snippet)")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                    return eurInfo
-                }
-                debug("   ❌ Kein Betrag im Snippet")
-            }
-            
-            // 6. ariva.de mit Firmen-Slug (Slug-URLs für finanzen.net bereits in Schritt 2/3)
-            if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty {
-                debug("6️⃣ Versuche ariva.de/\(ersterSlug)-aktie/kursziele")
-                if let info = await fetchKurszielVonAriva(slug: ersterSlug) {
-                    debug("   → Gefunden: \(info.kursziel) €")
-                    if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                        debug("   ✅ Plausibilitätsprüfung bestanden")
-                        let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
-                        return eurInfo
-                    } else {
-                        debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
-                    }
-                } else {
-                    debug("   ❌ Kein Kursziel gefunden")
-                }
-            }
-            
-            // 7. Yahoo Finance – per Suchbegriff Ticker ermitteln (WKN/ISIN funktionieren oft nicht)
+            // Yahoo
             let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
-            debug("7️⃣ Versuche Yahoo Finance mit Suchbegriff: \(searchTerm ?? aktie.bezeichnung)")
-            if let ticker = await fetchYahooTicker(searchTerm: searchTerm ?? aktie.bezeichnung) {
-                debug("   → Ticker gefunden: \(ticker)")
-                if let info = await fetchKurszielVonYahoo(symbol: ticker) {
-                    debug("   → Gefunden: \(info.kursziel) €")
-                    if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                        debug("   ✅ Plausibilitätsprüfung bestanden")
-                        let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                        if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+            let yahooSymbols: [String] = [searchTerm ?? aktie.bezeichnung, aktie.wkn, aktie.isin].filter { !$0.isEmpty }
+            for symbol in yahooSymbols {
+                if let info = await fetchKurszielVonYahoo(symbol: symbol) {
+                    if let eurInfo = await nehmenWennRealistisch(info) {
+                        debug("   → Yahoo: \(eurInfo.kursziel) € (übernommen)")
                         return eurInfo
-                    } else {
-                        debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                     }
-                } else {
-                    debug("   ❌ Kein Kursziel gefunden")
                 }
-            } else {
-                debug("   ❌ Kein Ticker gefunden")
             }
-            
-            // 8. Yahoo mit WKN/ISIN als Fallback
-            debug("8️⃣ Versuche Yahoo Finance mit WKN: \(aktie.wkn)")
-            if let info = await fetchKurszielVonYahoo(symbol: aktie.wkn) {
-                debug("   → Gefunden: \(info.kursziel) €")
-                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                    debug("   ✅ Plausibilitätsprüfung bestanden")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+            if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty, let info = await fetchKurszielVonAriva(slug: ersterSlug) {
+                if let eurInfo = await nehmenWennRealistisch(info) {
+                    debug("   → ariva.de: \(eurInfo.kursziel) € (übernommen)")
                     return eurInfo
-                } else {
-                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                 }
-            } else {
-                debug("   ❌ Kein Kursziel gefunden")
             }
-            
-            debug("9️⃣ Versuche Yahoo Finance mit ISIN: \(aktie.isin)")
-            if let info = await fetchKurszielVonYahoo(symbol: aktie.isin) {
-                debug("   → Gefunden: \(info.kursziel) €")
-                if isValidKursziel(info.kursziel, referencePrice: refPrice) {
-                    debug("   ✅ Plausibilitätsprüfung bestanden")
-                    let eurInfo = await kurszielZuEUR(info: info, aktie: aktie)
-                    if let replacement = await beiUnrealistischOpenAIVersuchen(eurInfo: eurInfo, refPrice: refPrice, aktie: aktie) { return replacement }
+            if istFonds(aktie), let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
+                if let eurInfo = await nehmenWennRealistisch(info) {
+                    debug("   → Snippet: \(eurInfo.kursziel) € (übernommen)")
                     return eurInfo
-                } else {
-                    debug("   ❌ Plausibilitätsprüfung fehlgeschlagen")
                 }
-            } else {
-                debug("   ❌ Kein Kursziel gefunden")
             }
+            debug("   → Finanzen.net/Yahoo: nichts oder unrealistisch, weiter mit OpenAI")
             
-            debug("❌ Keine Methode erfolgreich")
+            // 3. OpenAI – kommt nichts oder unrealistisch → nichts eintragen (nil)
+            let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
+            guard hatOpenAIKey else {
+                debug("   → Kein OpenAI-Key, Ende (nichts eingetragen)")
+                return nil
+            }
+            if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                if let eurInfo = await nehmenWennRealistisch(info) {
+                    debug("   → OpenAI: \(eurInfo.kursziel) € (übernommen)")
+                    return eurInfo
+                }
+            }
+            debug("   → OpenAI: nichts oder unrealistisch, nichts eingetragen")
             return nil
         }
     }
@@ -671,6 +573,7 @@ class KurszielService {
     
     /// Ruft Kursziel von Yahoo Finance ab (inoffizielle API)
     private static func fetchKurszielVonYahoo(symbol: String) async -> KurszielInfo? {
+        zugriffeYahoo += 1
         // Yahoo Finance verwendet normalerweise Ticker-Symbole
         // Für deutsche Aktien: Versuche verschiedene Formate
         let symbols = [
@@ -808,6 +711,7 @@ class KurszielService {
     
     /// Ruft Kursziel ausschließlich von finanzen.net ab (für Einzeltest mit Debug). Versucht Slug, WKN, Aktien-Seite, Suche.
     static func fetchKurszielFromFinanzenNet(for aktie: Aktie) async -> KurszielInfo? {
+        zugriffeFinanzenNet += 1
         clearDebugLog()
         debug("━━━ finanzen.net EINZELTEST: \(aktie.bezeichnung) ━━━")
         debug("   WKN: \(aktie.wkn), ISIN: \(aktie.isin)")
@@ -1057,6 +961,7 @@ class KurszielService {
                 request.timeoutInterval = 30
                 request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36", forHTTPHeaderField: "User-Agent")
                 let (data, response) = try await URLSession.shared.data(for: request)
+                zugriffeFMP += 1
                 if let http = response as? HTTPURLResponse {
                     debug("   📥 FMP \(sym) HTTP Status: \(http.statusCode)")
                 }
@@ -1523,21 +1428,21 @@ class KurszielService {
             guard let it = item else { return nil }
             let symbol = it["symbol"] as? String ?? "?"
             guard let parsed = parseFMPConsensusItem(it, symbol: symbol) else { return nil }
+            // FMP liefert manchmal 0 (z. B. Infineon) – dann nil, damit weiter bei Finanzen.net/OpenAI gesucht wird
+            guard parsed.consensus > 0 else { return nil }
             var consensus = parsed.consensus
             var high = parsed.high
             var low = parsed.low
-            if consensus > 0 {
-                if gbpTicker.contains(symbol) {
-                    let rate = rateGBPtoEUR()
-                    consensus = parsed.consensus * rate
-                    high = parsed.high.map { $0 * rate }
-                    low = parsed.low.map { $0 * rate }
-                } else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
-                    let rate = rateUSDtoEUR()
-                    consensus = parsed.consensus * rate
-                    high = parsed.high.map { $0 * rate }
-                    low = parsed.low.map { $0 * rate }
-                }
+            if gbpTicker.contains(symbol) {
+                let rate = rateGBPtoEUR()
+                consensus = parsed.consensus * rate
+                high = parsed.high.map { $0 * rate }
+                low = parsed.low.map { $0 * rate }
+            } else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
+                let rate = rateUSDtoEUR()
+                consensus = parsed.consensus * rate
+                high = parsed.high.map { $0 * rate }
+                low = parsed.low.map { $0 * rate }
             }
             let waehrung: String
             if gbpTicker.contains(symbol) || usTicker.contains(symbol) || isLikelyUSTicker(symbol) {
@@ -1847,6 +1752,7 @@ class KurszielService {
             debug("   ❌ OpenAI API-Key nicht konfiguriert (Einstellungen)")
             return nil
         }
+        zugriffeOpenAI += 1
         debug("   🔑 OpenAI API-Key geladen (Länge \(apiKey.count), Format: \(apiKey.hasPrefix("sk-") ? "sk-... ✓" : "Präfix prüfen"))")
         let isinTrimmed = isin?.trimmingCharacters(in: .whitespaces)
         let hasISIN = (isinTrimmed?.count ?? 0) >= 10
