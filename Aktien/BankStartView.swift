@@ -15,6 +15,16 @@ import UIKit
 import AppKit
 #endif
 
+/// Beträge im deutschen Format (z. B. 1.234,56) – für Anzeige auf der Startseite
+private func formatBetragDE(_ value: Double, decimals: Int = 2) -> String {
+    let f = NumberFormatter()
+    f.locale = Locale(identifier: "de_DE")
+    f.numberStyle = .decimal
+    f.minimumFractionDigits = decimals
+    f.maximumFractionDigits = decimals
+    return f.string(from: NSNumber(value: value)) ?? String(format: "%.\(decimals)f", value)
+}
+
 struct BankStartView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: [SortDescriptor<Aktie>(\.bankleistungsnummer), SortDescriptor<Aktie>(\.bezeichnung)]) private var aktien: [Aktie]
@@ -245,7 +255,7 @@ struct BankStartView: View {
                     }
                 }
             }
-            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
+            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text, .spreadsheet, UTType(filenameExtension: "xlsx", conformingTo: .spreadsheet)!], allowsMultipleSelection: true) { result in
                 switch result {
                 case .success(let urls):
                     StartState.shared.pendingImportURLsFromStart = urls
@@ -425,7 +435,7 @@ struct BankStartView: View {
         let summariesFuerBank = importSummaries.filter { $0.importBankId == bank.id }
         if let neueste = summariesFuerBank.max(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung }) {
             let datumStr = neueste.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)
-            let sumStr = neueste.gesamtwertAktuelleEinlesung > 0 ? String(format: "%.2f €", neueste.gesamtwertAktuelleEinlesung) : "—"
+            let sumStr = neueste.gesamtwertAktuelleEinlesung > 0 ? formatBetragDE(neueste.gesamtwertAktuelleEinlesung) + " €" : "—"
             return (datumStr, sumStr)
         }
         // 2) Fallback: Bank mit fester BL – Positionen anhand BL zuordnen
@@ -439,7 +449,7 @@ struct BankStartView: View {
         let lastDate = positions.map(\.importDatum).max() ?? Date()
         let sum = positions.compactMap(\.marktwertEUR).reduce(0, +)
         let datumStr = lastDate.formatted(date: .abbreviated, time: .shortened)
-        let sumStr = sum > 0 ? String(format: "%.2f €", sum) : "—"
+        let sumStr = sum > 0 ? formatBetragDE(sum) + " €" : "—"
         return (datumStr, sumStr)
     }
     

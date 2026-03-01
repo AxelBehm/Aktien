@@ -119,6 +119,16 @@ private let csvSpaltenFields: [CSVSpaltenField] = [
     CSVSpaltenField(id: "kursziel_quelle", label: "Kursziel Quelle (optional)"),
 ]
 
+/// Beträge einheitlich im deutschen Format anzeigen (z. B. 1.234,56).
+private func formatBetragDE(_ value: Double, decimals: Int = 2) -> String {
+    let f = NumberFormatter()
+    f.locale = Locale(identifier: "de_DE")
+    f.numberStyle = .decimal
+    f.minimumFractionDigits = decimals
+    f.maximumFractionDigits = decimals
+    return f.string(from: NSNumber(value: value)) ?? String(format: "%.\(decimals)f", value)
+}
+
 /// Für „Fester Wert“-Übernahme: String als Double parsen (deutsches Format).
 private func parseDoubleFromFixed(_ s: String) -> Double? {
     let trimmed = s.trimmingCharacters(in: .whitespaces)
@@ -180,10 +190,10 @@ private struct StableDecimalField: View {
     
     private static var formatter: NumberFormatter {
         let f = NumberFormatter()
+        f.locale = Locale(identifier: "de_DE")
         f.numberStyle = .decimal
         f.minimumFractionDigits = 0
         f.maximumFractionDigits = 2
-        f.decimalSeparator = Locale.current.decimalSeparator ?? "."
         return f
     }
     
@@ -344,10 +354,10 @@ private struct DevisenkursKopfView: View {
                     .font(.caption)
                     .foregroundColor(.secondary)
             } else {
-                Text("USD/EUR: \(usdToEur.map { String(format: "%.4f", $0) } ?? "–")")
+                Text("USD/EUR: \(usdToEur.map { formatBetragDE($0, decimals: 4) } ?? "–")")
                     .font(.caption)
                     .foregroundColor(.secondary)
-                Text("GBP/EUR: \(gbpToEur.map { String(format: "%.4f", $0) } ?? "–")")
+                Text("GBP/EUR: \(gbpToEur.map { formatBetragDE($0, decimals: 4) } ?? "–")")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
@@ -377,7 +387,7 @@ private struct EinlesungenChartView: View {
                         let val = s.gesamtwertAktuelleEinlesung
                         let fraction = range > 0 ? (val - minVal) / range : 1.0
                         VStack(spacing: 2) {
-                            Text("\(val, specifier: "%.0f") €")
+                            Text("\(formatBetragDE(val, decimals: 0)) €")
                                 .font(.system(size: 9))
                                 .foregroundColor(.secondary)
                                 .lineLimit(1)
@@ -420,10 +430,10 @@ private struct StatistikSheetView: View {
         Array(summaries.prefix(maxAnzahlEinlesungen)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
     }
     
-    /// Formatierung mit Vorzeichen für Statistik: immer „+1,23“ oder „-1,23“, nie ohne Plus
+    /// Formatierung mit Vorzeichen für Statistik: immer „+1,23“ oder „-1,23“, nie ohne Plus (deutsches Format)
     private static func formatVeränderung(_ value: Double) -> String {
         let vorzeichen = value >= 0 ? "+" : ""
-        return vorzeichen + String(format: "%.2f", value) + " €"
+        return vorzeichen + formatBetragDE(value) + " €"
     }
     
     /// Pro Einlesedatum die Summe pro BL und Abweichung zur letzten Einlesung, in der dieselbe BL vorkam (rückwärts suchen, auch wenn dazwischen andere BLs eingelesen wurden)
@@ -501,7 +511,7 @@ private struct StatistikSheetView: View {
                                                         .font(.caption)
                                                         .foregroundColor(.secondary)
                                                     Spacer()
-                                                    Text(String(format: "%.2f", row.wert) + " €")
+                                                    Text(formatBetragDE(row.wert) + " €")
                                                         .font(.caption)
                                                 }
                                                 if let abw = row.abweichung {
@@ -663,7 +673,7 @@ private struct PositionVerlaufChartView: View {
                                 VStack(spacing: 1) {
                                     HStack(spacing: 1) {
                                         if let kurs = s.kurs {
-                                            Text(String(format: "%.2f", kurs))
+                                            Text(formatBetragDE(kurs))
                                                 .font(.system(size: 6))
                                                 .foregroundColor(.blue)
                                                 .lineLimit(1)
@@ -671,7 +681,7 @@ private struct PositionVerlaufChartView: View {
                                         }
                                         if s.kurs != nil && (s.kursziel != nil || kzEffective != nil) { Spacer(minLength: 0) }
                                         if let kz = kzEffective {
-                                            Text(String(format: "%.2f", kz))
+                                            Text(formatBetragDE(kz))
                                                 .font(.system(size: 6))
                                                 .foregroundColor(.green)
                                                 .lineLimit(1)
@@ -1065,16 +1075,16 @@ struct ContentView: View {
                 }
                 // Zeile 1: Bestand + Anzahl, Marktwert + Wert (gekürzte Labels). Marktwert aus CSV oder berechnet (Kurs × Bestand).
                 HStack(spacing: 12) {
-                    Text("Stück \(aktie.bestand, specifier: "%.0f")")
+                    Text("Stück \(formatBetragDE(aktie.bestand, decimals: 0))")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     if let mw = aktie.marktwertEUR {
-                        Text("Marktw. \(mw, specifier: "%.2f") €")
+                        Text("Marktw. \(formatBetragDE(mw)) €")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     } else if let k = aktie.kurs ?? aktie.devisenkurs, aktie.bestand > 0 {
                         let computed = k * aktie.bestand
-                        Text("Marktw. \(computed, specifier: "%.2f") €")
+                        Text("Marktw. \(formatBetragDE(computed)) €")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -1083,12 +1093,12 @@ struct ContentView: View {
                 if aktie.previousKurs != nil || (aktie.kurs ?? aktie.devisenkurs) != nil {
                     HStack(spacing: 12) {
                         if let alt = aktie.previousKurs {
-                            Text("Kurs alt \(alt, specifier: "%.2f")")
+                            Text("Kurs alt \(formatBetragDE(alt))")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
                         if let neu = aktie.kurs ?? aktie.devisenkurs {
-                            Text("Kurs neu \(neu, specifier: "%.2f")")
+                            Text("Kurs neu \(formatBetragDE(neu))")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
                         }
@@ -1101,7 +1111,7 @@ struct ContentView: View {
                         Text("Veränd.")
                             .font(.caption2)
                             .foregroundColor(.secondary)
-                        Text("\(pct >= 0 ? "+" : "")\(pct, specifier: "%.2f")%")
+                        Text("\(pct >= 0 ? "+" : "")\(formatBetragDE(pct))%")
                             .font(.caption2)
                             .fontWeight(.medium)
                             .foregroundColor(pct >= 0 ? .green : .red)
@@ -1112,10 +1122,10 @@ struct ContentView: View {
                     let abstandPct = (kz - kurs) / kurs * 100
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 12) {
-                            Text("Kursziel \(kz, specifier: "%.2f")")
+                            Text("Kursziel \(formatBetragDE(kz))")
                                 .font(.caption2)
                                 .foregroundColor(.secondary)
-                            Text("Abstand \(abstandPct >= 0 ? "+" : "")\(abstandPct, specifier: "%.1f")%")
+                            Text("Abstand \(abstandPct >= 0 ? "+" : "")\(formatBetragDE(abstandPct, decimals: 1))%")
                                 .font(.caption2)
                                 .fontWeight(.medium)
                                 .foregroundColor(abstandPct >= 0 ? .green : .red)
@@ -1215,7 +1225,7 @@ struct ContentView: View {
             } message: { summary in
                 Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) und alle zugehörigen Positionen werden gelöscht.")
             }
-            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
+            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text, .spreadsheet, UTType(filenameExtension: "xlsx", conformingTo: .spreadsheet)!], allowsMultipleSelection: true) { result in
                 handleFileImport(result: result)
             }
             .confirmationDialog("Anderes CSV-Format", isPresented: $showFingerprintMismatchAlert) {
@@ -1352,7 +1362,7 @@ struct ContentView: View {
             } message: { summary in
                 Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) und alle zugehörigen Positionen werden gelöscht.")
             }
-            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
+            .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text, .spreadsheet, UTType(filenameExtension: "xlsx", conformingTo: .spreadsheet)!], allowsMultipleSelection: true) { result in
                 handleFileImport(result: result)
             }
             .confirmationDialog("Anderes CSV-Format", isPresented: $showFingerprintMismatchAlert) {
@@ -1685,7 +1695,7 @@ struct ContentView: View {
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                 Spacer()
-                                Text("\(zwischensumme, specifier: "%.2f") €")
+                                Text("\(formatBetragDE(zwischensumme)) €")
                                     .font(.caption)
                                     .fontWeight(.medium)
                             }
@@ -1699,7 +1709,7 @@ struct ContentView: View {
                             .font(.subheadline)
                             .fontWeight(.semibold)
                         Spacer()
-                        Text("\(gesamtMarktwert, specifier: "%.2f") €")
+                        Text("\(formatBetragDE(gesamtMarktwert)) €")
                             .font(.subheadline)
                             .fontWeight(.semibold)
                     }
@@ -1827,7 +1837,7 @@ struct ContentView: View {
         } message: {
             if let orig = unrealistischConfirm.original, let repl = unrealistischConfirm.replacement {
                 let name = unrealistischConfirm.aktienBezeichnung.isEmpty ? "Aktie" : unrealistischConfirm.aktienBezeichnung
-                Text("\(name): Original \(String(format: "%.2f", orig.kursziel)) \(orig.waehrung ?? "EUR"). OpenAI-Ersatz: \(String(format: "%.2f", repl.kursziel)) \(repl.waehrung ?? "EUR"). Übernehmen?")
+                Text("\(name): Original \(formatBetragDE(orig.kursziel)) \(orig.waehrung ?? "EUR"). OpenAI-Ersatz: \(formatBetragDE(repl.kursziel)) \(repl.waehrung ?? "EUR"). Übernehmen?")
             }
         }
     }
@@ -2819,7 +2829,7 @@ private struct KurszielZeileView: View {
     private var zwischenablageText: String {
         var t = "ISIN: \(aktie.isin)\ndurchschnittliches Kursziel:"
         if let kz = aktie.kursziel, kz > 0 {
-            t += " \(String(format: "%.2f", kz)) \(aktie.kurszielWaehrung ?? "EUR")"
+            t += " \(formatBetragDE(kz)) \(aktie.kurszielWaehrung ?? "EUR")"
         } else { t += " –" }
         return t
     }
@@ -2929,7 +2939,7 @@ private struct KurszielZeileView: View {
                         .font(.subheadline)
                         .fontWeight(.medium)
                     if let kurs = aktie.kurs ?? aktie.devisenkurs {
-                        Text("Kurs: \(kurs, specifier: "%.4f") \(aktie.waehrung)")
+                        Text("Kurs: \(formatBetragDE(kurs, decimals: 4)) \(aktie.waehrung)")
                             .font(.caption2)
                             .foregroundColor(kurszielSecondary)
                     }
@@ -3121,7 +3131,7 @@ private struct KurszielZeileView: View {
             }
         } message: {
             if let kz = pendingKurszielFromFile {
-                Text("Kursziel \(String(format: "%.2f", kz)) EUR aus Datei übernehmen?")
+                Text("Kursziel \(formatBetragDE(kz)) EUR aus Datei übernehmen?")
             }
         }
         .confirmationDialog("Kursziel übernehmen? – \(aktie.bezeichnung)", isPresented: $showOpenAIÜbernehmenConfirm) {
@@ -3146,7 +3156,7 @@ private struct KurszielZeileView: View {
             }
         } message: {
             if let info = pendingOpenAIInfo {
-                Text("\(aktie.bezeichnung): Kursziel \(String(format: "%.2f", info.kursziel)) \(info.waehrung ?? "EUR") von OpenAI übernehmen?")
+                Text("\(aktie.bezeichnung): Kursziel \(formatBetragDE(info.kursziel)) \(info.waehrung ?? "EUR") von OpenAI übernehmen?")
             }
         }
         .onChange(of: aktie.isin) { _, _ in
@@ -3364,7 +3374,7 @@ struct AktieDetailView: View {
                     Text(aktie.waehrung)
                 }
                 LabeledContent("Bestand") {
-                    Text("\(aktie.bestand, specifier: "%.2f")")
+                    Text(formatBetragDE(aktie.bestand))
                 }
             }
             
@@ -3379,12 +3389,12 @@ struct AktieDetailView: View {
             Section("Kurse") {
                 if let einstandskurs = aktie.einstandskurs {
                     LabeledContent("Einstandskurs") {
-                        Text("\(einstandskurs, specifier: "%.4f")")
+                        Text(formatBetragDE(einstandskurs, decimals: 4))
                     }
                 }
                 if let kurs = aktie.kurs {
                     LabeledContent("Aktueller Kurs") {
-                        Text("\(kurs, specifier: "%.4f")")
+                        Text(formatBetragDE(kurs, decimals: 4))
                     }
                 }
                 LabeledContent("Kursziel") {
@@ -3468,20 +3478,20 @@ struct AktieDetailView: View {
                 if let kursziel = aktie.kursziel, let kurs = aktie.kurs, kurs > 0 {
                     let differenz = kursziel - kurs
                     let differenzProzent = (differenz / kurs) * 100
-                    Text("(\(differenz >= 0 ? "+" : "")\(differenzProzent, specifier: "%.1f")% zum Ziel)")
+                    Text("(\(differenz >= 0 ? "+" : "")\(formatBetragDE(differenzProzent, decimals: 1))% zum Ziel)")
                         .font(.caption)
                         .foregroundColor(differenz >= 0 ? .green : .red)
                 }
                 if let abstand = aktie.kurszielAbstand {
                     LabeledContent("Abstand Analysten (Ø)") {
-                        Text("\(abstand >= 0 ? "+" : "")\(abstand, specifier: "%.1f")%")
+                        Text("\(abstand >= 0 ? "+" : "")\(formatBetragDE(abstand, decimals: 1))%")
                             .foregroundColor(.secondary)
                     }
                 }
                 if aktie.kurszielQuelle == "M" {
                     let w = aktie.kurszielWaehrung ?? aktie.waehrung
-                    if let high = aktie.kurszielHigh { LabeledContent("Hochziel") { Text("\(high, specifier: "%.2f") \(w)") } }
-                    if let low = aktie.kurszielLow { LabeledContent("Niedrigziel") { Text("\(low, specifier: "%.2f") \(w)") } }
+if let high = aktie.kurszielHigh { LabeledContent("Hochziel") { Text("\(formatBetragDE(high)) \(w)") } }
+    if let low = aktie.kurszielLow { LabeledContent("Niedrigziel") { Text("\(formatBetragDE(low)) \(w)") } }
                     if let n = aktie.kurszielAnalysten { LabeledContent("Anzahl Analysten") { Text("\(n)") } }
                 }
                 if let kursziel = aktie.kursziel, !aktie.isKurszielPlausibel {
@@ -3535,13 +3545,13 @@ struct AktieDetailView: View {
             Section("Gewinn/Verlust") {
                 if let gewinnEUR = aktie.gewinnVerlustEUR {
                     LabeledContent("Gewinn/Verlust (EUR)") {
-                        Text("\(gewinnEUR, specifier: "%.2f") €")
+                        Text("\(formatBetragDE(gewinnEUR)) €")
                             .foregroundColor(gewinnEUR >= 0 ? .green : .red)
                     }
                 }
                 if let gewinnProzent = aktie.gewinnVerlustProzent {
                     LabeledContent("Gewinn/Verlust (%)") {
-                        Text("\(gewinnProzent, specifier: "%.2f") %")
+                        Text("\(formatBetragDE(gewinnProzent)) %")
                             .foregroundColor(gewinnProzent >= 0 ? .green : .red)
                     }
                 }
@@ -3562,17 +3572,17 @@ struct AktieDetailView: View {
                 Section("Werte aus Voreinlesung") {
                     if let bestandAlt = aktie.previousBestand {
                         LabeledContent("Bestand Alt") {
-                            Text("\(bestandAlt, specifier: "%.2f")")
+                            Text(formatBetragDE(bestandAlt))
                         }
                     }
                     if let marktwertAlt = aktie.previousMarktwertEUR {
                         LabeledContent("Marktwert Alt") {
-                            Text("\(marktwertAlt, specifier: "%.2f") €")
+                            Text("\(formatBetragDE(marktwertAlt)) €")
                         }
                     }
                     if let kursAlt = aktie.previousKurs {
                         LabeledContent("Kurs Alt") {
-                            Text("\(kursAlt, specifier: "%.4f")")
+                            Text(formatBetragDE(kursAlt, decimals: 4))
                         }
                     }
                 }
@@ -3732,10 +3742,10 @@ private struct FMPTestSheetView: View {
                 if let result = fmpResult {
                     Section {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Kursziel: \(result.kursziel, specifier: "%.2f") \(result.waehrung ?? "EUR")")
+                            Text("Kursziel: \(formatBetragDE(result.kursziel)) \(result.waehrung ?? "EUR")")
                                 .font(.headline)
                             if let h = result.kurszielHigh, let l = result.kurszielLow {
-                                Text("High: \(h, specifier: "%.2f") | Low: \(l, specifier: "%.2f")")
+                                Text("High: \(formatBetragDE(h)) | Low: \(formatBetragDE(l))")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                             }
@@ -3870,10 +3880,10 @@ private struct FinanzenNetTestSheetView: View {
                                     .font(.headline)
                                     .foregroundColor(.secondary)
                             } else {
-                                Text("Kursziel: \(info.kursziel, specifier: "%.2f") \(info.waehrung ?? "EUR")")
+                                Text("Kursziel: \(formatBetragDE(info.kursziel)) \(info.waehrung ?? "EUR")")
                                     .font(.headline)
                                 if let abstand = info.spalte4Durchschnitt {
-                                    Text("Abstand: \(abstand >= 0 ? "+" : "")\(abstand, specifier: "%.1f")%")
+                                    Text("Abstand: \(abstand >= 0 ? "+" : "")\(formatBetragDE(abstand, decimals: 1))%")
                                         .font(.caption)
                                         .foregroundColor(.secondary)
                                 }
@@ -4019,7 +4029,7 @@ private struct SnippetTestSheetView: View {
                 if let info = result {
                     Section {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Kursziel: \(info.kursziel, specifier: "%.2f") \(info.waehrung ?? "EUR")")
+                            Text("Kursziel: \(formatBetragDE(info.kursziel)) \(info.waehrung ?? "EUR")")
                                 .font(.headline)
                         }
                         Button("Übernehmen") {
@@ -4656,13 +4666,13 @@ struct WatchlistView: View {
                     Section {
                         LabeledContent("Bezeichnung", value: r.bezeichnung)
                         if let k = r.kurs {
-                            LabeledContent("Kurs", value: String(format: "%.2f €", k))
+                            LabeledContent("Kurs", value: formatBetragDE(k) + " €")
                         } else {
                             TextField("Kurs (optional)", text: $bearbeiteterKurs)
                                 .keyboardType(.decimalPad)
                         }
                         if let kz = r.kursziel {
-                            LabeledContent("Kursziel", value: String(format: "%.2f €", kz))
+                            LabeledContent("Kursziel", value: formatBetragDE(kz) + " €")
                         } else {
                             TextField("Kursziel (optional)", text: $bearbeitetesKursziel)
                                 .keyboardType(.decimalPad)
@@ -4688,7 +4698,7 @@ struct WatchlistView: View {
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                 if let k = aktie.kurs ?? aktie.devisenkurs, let kz = aktie.kursziel {
-                                    Text("Kurs \(String(format: "%.2f", k)) € · Kursziel \(String(format: "%.2f", kz)) €")
+                                    Text("Kurs \(formatBetragDE(k)) € · Kursziel \(formatBetragDE(kz)) €")
                                         .font(.caption2)
                                         .foregroundColor(.secondary)
                                 }
@@ -4740,8 +4750,8 @@ struct WatchlistView: View {
         await MainActor.run {
             lookupResult = result
             if let r = result {
-                bearbeiteterKurs = r.kurs.map { String(format: "%.2f", $0) } ?? ""
-                bearbeitetesKursziel = r.kursziel.map { String(format: "%.2f", $0) } ?? ""
+                bearbeiteterKurs = r.kurs.map { formatBetragDE($0) } ?? ""
+                bearbeitetesKursziel = r.kursziel.map { formatBetragDE($0) } ?? ""
             }
         }
     }
@@ -5176,15 +5186,11 @@ struct WKNTesterView: View {
             
             if let info = await KurszielService.fetchKurszielByWKN(wknCleaned) {
                 await MainActor.run {
-                    let formatter = NumberFormatter()
-                    formatter.numberStyle = .decimal
-                    formatter.minimumFractionDigits = 2
-                    formatter.maximumFractionDigits = 2
-                    let kurszielString = formatter.string(from: NSNumber(value: info.kursziel)) ?? String(format: "%.2f", info.kursziel)
+                    let kurszielString = formatBetragDE(info.kursziel)
                     let waehrungAnzeige = (info.waehrung ?? "EUR") == "USD" ? "USD" : "EUR"
                     var resultText = "Kursziel gefunden: \(kurszielString) \(waehrungAnzeige) \(info.quelle.rawValue)"
                     if let sp4 = info.spalte4Durchschnitt {
-                        let sp4String = formatter.string(from: NSNumber(value: sp4)) ?? String(format: "%.2f", sp4)
+                        let sp4String = formatBetragDE(sp4)
                         resultText += " | Spalte 4: \(sp4String)"
                     } else {
                         resultText += " | Spalte 4: –"

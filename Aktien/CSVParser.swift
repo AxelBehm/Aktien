@@ -67,12 +67,18 @@ class CSVParser {
         return parseCSV(from: stripBOMAndNormalize(content))
     }
     
-    /// Format-Fingerabdruck für eine CSV-Datei (Spaltenanzahl der ersten Datenzeile). Zum Abgleich mit gespeichertem Wert pro Bank.
+    /// Format-Fingerabdruck für eine CSV- oder XLSX-Datei (Spaltenanzahl der ersten Datenzeile). Zum Abgleich mit gespeichertem Wert pro Bank.
     static func computeFingerprint(from url: URL) -> String? {
-        guard var content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
-        if content.isEmpty, let latin1 = try? String(contentsOf: url, encoding: .isoLatin1) { content = latin1 }
-        let text = stripBOMAndNormalize(content)
-        let lines = text.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        let text: String?
+        if url.pathExtension.lowercased() == "xlsx" {
+            text = try? csvStyleStringFromXLSX(url: url)
+        } else {
+            var content = try? String(contentsOf: url, encoding: .utf8)
+            if content?.isEmpty ?? true, let latin1 = try? String(contentsOf: url, encoding: .isoLatin1) { content = latin1 }
+            text = content.map { stripBOMAndNormalize($0) }
+        }
+        guard let t = text else { return nil }
+        let lines = t.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
         guard lines.count >= 2 else { return nil }
         let firstLine = lines[0]
         let delimiter = resolveDelimiter(firstLine: firstLine)
@@ -89,16 +95,23 @@ class CSVParser {
     /// firstFailureDiagnostic: Kurzbeschreibung (Feld, gelesener Wert, Grund) für diese Zeile.
     /// filePreview: Erste Zeile (max 120 Zeichen) + Hex der ersten Bytes, für Diagnose bei 0 importierten Zeilen.
     static func parseCSVWithStats(from url: URL) throws -> (aktien: [Aktie], zeilenGesamt: Int, zeilenImportiert: Int, hadKursziele: Bool, firstFailureLine: Int?, firstFailureDiagnostic: String?, filePreview: String?) {
-        let data = try Data(contentsOf: url)
-        var content = String(data: data, encoding: .utf8)
-        if content == nil || content?.isEmpty == true {
-            content = String(data: data, encoding: .isoLatin1)
+        var fileData: Data?
+        let rawText: String
+        if url.pathExtension.lowercased() == "xlsx" {
+            rawText = try csvStyleStringFromXLSX(url: url)
+        } else {
+            let data = try Data(contentsOf: url)
+            fileData = data
+            var content = String(data: data, encoding: .utf8)
+            if content == nil || content?.isEmpty == true {
+                content = String(data: data, encoding: .isoLatin1)
+            }
+            rawText = content ?? ""
         }
-        var text = content ?? ""
-        text = stripBOMAndNormalize(text)
+        let text = stripBOMAndNormalize(rawText)
         let firstLineRaw = text.components(separatedBy: "\n").first ?? ""
         let previewLine = String(firstLineRaw.prefix(120))
-        let hexBytes = data.prefix(24).map { String(format: "%02X", $0) }.joined(separator: " ")
+        let hexBytes = fileData.map { $0.prefix(24).map { String(format: "%02X", $0) }.joined(separator: " ") } ?? "–"
         let filePreview = "Erste Zeile (max 120 Zeichen): \(previewLine)\nErste 24 Bytes (Hex): \(hexBytes) (EF BB BF = BOM)"
         let lines = text.components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
