@@ -9,6 +9,13 @@ import SwiftUI
 import SwiftData
 import Observation
 import UniformTypeIdentifiers
+#if os(iOS)
+import QuickLook
+import UIKit
+extension URL: Identifiable {
+    public var id: String { absoluteString }
+}
+#endif
 #if os(macOS)
 import AppKit
 #endif
@@ -50,8 +57,8 @@ final class UnrealistischConfirmHelper {
     }
 }
 
-/// Gespeichertes manuelles Kursziel für Wiedereinsetzen nach „Alles löschen“ und erneutem Einlesen (Zuordnung über ISIN/WKN)
-private struct SavedManualKursziel: Codable {
+/// Gespeichertes manuelles Kursziel für Wiedereinsetzen nach „Alles löschen“ und erneutem Einlesen (Zuordnung über ISIN/WKN). Von BankStartView für „Alles löschen“ auf der Startseite genutzt.
+struct SavedManualKursziel: Codable {
     var isin: String
     var wkn: String
     var kursziel: Double
@@ -63,14 +70,23 @@ private struct SavedManualKursziel: Codable {
     var kurszielLow: Double?
     var kurszielAnalysten: Int?
 }
-private let savedManualKurszieleUserDefaultsKey = "SavedManualKursziele"
+let savedManualKurszieleUserDefaultsKey = "SavedManualKursziele"
 
-// MARK: - CSV-Spaltenzuordnung (andere Banken)
-private let csvColumnMappingUserDefaultsKey = "CSVColumnMapping"
-private let csvFieldSeparatorUserDefaultsKey = "CSVFieldSeparator"  // "auto" | "semicolon" | "comma" | "tab"
-private let csvDecimalSeparatorUserDefaultsKey = "CSVDecimalSeparator"  // "german" | "english"
+// MARK: - CSV-Spaltenzuordnung (andere Banken, pro Bank über BankStore)
+/// Spaltenbuchstaben wie in Excel: A, B, …, Z, AA, …, AZ (52 Spalten)
+private let csvColumnLetterOptions: [String] = {
+    var r = [""]
+    for i in 0..<52 {
+        if i < 26 {
+            r.append(String(Character(Unicode.Scalar(65 + i)!)))
+        } else {
+            r.append("A" + String(Character(Unicode.Scalar(65 + i - 26)!)))
+        }
+    }
+    return r
+}()
 
-/// Eine Spalte unserer App für die CSV-Zuordnung (Vorgabe links, User gibt rechts den CSV-Header ein)
+/// Eine Spalte unserer App für die CSV-Zuordnung (App-Feld → Spalte A, B, C, …)
 private struct CSVSpaltenField: Identifiable {
     let id: String
     let label: String
@@ -78,7 +94,7 @@ private struct CSVSpaltenField: Identifiable {
 }
 
 private let csvSpaltenFields: [CSVSpaltenField] = [
-    CSVSpaltenField(id: "bankleistungsnummer", label: "Bankleistungsnummer / Depotnummer"),
+    CSVSpaltenField(id: "bankleistungsnummer", label: "Bankleistungsnummer / Depotnummer (ohne Spalte: Fester Wert)"),
     CSVSpaltenField(id: "bestand", label: "Bestand (Stück)"),
     CSVSpaltenField(id: "bezeichnung", label: "Bezeichnung"),
     CSVSpaltenField(id: "wkn", label: "WKN"),
@@ -103,15 +119,54 @@ private let csvSpaltenFields: [CSVSpaltenField] = [
     CSVSpaltenField(id: "kursziel_quelle", label: "Kursziel Quelle (optional)"),
 ]
 
-private func loadCSVColumnMapping() -> [String: String] {
-    guard let data = UserDefaults.standard.data(forKey: csvColumnMappingUserDefaultsKey),
-          let decoded = try? JSONDecoder().decode([String: String].self, from: data) else { return [:] }
-    return decoded
+/// Für „Fester Wert“-Übernahme: String als Double parsen (deutsches Format).
+private func parseDoubleFromFixed(_ s: String) -> Double? {
+    let trimmed = s.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty else { return nil }
+    let formatter = NumberFormatter()
+    formatter.locale = Locale(identifier: "de_DE")
+    formatter.numberStyle = .decimal
+    return formatter.number(from: trimmed)?.doubleValue ?? Double(trimmed.replacingOccurrences(of: ",", with: "."))
 }
 
-private func saveCSVColumnMapping(_ mapping: [String: String]) {
-    guard let data = try? JSONEncoder().encode(mapping) else { return }
-    UserDefaults.standard.set(data, forKey: csvColumnMappingUserDefaultsKey)
+/// Für „Fester Wert“-Übernahme: String als Datum parsen (dd.MM.yyyy).
+private func parseDateFromFixed(_ s: String) -> Date? {
+    let trimmed = s.trimmingCharacters(in: .whitespaces)
+    guard !trimmed.isEmpty else { return nil }
+    let formatter = DateFormatter()
+    formatter.dateFormat = "dd.MM.yyyy"
+    formatter.locale = Locale(identifier: "de_DE")
+    return formatter.date(from: trimmed)
+}
+
+/// Wendet einen festen Zuordnungswert (Feld-ID + String nach „=“) auf eine Aktie an. Gilt für alle Felder mit „Fester Wert“.
+private func applyFixedValueToAktie(_ aktie: Aktie, fieldId: String, fixedValue: String) {
+    switch fieldId {
+    case "bankleistungsnummer": aktie.bankleistungsnummer = fixedValue
+    case "bezeichnung": aktie.bezeichnung = fixedValue
+    case "wkn": aktie.wkn = fixedValue
+    case "isin": aktie.isin = fixedValue
+    case "waehrung": aktie.waehrung = fixedValue.isEmpty ? "EUR" : fixedValue
+    case "hinweisEinstandskurs": aktie.hinweisEinstandskurs = fixedValue
+    case "gattung": aktie.gattung = fixedValue.isEmpty ? "Aktie" : fixedValue
+    case "branche": aktie.branche = fixedValue.isEmpty ? "-" : fixedValue
+    case "risikoklasse": aktie.risikoklasse = fixedValue.isEmpty ? "-" : fixedValue
+    case "depotPortfolioName": aktie.depotPortfolioName = fixedValue
+    case "kursziel_quelle": aktie.kurszielQuelle = fixedValue.isEmpty ? nil : fixedValue
+    case "einstandskurs": aktie.einstandskurs = parseDoubleFromFixed(fixedValue)
+    case "deviseneinstandskurs": aktie.deviseneinstandskurs = parseDoubleFromFixed(fixedValue)
+    case "kurs": aktie.kurs = parseDoubleFromFixed(fixedValue)
+    case "devisenkurs": aktie.devisenkurs = parseDoubleFromFixed(fixedValue)
+    case "gewinnVerlustEUR": aktie.gewinnVerlustEUR = parseDoubleFromFixed(fixedValue)
+    case "gewinnVerlustProzent": aktie.gewinnVerlustProzent = parseDoubleFromFixed(fixedValue)
+    case "marktwertEUR": aktie.marktwertEUR = parseDoubleFromFixed(fixedValue)
+    case "stueckzinsenEUR": aktie.stueckzinsenEUR = parseDoubleFromFixed(fixedValue)
+    case "anteilProzent": aktie.anteilProzent = parseDoubleFromFixed(fixedValue)
+    case "kursziel": aktie.kursziel = parseDoubleFromFixed(fixedValue).flatMap { $0 > 0 ? $0 : nil }
+    case "datumLetzteBewegung": aktie.datumLetzteBewegung = parseDateFromFixed(fixedValue)
+    case "bestand": if let d = parseDoubleFromFixed(fixedValue), d >= 0 { aktie.bestand = d }
+    default: break
+    }
 }
 
 /// Dezimal-TextField, das beim Löschen nicht zittert – speichert erst beim Verlassen des Feldes
@@ -345,15 +400,69 @@ private struct EinlesungenChartView: View {
     }
 }
 
-/// Statistik-Fenster: Einlesestatistik (letzte 10) + Plattform-Zugriffe (FMP, Finanzen.net, Yahoo, OpenAI)
+/// Maximale Anzahl Einlese-Läufe, die gespeichert und in der Statistik angezeigt werden (gesamt, nicht pro BL).
+private let maxAnzahlEinlesungen = 20
+
+/// Statistik-Fenster: Einlesestatistik (letzte N Läufe gesamt) + Plattform-Zugriffe (FMP, Finanzen.net, Yahoo, OpenAI)
 private struct StatistikSheetView: View {
     var summaries: [ImportSummary]
     @Binding var showEinlesungenChart: Bool
-    var onDeleteEinlesung: (ImportSummary) -> Void
+    /// Bei alreadyConfirmed == true direkt löschen (nach „Wirklich löschen? Ja“); sonst Bestätigung in ContentView anzeigen
+    var onDeleteEinlesung: (ImportSummary, _ alreadyConfirmed: Bool) -> Void
+    /// Schließt Statistik und öffnet in ContentView den Dialog „Alles löschen?“ (Löschen merken / nicht merken)
+    var onRequestDeleteAll: () -> Void
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+    @State private var summaryToDelete: ImportSummary?
+    @State private var showDeleteAllConfirm = false
     
-    private var letzteZehn: [ImportSummary] {
-        Array(summaries.prefix(10)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
+    private var letzteEinlesungen: [ImportSummary] {
+        Array(summaries.prefix(maxAnzahlEinlesungen)).sorted(by: { $0.datumAktuelleEinlesung < $1.datumAktuelleEinlesung })
+    }
+    
+    /// Formatierung mit Vorzeichen für Statistik: immer „+1,23“ oder „-1,23“, nie ohne Plus
+    private static func formatVeränderung(_ value: Double) -> String {
+        let vorzeichen = value >= 0 ? "+" : ""
+        return vorzeichen + String(format: "%.2f", value) + " €"
+    }
+    
+    /// Pro Einlesedatum die Summe pro BL und Abweichung zur letzten Einlesung, in der dieselbe BL vorkam (rückwärts suchen, auch wenn dazwischen andere BLs eingelesen wurden)
+    private func einlesungenProDatumUndBL() -> [(summary: ImportSummary, zeilen: [(bl: String, wert: Double, abweichung: Double?)])] {
+        let sorted = letzteEinlesungen
+        var result: [(summary: ImportSummary, zeilen: [(bl: String, wert: Double, abweichung: Double?)])] = []
+        /// Pro BL der zuletzt bekannte Wert (aus beliebigem früheren Lauf), damit Abweichung auch bei dazwischenliegenden anderen BL-Läufen stimmt
+        var lastKnownPerBL: [String: Double] = [:]
+        let trim: (String) -> String = { $0.trimmingCharacters(in: .whitespaces) }
+        
+        for summary in sorted {
+            let snaps: [ImportPositionSnapshot]
+            if let runId = summary.importRunId {
+                let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importRunId == runId })
+                snaps = (try? modelContext.fetch(descriptor)) ?? []
+            } else {
+                let einleseDatum = summary.datumAktuelleEinlesung
+                let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == einleseDatum })
+                snaps = (try? modelContext.fetch(descriptor)) ?? []
+            }
+            var currentPerBL: [String: Double] = [:]
+            for s in snaps {
+                let bl = trim(s.bankleistungsnummer)
+                guard let mw = s.marktwertEUR else { continue }
+                currentPerBL[bl, default: 0] += mw
+            }
+            var zeilen: [(bl: String, wert: Double, abweichung: Double?)] = []
+            for (bl, wert) in currentPerBL.sorted(by: { $0.key < $1.key }) {
+                let lastKnown = lastKnownPerBL[bl]
+                let abw: Double? = lastKnown != nil ? wert - lastKnown! : nil
+                zeilen.append((bl.isEmpty ? "—" : bl, wert, abw))
+            }
+            result.append((summary, zeilen))
+            // Nur die in diesem Lauf vorkommenden BLs aktualisieren; andere BLs behalten ihren letzten Wert für spätere Abweichung
+            for (bl, wert) in currentPerBL {
+                lastKnownPerBL[bl] = wert
+            }
+        }
+        return result
     }
     
     var body: some View {
@@ -366,74 +475,118 @@ private struct StatistikSheetView: View {
                     LabeledContent("OpenAI", value: "\(KurszielService.zugriffeOpenAI)")
                 }
                 Section {
-                    if letzteZehn.isEmpty {
-                        Text("Keine Einlesungen. Nach CSV-Import erscheinen hier die Gesamtsummen (bis zu 10).")
+                    if letzteEinlesungen.isEmpty {
+                        Text("Keine Einlesungen. Nach CSV-Import erscheinen hier pro Datum und BL die Werte sowie die Abweichung zur letzten Einlesung.")
                             .font(.subheadline)
                             .foregroundColor(.secondary)
                     } else {
                         if showEinlesungenChart {
-                            EinlesungenChartView(summaries: letzteZehn)
+                            EinlesungenChartView(summaries: letzteEinlesungen)
                                 .frame(height: 160)
                                 .listRowBackground(Color.clear)
                                 .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
                         }
-                        let ausgangsbasis = letzteZehn.first
-                        ForEach(Array(letzteZehn.enumerated()), id: \.element.importDatum) { _, summary in
-                            HStack(alignment: .top, spacing: 8) {
-                                VStack(alignment: .leading, spacing: 6) {
-                                    Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
-                                        .font(.caption)
-                                        .fontWeight(.medium)
-                                    HStack {
-                                        Text("Gesamtwert:")
-                                            .font(.caption)
-                                            .foregroundColor(.secondary)
-                                        Spacer()
-                                        Text("\(summary.gesamtwertAktuelleEinlesung, specifier: "%.2f") €")
-                                            .font(.caption)
+                        ForEach(Array(einlesungenProDatumUndBL().enumerated()), id: \.element.summary.importDatum) { _, item in
+                            let summary = item.summary
+                            VStack(alignment: .leading, spacing: 8) {
+                                HStack(alignment: .top, spacing: 8) {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened))
+                                            .font(.subheadline)
                                             .fontWeight(.medium)
-                                    }
-                                    if let basis = ausgangsbasis, basis.importDatum != summary.importDatum, basis.gesamtwertAktuelleEinlesung > 0 {
-                                        let differenz = summary.gesamtwertAktuelleEinlesung - basis.gesamtwertAktuelleEinlesung
-                                        HStack {
-                                            Text("Veränderung zur Ausgangsbasis")
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
-                                            Spacer()
-                                            Text("\(differenz >= 0 ? "+" : "")\(differenz, specifier: "%.2f") €")
-                                                .font(.caption2)
-                                                .foregroundColor(differenz >= 0 ? .green : .red)
+                                        ForEach(item.zeilen, id: \.bl) { row in
+                                            VStack(alignment: .leading, spacing: 2) {
+                                                HStack {
+                                                    Text("BL \(row.bl)")
+                                                        .font(.caption)
+                                                        .foregroundColor(.secondary)
+                                                    Spacer()
+                                                    Text(String(format: "%.2f", row.wert) + " €")
+                                                        .font(.caption)
+                                                }
+                                                if let abw = row.abweichung {
+                                                    Text(Self.formatVeränderung(abw))
+                                                        .font(.caption2)
+                                                        .foregroundColor(abw >= 0 ? .green : .red)
+                                                } else {
+                                                    Text("—")
+                                                        .font(.caption2)
+                                                        .foregroundColor(.secondary)
+                                                }
+                                            }
                                         }
                                     }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                                    Button(role: .destructive) {
+                                        summaryToDelete = summary
+                                    } label: {
+                                        Image(systemName: "trash")
+                                            .font(.body)
+                                    }
+                                    .buttonStyle(.borderless)
                                 }
-                                .padding(.vertical, 4)
-                                Button(role: .destructive) {
-                                    onDeleteEinlesung(summary)
-                                    dismiss()
-                                } label: {
-                                    Image(systemName: "trash")
-                                        .font(.body)
-                                }
-                                .buttonStyle(.borderless)
                             }
+                            .padding(.vertical, 6)
                         }
                     }
                 } header: {
-                    Text("Einlesestatistik (letzte 10)")
+                    Text("Einlesestatistik (letzte \(maxAnzahlEinlesungen))")
                 } footer: {
-                    if !letzteZehn.isEmpty {
+                    if !letzteEinlesungen.isEmpty {
+                        Text("Pro Datum/Zeit und BL: Wert der Einlesedatei und Abweichung zur vorherigen Einlesung (gleiche BL).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
                         Button(showEinlesungenChart ? "Chart aus" : "Chart") {
                             showEinlesungenChart.toggle()
                         }
                         .font(.caption)
                     }
                 }
+                Section {
+                    Button(role: .destructive) {
+                        showDeleteAllConfirm = true
+                    } label: {
+                        Label("Alles löschen", systemImage: "trash")
+                    }
+                    Text("Löscht alle Aktien, Einlesungen und Snapshots. Optional: „Löschen und Kursziele merken“ – beim nächsten Import werden gemerkte Kursziele wieder zugeordnet.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                } header: {
+                    Text("Daten")
+                }
             }
-            .navigationTitle("Statistik")
+            .navigationTitle("Statistik · \(BankStore.selectedBank.name)")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Schließen") { dismiss() }
                 }
+            }
+            .confirmationDialog("Wirklich löschen?", isPresented: Binding(
+                get: { summaryToDelete != nil },
+                set: { if !$0 { summaryToDelete = nil } }
+            ), presenting: summaryToDelete) { summary in
+                Button("Ja", role: .destructive) {
+                    onDeleteEinlesung(summary, true)
+                    summaryToDelete = nil
+                    dismiss()
+                }
+                Button("Nein", role: .cancel) {
+                    summaryToDelete = nil
+                }
+            } message: { summary in
+                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) und alle zugehörigen Positionen werden gelöscht.")
+            }
+            .confirmationDialog("Wirklich löschen?", isPresented: $showDeleteAllConfirm) {
+                Button("Ja", role: .destructive) {
+                    showDeleteAllConfirm = false
+                    onRequestDeleteAll()
+                    dismiss()
+                }
+                Button("Nein", role: .cancel) {
+                    showDeleteAllConfirm = false
+                }
+            } message: {
+                Text("Alle Aktien, Einlesungen und Verläufe werden gelöscht. Nach „Ja“ erscheint die Auswahl: mit oder ohne Kursziele merken.")
             }
         }
     }
@@ -596,9 +749,16 @@ struct ContentView: View {
     @State private var showSettings = false
     @State private var showRechtliches = false
     @State private var showWatchlist = false
+    @State private var pendingImportURLs: [URL]? = nil
+    @State private var showFingerprintMismatchAlert = false
+    /// Für Hinweis im Format-Dialog: Spaltenanzahl dieser Datei vs. gespeichert
+    @State private var fingerprintMismatchFileSpalten: String? = nil
+    @State private var fingerprintMismatchStoredSpalten: String? = nil
     @AppStorage(KurszielService.openAIAPIKeyKey) private var openAIAPIKeyStore: String = ""
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
+    /// Wenn an (nur in Einstellungen sichtbar bei Debug-Build): Beim CSV-Import nur 1 Zeile einlesen und Einlesewerte + Satz Deutsche Bank in die Konsole drucken.
+    @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
     @State private var isImportingKurszieleOpenAI = false
     /// Nach CSV-Import: Kurszielermittlung erst starten, wenn der Nutzer den Import-Alert mit OK geschlossen hat (verhindert blockierten OK-Button).
     @State private var pendingKurszielFetchAfterImport = false
@@ -611,7 +771,12 @@ struct ContentView: View {
     /// Beim Anzeigen von „Kursziele ermitteln?“: Zusatzhinweis, wenn CSV bereits Kursziele enthielt
     @State private var lastImportHadCSVKursziele = false
     @State private var unrealistischConfirm = UnrealistischConfirmHelper.shared
-    
+    /// Bereits eingelesene Datei erneut ausgewählt → „Nochmal? Ja/Nein“
+    @State private var showAlreadyImportedConfirm = false
+    @State private var alreadyImportedFilenamesForAlert: [String] = []
+    @State private var pendingURLsForAlreadyImported: [URL]? = nil
+    @State private var alreadyImportedFromStart = false
+
     /// Filter nach Kursziel-Quelle: Aus = alle, sonst nur die gewählte Quelle
     enum KurszielQuelleFilter: String, CaseIterable {
         case aus = "Aus"
@@ -627,8 +792,8 @@ struct ContentView: View {
     @State private var scrollToISINOnKurszieleTab: String? = nil
     /// Beim Wechsel von Kursziele → Aktien: Aktien-Liste zu dieser ISIN scrollen (letzte bearbeitete Zeile)
     @State private var scrollToISINWhenReturningFromKursziele: String? = nil
-    @State private var currentDetailISIN: String? = nil
-    @State private var visibleISINsOnAktienList: Set<String> = []
+    @State private var currentDetailKey: String? = nil
+    @State private var visibleDetailKeysOnAktienList: Set<String> = []
     /// true = Liste nach grösster Differenz Kurs ↔ Kursziel sortieren, mit % zum Ziel
     @State private var sortiereNachAbstandKursziel = false
     /// true = Chart über den 5 Einlesungen (Gesamtwert pro Datum) anzeigen
@@ -639,14 +804,187 @@ struct ContentView: View {
     /// Beim Start kurz Splash anzeigen statt weißen Bildschirm
     @State private var showSplash = true
     /// Auf iPad/Mac: Auswahl für mittlere Spalte im 3-Spalten-Layout (Aktie | Detail | Kursziele)
-    @State private var selectedAktieISINForThreeColumn: String? = nil
+    @State private var selectedAktieKeyForThreeColumn: String? = nil
+    @State private var exportFileURL: URL? = nil
     /// Linke Spalte (Aktienliste) auf iPad/Mac immer sichtbar
     @State private var threeColumnVisibility: NavigationSplitViewVisibility = .all
     @State private var preferredCompactColumn: NavigationSplitViewColumn = .sidebar
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    
+    /// Nur iPad: Hinweis anzeigen, nach „Einlesen“ den Seiten-Wechsel-Button zu betätigen
+    /// iPad: Meldung „Nach dem Einlesen … Seiten-Wechsel-Button“ 3 Sekunden anzeigen, dann Dateiauswahl
+    @State private var showEinlesenHinweis2Sek = false
+
+    #if os(iOS)
+    private var isIPad: Bool { UIDevice.current.userInterfaceIdiom == .pad }
+    #else
+    private var isIPad: Bool { false }
+    #endif
+
     /// iPad (regular) / Mac: 3-Spalten-Layout; iPhone / schmale iPad: Tabs
     private var useThreeColumnLayout: Bool { horizontalSizeClass == .regular }
+    
+    /// Eindeutiger Schlüssel pro Position (BL|ISIN|WKN – ISIN kann leer sein, wenn nicht in CSV)
+    private func detailKey(bl: String, isin: String, wkn: String) -> String { "\(bl)|\(isin)|\(wkn)" }
+    private func parseDetailKey(_ key: String) -> (bl: String, isin: String, wkn: String)? {
+        let parts = key.split(separator: "|", omittingEmptySubsequences: false)
+        guard parts.count >= 2 else { return nil }
+        let bl = String(parts[0])
+        let isin = String(parts[1])
+        let wkn = parts.count >= 3 ? String(parts[2]) : ""
+        return (bl, isin, wkn)
+    }
+    private func aktieForDetailKey(_ key: String) -> Aktie? {
+        guard let (bl, isin, wkn) = parseDetailKey(key) else { return nil }
+        return aktien.first(where: { a in
+            guard a.bankleistungsnummer == bl else { return false }
+            if !isin.isEmpty { return a.isin == isin }
+            return a.wkn == wkn
+        })
+    }
+
+    /// CSV-Zelle escapen (Semikolon/Anführungszeichen in Anführungszeichen, innere " verdoppeln)
+    private static func csvEscape(_ s: String) -> String {
+        let t = s.trimmingCharacters(in: .whitespaces)
+        if t.contains(";") || t.contains("\"") || t.contains("\n") || t.contains("\r") {
+            return "\"" + t.replacingOccurrences(of: "\"", with: "\"\"") + "\""
+        }
+        return t
+    }
+    
+    /// Aktien als CSV-String (Semikolon-getrennt, mit Kursziel)
+    private func buildExportCSV() -> String {
+        buildExportCSVFrom(aktien: aktien)
+    }
+    
+    /// CSV aus gegebener Aktienliste bauen (für Export im Hintergrund)
+    private func buildExportCSVFrom(aktien list: [Aktie]) -> String {
+        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Einstandskurs;Kurs;Marktwert_EUR;Kursziel;Kursziel_Waehrung;Kursziel_Datum;Kursziel_Quelle"
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "de_DE")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 4
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "dd.MM.yyyy"
+        dateFormatter.locale = Locale(identifier: "de_DE")
+        var rows: [String] = [header]
+        for a in list {
+            let bez = Self.csvEscape(a.bezeichnung)
+            let bl = Self.csvEscape(a.bankleistungsnummer)
+            let wkn = Self.csvEscape(a.wkn)
+            let isin = Self.csvEscape(a.isin)
+            let bestand = formatter.string(from: NSNumber(value: a.bestand)) ?? "\(a.bestand)"
+            let waehrung = Self.csvEscape(a.waehrung)
+            let einstand = a.einstandskurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kurs = a.kurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let marktwert = a.marktwertEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kursziel = a.kursziel.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kzWaehrung = (a.kurszielWaehrung ?? "").trimmingCharacters(in: .whitespaces)
+            let kzW = Self.csvEscape(kzWaehrung)
+            let kzDatum = a.kurszielDatum.map { dateFormatter.string(from: $0) } ?? ""
+            let kzQuelle = Self.csvEscape(a.kurszielQuelle ?? "")
+            rows.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(einstand);\(kurs);\(marktwert);\(kursziel);\(kzW);\(kzDatum);\(kzQuelle)")
+        }
+        return rows.joined(separator: "\n")
+    }
+    
+    @State private var isExportingCSV = false
+    
+    /// Eine Zeile Rohdaten für CSV-Export (nur Werttypen, Hintergrund-thread-sicher)
+    private struct ExportRow {
+        let bl: String
+        let bezeichnung: String
+        let wkn: String
+        let isin: String
+        let bestand: Double
+        let waehrung: String
+        let einstandskurs: Double?
+        let kurs: Double?
+        let marktwertEUR: Double?
+        let kursziel: Double?
+        let kurszielWaehrung: String
+        let kurszielDatum: Date?
+        let kurszielQuelle: String
+    }
+    
+    private func exportAktienToCSV() {
+        guard !isExportingCSV else { return }
+        isExportingCSV = true
+        let rows = aktien.map { a in
+            ExportRow(
+                bl: a.bankleistungsnummer,
+                bezeichnung: a.bezeichnung,
+                wkn: a.wkn,
+                isin: a.isin,
+                bestand: a.bestand,
+                waehrung: a.waehrung,
+                einstandskurs: a.einstandskurs,
+                kurs: a.kurs ?? a.devisenkurs,
+                marktwertEUR: a.marktwertEUR,
+                kursziel: a.kursziel,
+                kurszielWaehrung: a.kurszielWaehrung ?? "",
+                kurszielDatum: a.kurszielDatum,
+                kurszielQuelle: a.kurszielQuelle ?? ""
+            )
+        }
+        Task { @MainActor in
+            let result = await Task.detached(priority: .userInitiated) {
+                let csv = Self.buildCSVFromExportRows(rows)
+                let df = DateFormatter()
+                df.dateFormat = "yyyy-MM-dd_HH-mm"
+                df.locale = Locale(identifier: "de_DE")
+                let dateStr = df.string(from: Date())
+                let fileName = "Aktien_Export_\(dateStr).csv"
+                let tempDir = FileManager.default.temporaryDirectory
+                let fileURL = tempDir.appendingPathComponent(fileName)
+                do {
+                    try csv.write(to: fileURL, atomically: true, encoding: .utf8)
+                    return Result<URL, Error>.success(fileURL)
+                } catch {
+                    return Result<URL, Error>.failure(error)
+                }
+            }.value
+            switch result {
+            case .success(let url):
+                exportFileURL = url
+            case .failure(let error):
+                importMessage = "Export fehlgeschlagen: \(error.localizedDescription)"
+                showImportMessage = true
+            }
+            isExportingCSV = false
+        }
+    }
+    
+    /// CSV-String aus Rohzeilen bauen (läuft komplett im Hintergrund)
+    private static func buildCSVFromExportRows(_ rows: [ExportRow]) -> String {
+        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Einstandskurs;Kurs;Marktwert_EUR;Kursziel;Kursziel_Waehrung;Kursziel_Datum;Kursziel_Quelle"
+        let formatter = NumberFormatter()
+        formatter.locale = Locale(identifier: "de_DE")
+        formatter.numberStyle = .decimal
+        formatter.minimumFractionDigits = 0
+        formatter.maximumFractionDigits = 4
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateFormat = "dd.MM.yyyy"
+        dateFormatter.locale = Locale(identifier: "de_DE")
+        var lines = [header]
+        for a in rows {
+            let bez = Self.csvEscape(a.bezeichnung)
+            let bl = Self.csvEscape(a.bl)
+            let wkn = Self.csvEscape(a.wkn)
+            let isin = Self.csvEscape(a.isin)
+            let bestand = formatter.string(from: NSNumber(value: a.bestand)) ?? "\(a.bestand)"
+            let waehrung = Self.csvEscape(a.waehrung)
+            let einstand = a.einstandskurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kurs = a.kurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let marktwert = a.marktwertEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kursziel = a.kursziel.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kzW = Self.csvEscape(a.kurszielWaehrung)
+            let kzDatum = a.kurszielDatum.map { dateFormatter.string(from: $0) } ?? ""
+            let kzQuelle = Self.csvEscape(a.kurszielQuelle)
+            lines.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(einstand);\(kurs);\(marktwert);\(kursziel);\(kzW);\(kzDatum);\(kzQuelle)")
+        }
+        return lines.joined(separator: "\n")
+    }
     
     /// Gefilterte Aktien nach gewählter Kursziel-Quelle, optional nur unrealistische
     private var aktienZurAnzeige: [Aktie] {
@@ -725,13 +1063,18 @@ struct ContentView: View {
                             .foregroundColor(.purple)
                     }
                 }
-                // Zeile 1: Bestand + Anzahl, Marktwert + Wert (gekürzte Labels)
+                // Zeile 1: Bestand + Anzahl, Marktwert + Wert (gekürzte Labels). Marktwert aus CSV oder berechnet (Kurs × Bestand).
                 HStack(spacing: 12) {
                     Text("Stück \(aktie.bestand, specifier: "%.0f")")
                         .font(.caption)
                         .foregroundColor(.secondary)
                     if let mw = aktie.marktwertEUR {
                         Text("Marktw. \(mw, specifier: "%.2f") €")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    } else if let k = aktie.kurs ?? aktie.devisenkurs, aktie.bestand > 0 {
+                        let computed = k * aktie.bestand
+                        Text("Marktw. \(computed, specifier: "%.2f") €")
                             .font(.caption)
                             .foregroundColor(.secondary)
                     }
@@ -764,8 +1107,8 @@ struct ContentView: View {
                             .foregroundColor(pct >= 0 ? .green : .red)
                     }
                 }
-                // Zeile 4: Kursziel, Abstand zum Kursziel + Mini-Balken Kurs → Kursziel (immer anzeigen wenn vorhanden)
-                if let kurs = aktie.kurs ?? aktie.devisenkurs, let kz = aktie.kursziel, kurs > 0 {
+                // Zeile 4: Kursziel, Abstand zum Kursziel + Mini-Balken (Kurs/devisenkurs → Kursziel)
+                if let kurs = (aktie.kurs ?? aktie.devisenkurs).flatMap({ $0 > 0 ? $0 : nil }), let kz = aktie.kursziel {
                     let abstandPct = (kz - kurs) / kurs * 100
                     VStack(alignment: .leading, spacing: 4) {
                         HStack(spacing: 12) {
@@ -805,7 +1148,7 @@ struct ContentView: View {
         Binding(
             get: { selectedTab },
             set: { new in
-                if new == 1, currentDetailISIN == nil {
+                if new == 1, currentDetailKey == nil {
                     return
                 }
                 selectedTab = new
@@ -823,11 +1166,11 @@ struct ContentView: View {
                         aktienListContent(proxy: proxy)
                             .onChange(of: selectedTab) { _, new in
                                 if new == 0 {
-                                    let isin = scrollToISINWhenReturningFromKursziele ?? scrollToISIN
+                                    let key = scrollToISINWhenReturningFromKursziele ?? scrollToISIN
                                     scrollToISINWhenReturningFromKursziele = nil
-                                    if let isin = isin {
+                                    if let key = key {
                                         DispatchQueue.main.async {
-                                            proxy.scrollTo(isin, anchor: .center)
+                                            proxy.scrollTo(key, anchor: .center)
                                             scrollToISIN = nil
                                         }
                                     }
@@ -835,9 +1178,9 @@ struct ContentView: View {
                             }
                     }
                 }
-                .navigationDestination(for: String.self) { isin in
-                    if let aktie = aktien.first(where: { $0.isin == isin }) {
-                        AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+                .navigationDestination(for: String.self) { key in
+                    if let aktie = aktieForDetailKey(key) {
+                        AktieDetailView(aktie: aktie, onAppearISIN: { _ in currentDetailKey = key })
                     }
                 }
             }
@@ -846,7 +1189,7 @@ struct ContentView: View {
             #elseif os(iOS)
             .navigationSplitViewColumnWidth(min: 320, ideal: 420)
             #endif
-            .navigationTitle("Aktien")
+            .navigationTitle("Aktien · \(BankStore.selectedBank.name)")
             .toolbar { aktienToolbarContent }
             .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
                 Button("Löschen und Kursziele merken", role: .destructive) { saveManualKurszieleAndDeleteAll() }
@@ -863,17 +1206,46 @@ struct ContentView: View {
                     Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht.")
                 }
             }
-            .confirmationDialog("Einlesung löschen?", isPresented: $showDeleteEinlesungConfirmation, presenting: einlesungToDelete) { summary in
-                Button("Löschen", role: .destructive) {
+            .confirmationDialog("Wirklich löschen?", isPresented: $showDeleteEinlesungConfirmation, presenting: einlesungToDelete) { summary in
+                Button("Ja", role: .destructive) {
                     deleteEinlesung(summary)
                     einlesungToDelete = nil
                 }
-                Button("Abbrechen", role: .cancel) { einlesungToDelete = nil }
+                Button("Nein", role: .cancel) { einlesungToDelete = nil }
             } message: { summary in
-                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) löschen? Alle Aktien und Summen für diesen Tag werden aus den Tabellen entfernt.")
+                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) und alle zugehörigen Positionen werden gelöscht.")
             }
             .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
                 handleFileImport(result: result)
+            }
+            .confirmationDialog("Anderes CSV-Format", isPresented: $showFingerprintMismatchAlert) {
+                Button("Abbrechen", role: .cancel) {
+                    pendingImportURLs = nil
+                    showFingerprintMismatchAlert = false
+                    isImporting = false
+                    clearPendingKurszielAfterImport()
+                }
+                Button("Trotzdem einlesen") {
+                    if let urls = pendingImportURLs {
+                        importMultipleCSVFiles(urls: urls)
+                    }
+                    pendingImportURLs = nil
+                    showFingerprintMismatchAlert = false
+                }
+            } message: {
+                let bankName = BankStore.selectedBank.name
+                let fileSp = fingerprintMismatchFileSpalten ?? "?"
+                let storedSp = fingerprintMismatchStoredSpalten ?? "?"
+                Text("Die Datei hat eine andere Spaltenanzahl als beim letzten Einlesen für \(bankName): diese Datei \(fileSp) Spalten, zuletzt \(storedSp) Spalten. Unter Einstellungen → \(bankName) → Spalten zuordnen prüfen: Welche Spalte (A, B, C, …) welchem Feld zugeordnet ist. Bankleistungsnummer kann „Fester Wert“ (z. B. = Ihre Kontonummer oder 1) sein, wenn die CSV keine hat. Nur einlesen, wenn es der richtige Export ist.")
+            }
+            .confirmationDialog("Bereits eingelesen", isPresented: $showAlreadyImportedConfirm) {
+                Button("Ja, nochmal einlesen") { proceedWithPendingAlreadyImportedURLs() }
+                Button("Nein", role: .cancel) {
+                    pendingURLsForAlreadyImported = nil
+                    showAlreadyImportedConfirm = false
+                }
+            } message: {
+                Text("Folgende Datei(en) wurden bereits eingelesen: \(alreadyImportedFilenamesForAlert.joined(separator: ", ")). Nochmal einlesen?")
             }
             .alert("Import", isPresented: $showImportMessage) {
                 Button("OK", role: .cancel) {
@@ -884,6 +1256,8 @@ struct ContentView: View {
                     } else if showKurszielAbfrageBeiAltemDatum {
                         showKurszielAbfrageBeiAltemDatum = false
                         showKurszielAbfrageAlert = true
+                    } else {
+                        NotificationCenter.default.post(name: .returnToStartAfterImport, object: nil)
                     }
                 }
             } message: { Text(importMessage) }
@@ -914,11 +1288,23 @@ struct ContentView: View {
             .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
             .sheet(isPresented: $showWatchlist) { WatchlistView() }
             .sheet(isPresented: $showStatistik) {
-                StatistikSheetView(summaries: importSummaries, showEinlesungenChart: $showEinlesungenChart, onDeleteEinlesung: { summary in
-                    einlesungToDelete = summary
-                    showDeleteEinlesungConfirmation = true
+                StatistikSheetView(summaries: importSummaries, showEinlesungenChart: $showEinlesungenChart, onDeleteEinlesung: { summary, alreadyConfirmed in
+                    if alreadyConfirmed {
+                        deleteEinlesung(summary)
+                    } else {
+                        einlesungToDelete = summary
+                        showDeleteEinlesungConfirmation = true
+                        showStatistik = false
+                    }
+                }, onRequestDeleteAll: {
                     showStatistik = false
+                    showDeleteConfirmation = true
                 })
+            }
+            .sheet(item: $exportFileURL, onDismiss: { exportFileURL = nil }) { url in
+                ExportCSVShareSheet(fileURL: url) {
+                    exportFileURL = nil
+                }
             }
         } detail: {
             Text("Aktie auswählen")
@@ -932,7 +1318,7 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 DevisenkursKopfView(usdToEur: appWechselkurse.usdToEur, gbpToEur: appWechselkurse.gbpToEur, isLoading: appWechselkurse.isLoading)
                 ScrollViewReader { proxy in
-                    aktienListContent(proxy: proxy, selectionForThreeColumn: $selectedAktieISINForThreeColumn)
+                    aktienListContent(proxy: proxy, selectionForThreeColumn: $selectedAktieKeyForThreeColumn)
                 }
             }
             #if os(macOS)
@@ -940,7 +1326,7 @@ struct ContentView: View {
             #elseif os(iOS)
             .navigationSplitViewColumnWidth(min: 280, ideal: 360)
             #endif
-            .navigationTitle("Aktien")
+            .navigationTitle("Aktien · \(BankStore.selectedBank.name)")
             .toolbar { aktienToolbarContent }
             .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
                 Button("Löschen und Kursziele merken", role: .destructive) { saveManualKurszieleAndDeleteAll() }
@@ -957,17 +1343,46 @@ struct ContentView: View {
                     Text("Alle \(aktien.count) Aktien werden unwiderruflich gelöscht.")
                 }
             }
-            .confirmationDialog("Einlesung löschen?", isPresented: $showDeleteEinlesungConfirmation, presenting: einlesungToDelete) { summary in
-                Button("Löschen", role: .destructive) {
+            .confirmationDialog("Wirklich löschen?", isPresented: $showDeleteEinlesungConfirmation, presenting: einlesungToDelete) { summary in
+                Button("Ja", role: .destructive) {
                     deleteEinlesung(summary)
                     einlesungToDelete = nil
                 }
-                Button("Abbrechen", role: .cancel) { einlesungToDelete = nil }
+                Button("Nein", role: .cancel) { einlesungToDelete = nil }
             } message: { summary in
-                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) löschen? Alle Aktien und Summen für diesen Tag werden aus den Tabellen entfernt.")
+                Text("Einlesung vom \(summary.datumAktuelleEinlesung.formatted(date: .abbreviated, time: .shortened)) und alle zugehörigen Positionen werden gelöscht.")
             }
             .fileImporter(isPresented: $isImporting, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: true) { result in
                 handleFileImport(result: result)
+            }
+            .confirmationDialog("Anderes CSV-Format", isPresented: $showFingerprintMismatchAlert) {
+                Button("Abbrechen", role: .cancel) {
+                    pendingImportURLs = nil
+                    showFingerprintMismatchAlert = false
+                    isImporting = false
+                    clearPendingKurszielAfterImport()
+                }
+                Button("Trotzdem einlesen") {
+                    if let urls = pendingImportURLs {
+                        importMultipleCSVFiles(urls: urls)
+                    }
+                    pendingImportURLs = nil
+                    showFingerprintMismatchAlert = false
+                }
+            } message: {
+                let bankName = BankStore.selectedBank.name
+                let fileSp = fingerprintMismatchFileSpalten ?? "?"
+                let storedSp = fingerprintMismatchStoredSpalten ?? "?"
+                Text("Die Datei hat eine andere Spaltenanzahl als beim letzten Einlesen für \(bankName): diese Datei \(fileSp) Spalten, zuletzt \(storedSp) Spalten. Unter Einstellungen → \(bankName) → Spalten zuordnen prüfen: Welche Spalte (A, B, C, …) welchem Feld zugeordnet ist. Bankleistungsnummer kann „Fester Wert“ (z. B. = Ihre Kontonummer oder 1) sein, wenn die CSV keine hat. Nur einlesen, wenn es der richtige Export ist.")
+            }
+            .confirmationDialog("Bereits eingelesen", isPresented: $showAlreadyImportedConfirm) {
+                Button("Ja, nochmal einlesen") { proceedWithPendingAlreadyImportedURLs() }
+                Button("Nein", role: .cancel) {
+                    pendingURLsForAlreadyImported = nil
+                    showAlreadyImportedConfirm = false
+                }
+            } message: {
+                Text("Folgende Datei(en) wurden bereits eingelesen: \(alreadyImportedFilenamesForAlert.joined(separator: ", ")). Nochmal einlesen?")
             }
             .alert("Import", isPresented: $showImportMessage) {
                 Button("OK", role: .cancel) {
@@ -978,6 +1393,8 @@ struct ContentView: View {
                     } else if showKurszielAbfrageBeiAltemDatum {
                         showKurszielAbfrageBeiAltemDatum = false
                         showKurszielAbfrageAlert = true
+                    } else {
+                        NotificationCenter.default.post(name: .returnToStartAfterImport, object: nil)
                     }
                 }
             } message: { Text(importMessage) }
@@ -1008,20 +1425,35 @@ struct ContentView: View {
             .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
             .sheet(isPresented: $showWatchlist) { WatchlistView() }
             .sheet(isPresented: $showStatistik) {
-                StatistikSheetView(summaries: importSummaries, showEinlesungenChart: $showEinlesungenChart, onDeleteEinlesung: { summary in
-                    einlesungToDelete = summary
-                    showDeleteEinlesungConfirmation = true
+                StatistikSheetView(summaries: importSummaries, showEinlesungenChart: $showEinlesungenChart, onDeleteEinlesung: { summary, alreadyConfirmed in
+                    if alreadyConfirmed {
+                        deleteEinlesung(summary)
+                    } else {
+                        einlesungToDelete = summary
+                        showDeleteEinlesungConfirmation = true
+                        showStatistik = false
+                    }
+                }, onRequestDeleteAll: {
                     showStatistik = false
+                    showDeleteConfirmation = true
                 })
+            }
+            .sheet(item: $exportFileURL, onDismiss: { exportFileURL = nil }) { url in
+                ExportCSVShareSheet(fileURL: url) {
+                    exportFileURL = nil
+                }
             }
         } content: {
             Group {
-                if let isin = selectedAktieISINForThreeColumn, let aktie = aktien.first(where: { $0.isin == isin }) {
-                    AktieDetailView(aktie: aktie, onAppearISIN: { currentDetailISIN = $0 })
+                if let key = selectedAktieKeyForThreeColumn, let aktie = aktieForDetailKey(key) {
+                    AktieDetailView(aktie: aktie, onAppearISIN: { _ in currentDetailKey = key })
                 } else {
                     Text("Aktie wählen")
                         .foregroundStyle(.secondary)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        #if os(iOS)
+                        .background(Color(uiColor: .secondarySystemGroupedBackground))
+                        #endif
                 }
             }
             #if os(macOS)
@@ -1029,73 +1461,77 @@ struct ContentView: View {
             #elseif os(iOS)
             .navigationSplitViewColumnWidth(min: 300, ideal: 400)
             #endif
-            .navigationTitle("Detail")
+            .navigationTitle("Detail · \(BankStore.selectedBank.name)")
         } detail: {
-            KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: selectedAktieISINForThreeColumn ?? currentDetailISIN, onCopyISIN: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailISIN = $0 })
-                .onChange(of: selectedAktieISINForThreeColumn) { _, isin in
-                    if let isin = isin, !isin.isEmpty { scrollToISINOnKurszieleTab = isin }
+            KurszielListenView(aktien: aktienZurAnzeige, scrollToDetailKey: $scrollToISINOnKurszieleTab, markedDetailKey: selectedAktieKeyForThreeColumn ?? currentDetailKey, onCopyDetailKey: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailKey = $0 })
+                .onChange(of: selectedAktieKeyForThreeColumn) { _, key in
+                    if let key = key, !key.isEmpty { scrollToISINOnKurszieleTab = key }
                 }
                 #if os(macOS)
                 .navigationSplitViewColumnWidth(min: 320, ideal: 440, max: 700)
                 #elseif os(iOS)
                 .navigationSplitViewColumnWidth(min: 300, ideal: 400)
                 #endif
-                .navigationTitle("Kursziele")
+                .navigationTitle("Kursziele · \(BankStore.selectedBank.name)")
         }
         .navigationSplitViewStyle(.balanced)
     }
 
     @ToolbarContentBuilder
     private var aktienToolbarContent: some ToolbarContent {
+        Group {
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button {
+                    StartState.shared.hasStarted = false
+                } label: {
+                    Label("Startseite", systemImage: "house.fill")
+                }
+            }
+            ToolbarItem(placement: .navigationBarLeading) {
+                Button(role: .destructive) {
+                    StartState.shared.requestAuthOnNextStart()
+                } label: {
+                    Label("App beenden", systemImage: "lock.fill")
+                }
+            }
+        }
         #if os(iOS)
         ToolbarItem(placement: .navigationBarTrailing) {
             Button("Rechtliches") { showRechtliches = true }
         }
         #endif
-        ToolbarItem {
-            Button(action: { sortiereNachAbstandKursziel.toggle() }) {
-                Label(sortiereNachAbstandKursziel ? "Sortierung: Standard" : "Nach Abstand zum Kursziel", systemImage: sortiereNachAbstandKursziel ? "list.bullet" : "chart.line.uptrend.xyaxis")
-            }
-        }
-        ToolbarItem {
-            Button(action: { showWatchlist = true }) { Label("Watchlist", systemImage: "eye") }
-        }
-        ToolbarItem {
-            Button(action: importCSVFiles) { Label("CSV importieren", systemImage: "doc.badge.plus") }
-        }
-        ToolbarItem {
-            Button(role: .destructive, action: { showDeleteConfirmation = true }) {
-                Label("Alles löschen", systemImage: "trash")
-            }
-            .disabled(aktien.isEmpty)
-        }
-        ToolbarItem {
-            Button(action: { showSettings = true }) { Label("Einstellungen", systemImage: "gear") }
-        }
-        ToolbarItem {
-            Button(action: { showStatistik = true }) { Label("Statistik", systemImage: "chart.bar.doc.horizontal") }
-        }
-        ToolbarItem {
-            Button(action: {
-                #if os(iOS)
-                if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
-                    let kandidaten = KurszielService.slugKandidaten(from: clipboard)
-                    let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
-                    if !slug.isEmpty { testWKN = "https://www.finanzen.net/kursziele/\(slug)" }
+        Group {
+            ToolbarItem {
+                Button(action: { sortiereNachAbstandKursziel.toggle() }) {
+                    Label(sortiereNachAbstandKursziel ? "Sortierung: Standard" : "Nach Abstand zum Kursziel", systemImage: sortiereNachAbstandKursziel ? "list.bullet" : "chart.line.uptrend.xyaxis")
                 }
-                #elseif os(macOS)
-                if let clipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
-                    let kandidaten = KurszielService.slugKandidaten(from: clipboard)
-                    let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
-                    if !slug.isEmpty { testWKN = "https://www.finanzen.net/kursziele/\(slug)" }
+            }
+            ToolbarItem {
+                Button(action: { showWatchlist = true }) { Label("Watchlist", systemImage: "eye") }
+            }
+            ToolbarItem {
+                Button(action: { showStatistik = true }) { Label("Statistik", systemImage: "chart.bar.doc.horizontal") }
+            }
+            ToolbarItem {
+                Button(action: { startKurszielErmittlungManuell() }) {
+                    Label("Kursziele ermitteln", systemImage: "arrow.clockwise.circle")
                 }
-                #endif
-                if testWKN.isEmpty { testWKN = "https://www.finanzen.net/kursziele/rheinmetall" }
-                showWKNTester = true
-            }) { Label("WKN testen", systemImage: "magnifyingglass") }
-        }
-        ToolbarItem {
-            Button(action: { showDebugLog = true }) { Label("Debug-Log", systemImage: "ladybug") }
+                .disabled(isImportingKursziele || aktien.isEmpty)
+            }
+            ToolbarItem {
+                Button(action: { exportAktienToCSV() }) {
+                    if isExportingCSV {
+                        ProgressView()
+                            .scaleEffect(0.8)
+                    } else {
+                        Label("CSV exportieren", systemImage: "square.and.arrow.up")
+                    }
+                }
+                .disabled(aktien.isEmpty || isExportingCSV)
+            }
+            ToolbarItem {
+                Button(action: { showDebugLog = true }) { Label("Debug-Log", systemImage: "ladybug") }
+            }
         }
     }
 
@@ -1169,7 +1605,7 @@ struct ContentView: View {
                     Section {
                         ForEach(aktienSortiertNachAbstandKursziel) { aktie in
                             Button {
-                                if let sel = selectionForThreeColumn { sel.wrappedValue = aktie.isin } else { aktienDetailPath.append(aktie.isin) }
+                                if let sel = selectionForThreeColumn { sel.wrappedValue = detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn) } else { aktienDetailPath.append(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
                             } label: {
                                 HStack {
                                     aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: true)
@@ -1191,9 +1627,9 @@ struct ContentView: View {
                             }
                             .buttonStyle(.plain)
                             .transaction { t in t.animation = .easeOut(duration: 0.22) }
-                            .id(aktie.isin)
-                            .onAppear { visibleISINsOnAktienList.insert(aktie.isin) }
-                            .onDisappear { visibleISINsOnAktienList.remove(aktie.isin) }
+                            .id(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn))
+                            .onAppear { visibleDetailKeysOnAktienList.insert(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
+                            .onDisappear { visibleDetailKeysOnAktienList.remove(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
                         }
                     } header: {
                         Text("Nach Abstand zum Kursziel (grösste Differenz zuerst)")
@@ -1209,7 +1645,7 @@ struct ContentView: View {
                         Section {
                             ForEach(group.aktien) { aktie in
                                 Button {
-                                    if let sel = selectionForThreeColumn { sel.wrappedValue = aktie.isin } else { aktienDetailPath.append(aktie.isin) }
+                                    if let sel = selectionForThreeColumn { sel.wrappedValue = detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn) } else { aktienDetailPath.append(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
                                 } label: {
                                     HStack {
                                         aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: false)
@@ -1231,9 +1667,9 @@ struct ContentView: View {
                                 }
                                 .buttonStyle(.plain)
                                 .transaction { t in t.animation = .easeOut(duration: 0.22) }
-                                .id(aktie.isin)
-                                .onAppear { visibleISINsOnAktienList.insert(aktie.isin) }
-                                .onDisappear { visibleISINsOnAktienList.remove(aktie.isin) }
+                                .id(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn))
+                                .onAppear { visibleDetailKeysOnAktienList.insert(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
+                                .onDisappear { visibleDetailKeysOnAktienList.remove(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
                             }
                             .onDelete { offsets in
                                 deleteAktienInGroup(group.aktien, offsets: offsets)
@@ -1273,17 +1709,51 @@ struct ContentView: View {
     }
 
     var body: some View {
-        ZStack {
+        ZStack(alignment: .top) {
             contentView
             if showSplash {
                 splashOverlay
             }
+            if isIPad, showEinlesenHinweis2Sek {
+                Color.black.opacity(0.4)
+                    .ignoresSafeArea()
+                VStack(spacing: 16) {
+                    Text("Nach dem Einlesen bitte den Seiten-Wechsel-Button betätigen, um die Ergebnisse zu sehen.")
+                        .font(.body)
+                        .fontWeight(.medium)
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.primary)
+                        .padding(.horizontal, 32)
+                        .padding(.vertical, 24)
+                        .background(.regularMaterial)
+                        .cornerRadius(16)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .transition(.opacity)
+            }
         }
         .animation(.easeOut(duration: 0.25), value: showSplash)
+        .animation(.easeOut(duration: 0.2), value: showEinlesenHinweis2Sek)
         .onAppear {
             // Kurz Splash zeigen, damit nie nur ein weißes Bild erscheint
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                 showSplash = false
+            }
+            // Von Startseite: Dateien bereits gewählt → sofort Fingerprint/Import verarbeiten (Picker war dort geöffnet)
+            if let urls = StartState.shared.pendingImportURLsFromStart {
+                StartState.shared.pendingImportURLsFromStart = nil
+                applyImportURLsFromStart(urls)
+            } else {
+                // Mit „Start“ gekommen: Aktienliste anzeigen (Sidebar), keine Detailseite – sonst erscheint nur „Aktie wählen“
+                selectedAktieKeyForThreeColumn = nil
+                aktienDetailPath = []
+                preferredCompactColumn = .sidebar
+                threeColumnVisibility = .all
+                // Einmal im nächsten Run-Loop wiederholen, damit das Split-View die Sidebar anzeigt (iPad)
+                DispatchQueue.main.async {
+                    preferredCompactColumn = .sidebar
+                    threeColumnVisibility = .all
+                }
             }
         }
     }
@@ -1327,13 +1797,13 @@ struct ContentView: View {
                         }
 
                     NavigationStack {
-                        KurszielListenView(aktien: aktienZurAnzeige, scrollToISIN: $scrollToISINOnKurszieleTab, markedISIN: currentDetailISIN, onCopyISIN: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailISIN = $0 })
+                        KurszielListenView(aktien: aktienZurAnzeige, scrollToDetailKey: $scrollToISINOnKurszieleTab, markedDetailKey: currentDetailKey, onCopyDetailKey: { scrollToISIN = $0 }, onRowEdited: { scrollToISINWhenReturningFromKursziele = $0 }, onKurszielSuchenTapped: { currentDetailKey = $0 })
                     }
                     .tabItem { Label("Kursziele", systemImage: "target") }
                     .tag(1)
                     .onChange(of: selectedTab) { _, new in
                         if new == 1 {
-                            scrollToISINOnKurszieleTab = currentDetailISIN ?? gruppierteAktien.flatMap(\.aktien).first(where: { visibleISINsOnAktienList.contains($0.isin) })?.isin
+                            scrollToISINOnKurszieleTab = currentDetailKey ?? gruppierteAktien.flatMap(\.aktien).first(where: { visibleDetailKeysOnAktienList.contains(detailKey(bl: $0.bankleistungsnummer, isin: $0.isin, wkn: $0.wkn)) }).map { detailKey(bl: $0.bankleistungsnummer, isin: $0.isin, wkn: $0.wkn) }
                         }
                     }
                 }
@@ -1419,67 +1889,270 @@ struct ContentView: View {
         isImporting = true
     }
     
+    /// Prüft, ob mindestens ein gewählter Dateiname in der Einlese-Merkliste ist. Wenn ja: Dialog „Nochmal?“; sonst proceed().
+    private func ifNotAlreadyImported(urls: [URL], fromStart: Bool, proceed: @escaping () -> Void) {
+        let namen = urls.map { $0.lastPathComponent }
+        let gespeichert = Set(BankStore.eingeleseneDateinamen())
+        let treffer = namen.filter { gespeichert.contains($0) }
+        if !treffer.isEmpty {
+            alreadyImportedFilenamesForAlert = treffer
+            pendingURLsForAlreadyImported = urls
+            alreadyImportedFromStart = fromStart
+            showAlreadyImportedConfirm = true
+        } else {
+            proceed()
+        }
+    }
+
+    /// Nach „Ja“ im Dialog „Bereits eingelesen – Nochmal?“: Import mit den zwischengespeicherten URLs starten.
+    private func proceedWithPendingAlreadyImportedURLs() {
+        guard let urls = pendingURLsForAlreadyImported else { return }
+        pendingURLsForAlreadyImported = nil
+        showAlreadyImportedConfirm = false
+        if alreadyImportedFromStart {
+            guard let first = urls.first else { return }
+            DispatchQueue.main.async { [urls] in
+                let fingerprint = CSVParser.computeFingerprint(from: first)
+                let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
+                if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
+                    clearPendingKurszielAfterImport()
+                    pendingImportURLs = urls
+                    fingerprintMismatchFileSpalten = fp
+                    fingerprintMismatchStoredSpalten = st
+                    showFingerprintMismatchAlert = true
+                } else {
+                    importMultipleCSVFiles(urls: urls)
+                }
+            }
+        } else {
+            guard let first = urls.first else { return }
+            DispatchQueue.main.async { [urls] in
+                let fingerprint = CSVParser.computeFingerprint(from: first)
+                let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
+                if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
+                    clearPendingKurszielAfterImport()
+                    pendingImportURLs = urls
+                    fingerprintMismatchFileSpalten = fp
+                    fingerprintMismatchStoredSpalten = st
+                    showFingerprintMismatchAlert = true
+                } else {
+                    self.importMultipleCSVFiles(urls: urls)
+                }
+            }
+        }
+    }
+
+    /// Verarbeitet vom Startseiten-Picker gewählte URLs (Fingerprint prüfen, ggf. Format-Dialog oder Import).
+    private func applyImportURLsFromStart(_ urls: [URL]) {
+        if isIPad {
+            showEinlesenHinweis2Sek = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+                showEinlesenHinweis2Sek = false
+            }
+        }
+        guard let first = urls.first else { return }
+        ifNotAlreadyImported(urls: urls, fromStart: true) {
+            DispatchQueue.main.async { [urls] in
+                let fingerprint = CSVParser.computeFingerprint(from: first)
+                let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
+                if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
+                    clearPendingKurszielAfterImport()
+                    pendingImportURLs = urls
+                    fingerprintMismatchFileSpalten = fp
+                    fingerprintMismatchStoredSpalten = st
+                    showFingerprintMismatchAlert = true
+                } else {
+                    importMultipleCSVFiles(urls: urls)
+                }
+            }
+        }
+    }
+
     private func handleFileImport(result: Result<[URL], Error>) {
         switch result {
         case .success(let urls):
-            // Picker zuerst schließen; Import erst in der nächsten Run-Loop starten, damit die Maske wirklich verschwindet
             isImporting = false
-            DispatchQueue.main.async { [urls] in
-                self.importMultipleCSVFiles(urls: urls)
+            guard let first = urls.first else { return }
+            ifNotAlreadyImported(urls: urls, fromStart: false) {
+                DispatchQueue.main.async { [urls] in
+                    let fingerprint = CSVParser.computeFingerprint(from: first)
+                    let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
+                    if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
+                        clearPendingKurszielAfterImport()
+                        pendingImportURLs = urls
+                        fingerprintMismatchFileSpalten = fp
+                        fingerprintMismatchStoredSpalten = st
+                        showFingerprintMismatchAlert = true
+                    } else {
+                        self.importMultipleCSVFiles(urls: urls)
+                    }
+                }
             }
         case .failure(let error):
             isImporting = false
+            clearPendingKurszielAfterImport()
             importMessage = "Fehler beim Auswählen der Dateien: \(error.localizedDescription)"
             showImportMessage = true
         }
     }
     
     private func importMultipleCSVFiles(urls: [URL]) {
+        pendingImportURLs = nil
+        showFingerprintMismatchAlert = false
+        let currentFingerprint = urls.first.flatMap { CSVParser.computeFingerprint(from: $0) }
+        if debugEinlesungNurEinSatz {
+            print("\n>>> DEBUG EINLESUNG: Schalter an – es wird nur die erste Datei, erste Zeile verarbeitet. Ausgabe folgt unten. <<<\n")
+        }
         var alleNeuenAktien: [Aktie] = []
         var zeilenVerarbeitet = 0
         var errors: [String] = []
         var parseHinweise: [String] = []
         
-        let erstesFilename = urls.first?.lastPathComponent ?? ""
-        let einleseDatum = DateFromFilename.parse(erstesFilename) ?? Date()
-        let neuestesDatum = importSummaries.map(\.datumAktuelleEinlesung).max()
+        // Einlesedatum aus allen Dateinamen bestimmen: neueste (Datum+Uhrzeit) der ausgewählten Dateien.
+        // Wenn kein Datum im Dateinamen erkennbar ist, aktueller Zeitpunkt als Fallback (damit mehrere Läufe am selben Tag unterscheidbar bleiben).
+        let parsedDates = urls.compactMap { DateFromFilename.parse($0.lastPathComponent) }
+        let einleseDatum = parsedDates.max() ?? Date()
         
-        // Wenn die Datei ein älteres Datum hat als die bisher neueste Einlesung: nur Gesamtwert für die Vergleichsliste übernehmen, Aktien-Daten nicht überschreiben
-        if !importSummaries.isEmpty, !aktien.isEmpty, let neuestes = neuestesDatum, einleseDatum < neuestes {
-            var gesamtwertNurVergleich = 0.0
-            for url in urls {
-                do {
-                    _ = url.startAccessingSecurityScopedResource()
-                    defer { url.stopAccessingSecurityScopedResource() }
-                    let (neueAktien, _, _, _) = try CSVParser.parseCSVWithStats(from: url)
-                    gesamtwertNurVergleich += neueAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
-                } catch {
-                    importMessage = "Fehler beim Einlesen von \(url.lastPathComponent): \(error.localizedDescription)"
-                    showImportMessage = true
-                    return
+        // 1. Alle CSV-Daten einlesen (zunächst nur sammeln, Einfügen nach Prüfung pro BL)
+        var csvHadKursziele = false
+        var firstFailureLineAny: Int?
+        var firstFailureDiagnosticAny: String?
+        var firstFailureFileAny: String?
+        var firstFilePreviewAny: String?
+        let urlsToProcess = debugEinlesungNurEinSatz ? Array(urls.prefix(1)) : urls
+        for url in urlsToProcess {
+            do {
+                _ = url.startAccessingSecurityScopedResource()
+                defer { url.stopAccessingSecurityScopedResource() }
+                
+                let (neueAktien, zeilenGesamt, zeilenImportiert, hadKursziele, firstFailureLine, firstFailureDiagnostic, filePreview) = try CSVParser.parseCSVWithStats(from: url)
+                if firstFailureDiagnosticAny == nil, let diag = firstFailureDiagnostic {
+                    firstFailureLineAny = firstFailureLine
+                    firstFailureDiagnosticAny = diag
+                    firstFailureFileAny = url.lastPathComponent
                 }
+                if firstFilePreviewAny == nil, let preview = filePreview { firstFilePreviewAny = preview }
+                let neueAktienToInsert = debugEinlesungNurEinSatz ? Array(neueAktien.prefix(1)) : neueAktien
+                csvHadKursziele = csvHadKursziele || hadKursziele
+                zeilenVerarbeitet += debugEinlesungNurEinSatz ? neueAktienToInsert.count : zeilenImportiert
+                if zeilenGesamt > zeilenImportiert, !debugEinlesungNurEinSatz {
+                    var hinweis = "\(url.lastPathComponent): \(zeilenGesamt) Zeilen in Datei, \(zeilenImportiert) als Positionen importiert. \(zeilenGesamt - zeilenImportiert) Zeile(n) konnten nicht zugeordnet werden."
+                    if let line = firstFailureLine, let diag = firstFailureDiagnostic {
+                        hinweis += " Erste fehlgeschlagene Zeile: Zeile \(line) – \(diag)"
+                    } else {
+                        hinweis += " (z. B. anderes Format oder fehlende Pflichtfelder)"
+                    }
+                    parseHinweise.append(hinweis)
+                }
+                for neueAktie in neueAktienToInsert {
+                    alleNeuenAktien.append(neueAktie)
+                }
+                // Nach erfolgreichem Einlesen: Umbenennen in EX_<Dateiname> (in Place; bei iCloud oft nur Lesezugriff → Kopie ins App-Documents)
+                if url.isFileURL {
+                    let ursprungsname = url.lastPathComponent
+                    let neuerName = "EX_" + ursprungsname
+                    let fm = FileManager.default
+                    let dir = url.deletingLastPathComponent()
+                    let neuesURLInPlace = dir.appendingPathComponent(neuerName)
+                    do {
+                        try fm.moveItem(at: url, to: neuesURLInPlace)
+                    } catch {
+                        if let docDir = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+                            let zielURL = docDir.appendingPathComponent(neuerName)
+                            try? fm.removeItem(at: zielURL)
+                            try? fm.copyItem(at: url, to: zielURL)
+                        }
+                    }
+                }
+            } catch {
+                errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
-            let summary = ImportSummary(gesamtwertVoreinlesung: 0, gesamtwertAktuelleEinlesung: gesamtwertNurVergleich, datumVoreinlesung: nil, datumAktuelleEinlesung: einleseDatum)
+        }
+        if debugEinlesungNurEinSatz && alleNeuenAktien.isEmpty {
+            print(">>> DEBUG: Keine Zeilen in alleNeuenAktien (Parser lieferte 0 Positionen oder alle waren Watchlist-Treffer). Prüfe CSV-Format und Zuordnung. <<<\n")
+        }
+        
+        // Feste Werte aus der Zuordnung: Jedes Feld, bei dem „Fester Wert“ (=…) eingetragen ist, wird auf alle Einlesezeilen angewendet (z. B. Bankleistungsnummer). Die BL aus der CSV-Spalte wird dabei überschrieben.
+        let aktivesMapping = BankStore.loadCSVColumnMapping(for: BankStore.selectedBankId)
+        if debugEinlesungNurEinSatz, let first = alleNeuenAktien.first {
+            let aktiveBankName = BankStore.selectedBank.name
+            let blMapping = aktivesMapping["bankleistungsnummer"] ?? "nil"
+            print("========== Einlesung Debug (1 Zeile) ==========")
+            print("  Aktive Bank (wird für Zuordnung genutzt): \(aktiveBankName)")
+            print("  Mapping BL: \(blMapping) — wenn mit '=' (z. B. =99999): BL aus CSV wird ignoriert, fester Wert gilt.")
+            print("--- Einlesewerte (aus CSV/Parser, vor fester Wert) ---")
+            print("  BL: \(first.bankleistungsnummer)")
+            print("  Bezeichnung: \(first.bezeichnung)")
+            print("  WKN: \(first.wkn)  ISIN: \(first.isin)")
+            print("  Bestand: \(first.bestand)  Währung: \(first.waehrung)")
+            print("  Kurs: \(first.kurs ?? 0)  Devisenkurs: \(first.devisenkurs ?? 0)")
+            print("  Marktwert EUR: \(first.marktwertEUR?.description ?? "nil")")
+            print("  Gattung: \(first.gattung)  Depot/Portfolio: \(first.depotPortfolioName)")
+            print("  importDatum (Parser): \(first.importDatum)")
+        }
+        for (fieldId, raw) in aktivesMapping {
+            guard raw.hasPrefix("=") else { continue }
+            let fixedValue = String(raw.dropFirst(1)).trimmingCharacters(in: .whitespaces)
+            guard !fixedValue.isEmpty else { continue }
+            for aktie in alleNeuenAktien {
+                applyFixedValueToAktie(aktie, fieldId: fieldId, fixedValue: fixedValue)
+            }
+        }
+        // Fester BL-Wert aus beliebiger Bank: Wenn irgendeine Bank „Fester Wert“ für BL hat, alle Zeilen damit überschreiben (BL aus CSV wird ignoriert).
+        if let festeBL = BankStore.fixedBankleistungsnummer(for: BankStore.selectedBankId) {
+            for aktie in alleNeuenAktien {
+                aktie.bankleistungsnummer = festeBL
+            }
+        }
+        
+        // Marktwert aus Kurs × Bestand, wenn CSV keine Marktwert-Spalte lieferte (z. B. DKB)
+        for aktie in alleNeuenAktien {
+            if aktie.marktwertEUR == nil, let k = aktie.kurs ?? aktie.devisenkurs, aktie.bestand > 0 {
+                aktie.marktwertEUR = k * aktie.bestand
+            }
+        }
+        
+        // Pro BL prüfen, ob das Einlesedatum älter ist als die letzte Einlesung dieser BL – nur dann „nur Vergleichsliste“
+        let neueBLs: Set<String> = {
+            if let festeBL = BankStore.fixedBankleistungsnummer(for: BankStore.selectedBankId) {
+                return [festeBL]
+            }
+            return Set(alleNeuenAktien.map { $0.bankleistungsnummer.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        }()
+        let nurVergleichsliste = !importSummaries.isEmpty && !aktien.isEmpty && !neueBLs.isEmpty && neueBLs.allSatisfy { bl in
+            guard let latest = aktien.filter({ $0.bankleistungsnummer.trimmingCharacters(in: .whitespaces) == bl }).map(\.importDatum).max() else { return false }
+            return einleseDatum < latest
+        }
+        if nurVergleichsliste {
+            let gesamtwertNurVergleich = alleNeuenAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
+            let runId = UUID()
+            let summary = ImportSummary(gesamtwertVoreinlesung: 0, gesamtwertAktuelleEinlesung: gesamtwertNurVergleich, datumVoreinlesung: nil, datumAktuelleEinlesung: einleseDatum, importBankId: BankStore.selectedBankId, importRunId: runId)
             modelContext.insert(summary)
-            let ueberzaehlige = Array(importSummaries.dropFirst(10))
+            let ueberzaehlige = Array(importSummaries.dropFirst(maxAnzahlEinlesungen))
             for oldSummary in ueberzaehlige {
-                let dateToRemove = oldSummary.datumAktuelleEinlesung
-                let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove })
-                if let toDelete = try? modelContext.fetch(descriptor) {
-                    for s in toDelete { modelContext.delete(s) }
+                let snapsToDelete: [ImportPositionSnapshot]
+                if let oldRunId = oldSummary.importRunId {
+                    snapsToDelete = (try? modelContext.fetch(FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importRunId == oldRunId }))) ?? []
+                } else {
+                    let dateToRemove = oldSummary.datumAktuelleEinlesung
+                    snapsToDelete = (try? modelContext.fetch(FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove }))) ?? []
                 }
+                for s in snapsToDelete { modelContext.delete(s) }
                 modelContext.delete(oldSummary)
             }
             do {
                 try modelContext.save()
             } catch {
+                clearPendingKurszielAfterImport()
                 importMessage = "Speicherfehler: \(error.localizedDescription)"
                 showImportMessage = true
                 return
             }
             let datumStr = einleseDatum.formatted(date: .abbreviated, time: .shortened)
-            let neuestStr = neuestes.formatted(date: .abbreviated, time: .shortened)
-            importMessage = "Einlesung vom \(datumStr) wurde nur für die Vergleichsliste übernommen (älteres Datum). Die angezeigten Daten stammen weiterhin vom \(neuestStr)."
+            let neuestesProBL = neueBLs.compactMap { bl in aktien.filter { $0.bankleistungsnummer.trimmingCharacters(in: .whitespaces) == bl }.map(\.importDatum).max() }.max()
+            let neuestStr = neuestesProBL.map { $0.formatted(date: .abbreviated, time: .shortened) } ?? ""
+            clearPendingKurszielAfterImport()
+            importMessage = "Einlesung vom \(datumStr) wurde nur für die Vergleichsliste übernommen (älteres Datum pro BL). Die angezeigten Daten stammen weiterhin vom \(neuestStr)."
             showImportMessage = true
             return
         }
@@ -1487,43 +2160,49 @@ struct ContentView: View {
         let alteAktien = Array(aktien)
         let gesamtwertVoreinlesung = alteAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
         
-        // 1. Alle CSV-Daten einlesen und als neue Zeilen einfügen
-        var csvHadKursziele = false
-        for url in urls {
-            do {
-                _ = url.startAccessingSecurityScopedResource()
-                defer { url.stopAccessingSecurityScopedResource() }
-                
-                let (neueAktien, zeilenGesamt, zeilenImportiert, hadKursziele) = try CSVParser.parseCSVWithStats(from: url)
-                csvHadKursziele = csvHadKursziele || hadKursziele
-                zeilenVerarbeitet += zeilenImportiert
-                if zeilenGesamt > zeilenImportiert {
-                    let u = zeilenGesamt - zeilenImportiert
-                    parseHinweise.append("\(url.lastPathComponent): \(zeilenGesamt) Zeilen in Datei, \(zeilenImportiert) als Positionen importiert. \(u) Zeile(n) konnten nicht zugeordnet werden (z. B. anderes Format oder fehlende Pflichtfelder).")
-                }
-                for neueAktie in neueAktien {
-                    let nIsin = neueAktie.isin.trimmingCharacters(in: .whitespaces)
-                    let nWkn = neueAktie.wkn.trimmingCharacters(in: .whitespaces)
-                    if let watchlist = alteAktien.first(where: { w in
-                        w.isWatchlist && ((!nIsin.isEmpty && w.isin.trimmingCharacters(in: .whitespaces) == nIsin) || (!nWkn.isEmpty && w.wkn.trimmingCharacters(in: .whitespaces) == nWkn))
-                    }) {
-                        watchlist.kurs = neueAktie.kurs
-                        watchlist.devisenkurs = neueAktie.devisenkurs
-                        watchlist.marktwertEUR = neueAktie.marktwertEUR
-                        if neueAktie.bezeichnung.isEmpty == false { watchlist.bezeichnung = neueAktie.bezeichnung }
-                        continue
-                    }
-                    modelContext.insert(neueAktie)
-                    alleNeuenAktien.append(neueAktie)
-                }
-            } catch {
-                errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
-            }
+        // Einlesedatum auf alle neuen Positionen setzen (Parser setzt nur Date()), damit „Einlesung löschen“ alle zugehörigen Sätze findet
+        for aktie in alleNeuenAktien {
+            aktie.importDatum = einleseDatum
         }
+        if debugEinlesungNurEinSatz, let first = alleNeuenAktien.first {
+            print("--- Satz Deutsche Bank (nach Verarbeitung, wird gespeichert) ---")
+            print("  BL: \(first.bankleistungsnummer)")
+            print("  Bezeichnung: \(first.bezeichnung)")
+            print("  WKN: \(first.wkn)  ISIN: \(first.isin)")
+            print("  Bestand: \(first.bestand)  Währung: \(first.waehrung)")
+            print("  Kurs: \(first.kurs ?? 0)  Devisenkurs: \(first.devisenkurs ?? 0)")
+            print("  Marktwert EUR: \(first.marktwertEUR?.description ?? "nil")")
+            print("  Gattung: \(first.gattung)  Depot/Portfolio: \(first.depotPortfolioName)")
+            print("  importDatum: \(first.importDatum)")
+            print("================================================================")
+        }
+        
+        // Hinweiszeilen (allgemeine Hinweise ohne Bestand/Marktwert) ausfiltern – keine echten Depotpositionen
+        alleNeuenAktien = alleNeuenAktien.filter { $0.bestand > 0 && $0.marktwertEUR != nil }
+        
+        // Neue Positionen einfügen bzw. Watchlist aktualisieren (nur eingefügte für Abgleich/Stats nutzen)
+        var eingefuegteAktien: [Aktie] = []
+        for neueAktie in alleNeuenAktien {
+            let nIsin = neueAktie.isin.trimmingCharacters(in: .whitespaces)
+            let nWkn = neueAktie.wkn.trimmingCharacters(in: .whitespaces)
+            if let watchlist = alteAktien.first(where: { w in
+                w.isWatchlist && ((!nIsin.isEmpty && w.isin.trimmingCharacters(in: .whitespaces) == nIsin) || (!nWkn.isEmpty && w.wkn.trimmingCharacters(in: .whitespaces) == nWkn))
+            }) {
+                watchlist.kurs = neueAktie.kurs
+                watchlist.devisenkurs = neueAktie.devisenkurs
+                watchlist.marktwertEUR = neueAktie.marktwertEUR
+                if !neueAktie.bezeichnung.isEmpty { watchlist.bezeichnung = neueAktie.bezeichnung }
+                continue
+            }
+            modelContext.insert(neueAktie)
+            eingefuegteAktien.append(neueAktie)
+        }
+        alleNeuenAktien = eingefuegteAktien
         
         do {
             try modelContext.save()
         } catch {
+            clearPendingKurszielAfterImport()
             importMessage = "Speicherfehler beim Einlesen: \(error.localizedDescription)"
             showImportMessage = true
             return
@@ -1532,35 +2211,38 @@ struct ContentView: View {
         // Gespeicherte manuelle Kursziele (nach „Löschen und Kursziele merken“) wieder zuordnen
         let wiederZugeordnet = applySavedManualKursziele(to: alleNeuenAktien)
         
-        // Abgleich pro Bankleistungsnummer: Nur Konten, die in der CSV vorkommen, werden aktualisiert.
-        // Alte Positionen dieser Konten werden entfernt (Verkäufe) – andere Konten (BL nicht in CSV) bleiben unverändert.
+        // Abgleich: Bei „Fester Wert“ für BL spielt die BL aus der Datei keine Rolle – Suche und Löschen nur mit festem Wert + WKN/ISIN.
+        let festeBL = BankStore.fixedBankleistungsnummer(for: BankStore.selectedBankId)
         let csvBankleistungsnummern = Set(alleNeuenAktien.map { $0.bankleistungsnummer.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty })
+        /// Set aus (WKN, ISIN) der neuen Zeilen für Lösch-Logik bei festem BL (alte Sätze mit gleicher WKN/ISIN ersetzen).
+        let neueWknIsinSet: Set<String> = {
+            var s = Set<String>()
+            for a in alleNeuenAktien {
+                let w = a.wkn.trimmingCharacters(in: .whitespaces)
+                let i = a.isin.trimmingCharacters(in: .whitespaces)
+                if !w.isEmpty || !i.isEmpty { s.insert("\(w)|\(i)") }
+            }
+            return s
+        }()
         
         // 2. Vergleiche alt/neu: previousMarktwertEUR, previousBestand, previousKurs, Kursziel etc. von alter Position übernehmen
-        // Matching erfolgt über bankleistungsnummer UND (WKN ODER ISIN)
-        // Wichtig: bankleistungsnummer allein reicht nicht, da z.B. Amazon unter mehreren BL-Nummern existieren kann
+        // Immer nur die Kombination (Bankleistungsnummer + WKN oder ISIN) – andere Kombinationen gelten nicht. Bei festem BL: Such-BL = fester Wert (BL aus Datei ignoriert).
         for neue in alleNeuenAktien {
             let bl = neue.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
             let wkn = neue.wkn.trimmingCharacters(in: .whitespaces)
             let isin = neue.isin.trimmingCharacters(in: .whitespaces)
+            let suchBL = festeBL ?? bl  // Bei festem BL: Such-BL = fester Wert
             
-            // Suche nach passender alter Aktie: bankleistungsnummer muss übereinstimmen UND (WKN ODER ISIN)
             if let alte = alteAktien.first(where: { alteAktie in
                 let alteBL = alteAktie.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
                 let alteWKN = alteAktie.wkn.trimmingCharacters(in: .whitespaces)
                 let alteISIN = alteAktie.isin.trimmingCharacters(in: .whitespaces)
-                
-                // bankleistungsnummer muss übereinstimmen
-                let blMatch = !bl.isEmpty && !alteBL.isEmpty && bl == alteBL
-                guard blMatch else { return false }
-                
-                // Zusätzlich muss WKN ODER ISIN übereinstimmen
+                let blMatch = !suchBL.isEmpty && !alteBL.isEmpty && alteBL == suchBL
                 let wknMatch = !wkn.isEmpty && !alteWKN.isEmpty && wkn == alteWKN
                 let isinMatch = !isin.isEmpty && !alteISIN.isEmpty && isin == alteISIN
-                
-                return wknMatch || isinMatch
+                return blMatch && (wknMatch || isinMatch)
             }) {
-                // Alte Werte speichern
+                // Alte Werte von der gefundenen Position (gleiche BL + WKN/ISIN) übernehmen
                 neue.previousMarktwertEUR = alte.marktwertEUR
                 neue.previousBestand = alte.bestand
                 neue.previousKurs = alte.kurs ?? alte.devisenkurs
@@ -1594,20 +2276,31 @@ struct ContentView: View {
             }
         }
         
-        // 3. Alte Zeilen nur für die in der CSV vorkommenden Bankleistungsnummern löschen (Abgleich: verkaufte/entfernte Positionen weg). Watchlist-Positionen nie löschen.
+        // 3. Alte Zeilen löschen: Bei festem BL alle alten Sätze mit fester BL oder mit gleicher WKN/ISIN wie die neue Einlesung (BL aus Datei spielt keine Rolle). Sonst: nur alte mit BL aus der neuen CSV löschen.
         for alte in alteAktien {
             if alte.isWatchlist { continue }
             let alteBL = alte.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
-            if !alteBL.isEmpty && csvBankleistungsnummern.contains(alteBL) {
-                modelContext.delete(alte)
+            let alteWkn = alte.wkn.trimmingCharacters(in: .whitespaces)
+            let alteIsin = alte.isin.trimmingCharacters(in: .whitespaces)
+            if let feste = festeBL {
+                let hatFesteBL = !alteBL.isEmpty && alteBL == feste
+                let inNeuerEinlesung = neueWknIsinSet.contains("\(alteWkn)|\(alteIsin)")
+                if hatFesteBL || inNeuerEinlesung {
+                    modelContext.delete(alte)
+                }
+            } else {
+                if !alteBL.isEmpty && csvBankleistungsnummern.contains(alteBL) {
+                    modelContext.delete(alte)
+                }
             }
         }
         
         let gesamtwertAktuelleEinlesung = alleNeuenAktien.compactMap { $0.marktwertEUR }.reduce(0, +)
         let datumVoreinlesung = importSummaries.first?.importDatum
-        let summary = ImportSummary(gesamtwertVoreinlesung: gesamtwertVoreinlesung, gesamtwertAktuelleEinlesung: gesamtwertAktuelleEinlesung, datumVoreinlesung: datumVoreinlesung, datumAktuelleEinlesung: einleseDatum)
+        let runId = UUID()
+        let summary = ImportSummary(gesamtwertVoreinlesung: gesamtwertVoreinlesung, gesamtwertAktuelleEinlesung: gesamtwertAktuelleEinlesung, datumVoreinlesung: datumVoreinlesung, datumAktuelleEinlesung: einleseDatum, importBankId: BankStore.selectedBankId, importRunId: runId)
         modelContext.insert(summary)
-        // Pro Position Snapshot für Verlauf/Charts (Kurs, Kursziel, Abstand)
+        // Pro Position Snapshot für Verlauf/Charts (Kurs, Kursziel, Abstand) – mit Lauf-ID, damit mehrere Läufe pro Tag getrennt sind
         for aktie in alleNeuenAktien {
             let kurs = aktie.kurs ?? aktie.devisenkurs
             let kz = aktie.kursziel
@@ -1621,68 +2314,112 @@ struct ContentView: View {
                 marktwertEUR: aktie.marktwertEUR,
                 kurs: kurs,
                 kursziel: kz,
-                abstandPct: abstand
+                abstandPct: abstand,
+                importRunId: runId
             )
             modelContext.insert(snap)
         }
-        // Nur die letzten 10 Einlesungen behalten; bei der 11. entfällt die älteste (importSummaries hat noch den Stand vor dem Insert)
-        let ueberzaehlige = Array(importSummaries.dropFirst(10))
+        // Nur die letzten N Einlesungen behalten; darüber hinaus entfällt die älteste (importSummaries hat noch den Stand vor dem Insert)
+        let ueberzaehlige = Array(importSummaries.dropFirst(maxAnzahlEinlesungen))
         for oldSummary in ueberzaehlige {
-            let dateToRemove = oldSummary.datumAktuelleEinlesung
-            let descriptor = FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove })
-            if let toDelete = try? modelContext.fetch(descriptor) {
-                for s in toDelete { modelContext.delete(s) }
+            let snapsToDelete: [ImportPositionSnapshot]
+            if let oldRunId = oldSummary.importRunId {
+                snapsToDelete = (try? modelContext.fetch(FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importRunId == oldRunId }))) ?? []
+            } else {
+                let dateToRemove = oldSummary.datumAktuelleEinlesung
+                snapsToDelete = (try? modelContext.fetch(FetchDescriptor<ImportPositionSnapshot>(predicate: #Predicate<ImportPositionSnapshot> { $0.importDatum == dateToRemove }))) ?? []
             }
+            for s in snapsToDelete { modelContext.delete(s) }
             modelContext.delete(oldSummary)
         }
         
         do {
             try modelContext.save()
         } catch {
+            clearPendingKurszielAfterImport()
             importMessage = "Speicherfehler: \(error.localizedDescription)"
             showImportMessage = true
             return
         }
         
+        if let fp = currentFingerprint {
+            BankStore.saveCSVFingerprint(fp, for: BankStore.selectedBankId)
+        }
+        
+        BankStore.addEingeleseneDateinamen(urlsToProcess.map { $0.lastPathComponent })
+        let eingeleseneDateinamen = urlsToProcess.map { $0.lastPathComponent }
         var message = "\(alleNeuenAktien.count) Aktien in der Liste (\(zeilenVerarbeitet) Zeilen aus CSV verarbeitet)."
+        if !eingeleseneDateinamen.isEmpty {
+            message += "\n\nEingelesen: \(eingeleseneDateinamen.joined(separator: ", "))"
+        }
+        let querstrich = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nHinweis:\n"
+        var hinweisTeile: [String] = []
+        if !eingeleseneDateinamen.isEmpty {
+            hinweisTeile.append("Damit Sie in der Dateien-App erkennen, welche Dateien schon eingelesen wurden: Datei dort umbenennen (z. B. „EX_“ vor den Namen setzen).")
+        }
+        if alleNeuenAktien.isEmpty, let diag = firstFailureDiagnosticAny {
+            let filePart = firstFailureFileAny.map { " (\($0))" } ?? ""
+            let linePart = firstFailureLineAny.map { " Zeile \($0):" } ?? ""
+            hinweisTeile.append("► Erste fehlgeschlagene Einlesezeile\(filePart)\(linePart) \(diag)")
+        }
         if wiederZugeordnet > 0 {
-            message += "\n\n\(wiederZugeordnet) manuelle Kursziele wieder zugeordnet (gemerkt nach „Alles löschen“)."
+            hinweisTeile.append("\(wiederZugeordnet) manuelle Kursziele wieder zugeordnet (gemerkt nach „Alles löschen“).")
         }
         if !parseHinweise.isEmpty {
-            message += "\n\n" + parseHinweise.joined(separator: "\n")
+            hinweisTeile.append(parseHinweise.joined(separator: "\n"))
         }
         if !errors.isEmpty {
-            message += "\n\nFehler:\n" + errors.joined(separator: "\n")
+            hinweisTeile.append("Fehler:\n" + errors.joined(separator: "\n"))
+        }
+        if alleNeuenAktien.isEmpty {
+            hinweisTeile.append("Unter Einstellungen → \(BankStore.selectedBank.name) → Spalten zuordnen prüfen. Pflicht: Bankleistungsnummer (Spalte A/B/C oder Fester Wert, z. B. = Ihre Kontonummer oder 1), Bezeichnung (Spalte), Bestand (Spalte), WKN (Spalte). Jede Zuordnung bedeutet: aus der gewählten Spalte wird Text in das App-Feld gelesen – falsche Spalte = keine gültige Zeile.")
+            if let preview = firstFilePreviewAny {
+                hinweisTeile.append("Dateivorschau (was die App liest):\n\(preview)")
+            }
+        }
+        if !hinweisTeile.isEmpty {
+            message += querstrich + hinweisTeile.joined(separator: "\n\n")
         }
         
-        importMessage = message
-        showImportMessage = true
-        
         // Kurszielermittlung erst nach OK auf dem Import-Alert starten; bei Daten vor Tagesdatum vorher abfragen.
-        // CSV ohne Kursziele: alle Werte neu berechnen (auch mit C gekennzeichnete), daher forceOverwrite.
         let sollAktualisieren: (Aktie) -> Bool = { a in
             if forceOverwriteAllKursziele || !csvHadKursziele { return !a.kurszielManuellGeaendert }
             guard !a.kurszielManuellGeaendert else { return false }
-            // Auch aus CSV (C): ermitteln, wenn Kursziel fehlt oder 0 ist
             let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
             return a.kurszielQuelle != "C" || keinWert
         }
         let brauchtKursziel = !csvHadKursziele || !alleNeuenAktien.filter(sollAktualisieren).isEmpty
         let startOfToday = Calendar.current.startOfDay(for: Date())
         let alteDatenMitImport = einleseDatum < startOfToday && !alleNeuenAktien.isEmpty
-        // Bei altem Datum immer anbieten (auch wenn CSV schon Kursziele hatte), sonst nur wenn tatsächlich Bedarf
         let sollAbfragenOderStarten = (brauchtKursziel || alteDatenMitImport)
-        // Auch ohne FMP/OpenAI-Key: Kursziele über finanzen.net, Yahoo, Suchmaschinen-Snippet etc. ermitteln
-        if sollAbfragenOderStarten {
-            lastImportHadCSVKursziele = csvHadKursziele
-            pendingKurszielForceOverwrite = forceOverwriteAllKursziele || !csvHadKursziele
-            pendingKurszielImportDatum = einleseDatum
-            if einleseDatum < startOfToday {
-                showKurszielAbfrageBeiAltemDatum = true
-            } else {
-                pendingKurszielFetchAfterImport = true
+        let kurszielHadKursziele = csvHadKursziele
+        let kurszielForceOverwrite = forceOverwriteAllKursziele || !csvHadKursziele
+        let kurszielImportDatum = einleseDatum
+        let kurszielAltesDatum = einleseDatum < startOfToday
+
+        // Alert erst im nächsten Run-Loop anzeigen, damit der Datei-Picker vollständig geschlossen ist (sonst erscheint die Maske erst nach Tipp auf Seitenwechsel, v. a. iPad).
+        Task { @MainActor in
+            importMessage = message
+            showImportMessage = true
+            if sollAbfragenOderStarten {
+                lastImportHadCSVKursziele = kurszielHadKursziele
+                pendingKurszielForceOverwrite = kurszielForceOverwrite
+                pendingKurszielImportDatum = kurszielImportDatum
+                if kurszielAltesDatum {
+                    showKurszielAbfrageBeiAltemDatum = true
+                } else {
+                    pendingKurszielFetchAfterImport = true
+                }
             }
         }
+    }
+    
+    /// Setzt alle „nach Import“-Kursziel-Zustände zurück, damit beim nächsten OK keine Kurszielermittlung startet (z. B. bei Format-Dialog oder Import-Fehler).
+    private func clearPendingKurszielAfterImport() {
+        pendingKurszielFetchAfterImport = false
+        showKurszielAbfrageBeiAltemDatum = false
+        pendingKurszielImportDatum = nil
+        pendingKurszielForceOverwrite = false
     }
     
     private func startPendingKurszielFetch() {
@@ -1701,6 +2438,25 @@ struct ContentView: View {
             Task { await fetchKurszieleForAktien(list, forceOverwrite: forceOverwrite, snapshotImportDatum: importDate) }
         }
         pendingKurszielImportDatum = nil
+    }
+    
+    /// Kurszielermittlung manuell starten (z. B. nach Unterbrechung durch Home-Button). Verwendet dieselbe Logik wie nach Import; Einstellung „Alle Kursziele überschreiben“ wird beachtet.
+    private func startKurszielErmittlungManuell() {
+        let forceOverwrite = forceOverwriteAllKursziele
+        let sollAktualisieren: (Aktie) -> Bool = { a in
+            if forceOverwrite { return !a.kurszielManuellGeaendert }
+            guard !a.kurszielManuellGeaendert else { return false }
+            let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
+            return a.kurszielQuelle != "C" || keinWert
+        }
+        let list = aktien.filter(sollAktualisieren)
+        let importDate = importSummaries.first?.datumAktuelleEinlesung
+        if list.isEmpty {
+            importMessage = "Keine Positionen zum Aktualisieren (alle manuell gesetzt oder bereits mit Kursziel)."
+            showImportMessage = true
+        } else {
+            Task { await fetchKurszieleForAktien(list, forceOverwrite: forceOverwrite, snapshotImportDatum: importDate) }
+        }
     }
     
     private func fetchKurszieleViaOpenAI() {
@@ -1842,17 +2598,22 @@ struct ContentView: View {
     
     private func deleteAllAktien() {
         withAnimation {
-            for aktie in aktien {
-                modelContext.delete(aktie)
-            }
-            for summary in importSummaries {
-                modelContext.delete(summary)
-            }
-            let snapDesc = FetchDescriptor<ImportPositionSnapshot>()
-            if let allSnaps = try? modelContext.fetch(snapDesc) {
+            do {
+                let snapDesc = FetchDescriptor<ImportPositionSnapshot>()
+                let allSnaps = try modelContext.fetch(snapDesc)
                 for s in allSnaps { modelContext.delete(s) }
+                let summaryDesc = FetchDescriptor<ImportSummary>()
+                let allSummaries = try modelContext.fetch(summaryDesc)
+                for s in allSummaries { modelContext.delete(s) }
+                let aktienDesc = FetchDescriptor<Aktie>()
+                let allAktien = try modelContext.fetch(aktienDesc)
+                for a in allAktien { modelContext.delete(a) }
+                try modelContext.save()
+                KurszielService.resetZugriffeStatistik()
+            } catch {
+                importMessage = "Beim Löschen ist ein Fehler aufgetreten: \(error.localizedDescription)"
+                showImportMessage = true
             }
-            try? modelContext.save()
         }
     }
     
@@ -1940,17 +2701,16 @@ struct ContentView: View {
 // MARK: - Seite 2: Kursziele (ISIN, Bezeichnung, Kursziel, Realistisch, Links)
 struct KurszielListenView: View {
     var aktien: [Aktie]
-    @Binding var scrollToISIN: String?
-    /// ISIN des zuletzt in der Aktien-Detailansicht gewählten Wertpapiers → Zeile in der Kursziel-Liste markieren
-    var markedISIN: String? = nil
-    var onCopyISIN: ((String) -> Void)? = nil
-    /// Wird gesetzt, wenn in einer Zeile ein Kursziel geändert wird → beim Zurückwechseln zur Aktien-Ansicht dorthin scrollen
+    @Binding var scrollToDetailKey: String?
+    /// Detail-Key (BL|ISIN) der zuletzt gewählten Position → Zeile markieren (gleiche ISIN in mehreren BL eindeutig)
+    var markedDetailKey: String? = nil
+    var onCopyDetailKey: ((String) -> Void)? = nil
     var onRowEdited: ((String) -> Void)? = nil
-    /// Wird aufgerufen, wenn „Kursziel suchen“ getippt wird → Zeile blau markieren; beim nächsten Tipp auf andere Zeile Markierung verschieben
     var onKurszielSuchenTapped: ((String) -> Void)? = nil
     @Environment(\.modelContext) private var modelContext
     @State private var showDebugLog = false
     private let finanzenNetAnalysenURL = URL(string: "https://www.finanzen.net/analysen")!
+    private func rowKey(aktie: Aktie) -> String { "\(aktie.bankleistungsnummer)|\(aktie.isin)|\(aktie.wkn)" }
     
     var body: some View {
         ScrollViewReader { proxy in
@@ -1965,8 +2725,9 @@ struct KurszielListenView: View {
                 
                 Section {
                     ForEach(aktien) { aktie in
-                        KurszielZeileView(aktie: aktie, modelContext: modelContext, isMarked: markedISIN.map { aktie.isin == $0 } ?? false, onCopyISIN: onCopyISIN, onRowEdited: onRowEdited, onKurszielSuchenTapped: onKurszielSuchenTapped)
-                            .id(aktie.isin)
+                        let key = rowKey(aktie: aktie)
+                        KurszielZeileView(aktie: aktie, modelContext: modelContext, detailKey: key, isMarked: markedDetailKey == key, onCopyDetailKey: onCopyDetailKey, onRowEdited: onRowEdited, onKurszielSuchenTapped: onKurszielSuchenTapped)
+                            .id(key)
                     }
                 } header: {
                     Text("Kursziele")
@@ -1975,24 +2736,28 @@ struct KurszielListenView: View {
                         .foregroundStyle(Color.primary.opacity(0.72))
                 }
             }
-            .onChange(of: scrollToISIN) { _, isin in
-                guard let isin = isin, !isin.isEmpty else { return }
+            #if os(iOS)
+            .scrollContentBackground(.hidden)
+            .background(Color(uiColor: .tertiarySystemGroupedBackground))
+            #endif
+            .onChange(of: scrollToDetailKey) { _, key in
+                guard let key = key, !key.isEmpty else { return }
                 DispatchQueue.main.async {
-                    proxy.scrollTo(isin, anchor: .center)
-                    scrollToISIN = nil
+                    proxy.scrollTo(key, anchor: .center)
+                    scrollToDetailKey = nil
                 }
             }
             .onAppear {
-                if let isin = scrollToISIN, !isin.isEmpty {
+                if let key = scrollToDetailKey, !key.isEmpty {
                     DispatchQueue.main.async {
-                        proxy.scrollTo(isin, anchor: .center)
-                        scrollToISIN = nil
+                        proxy.scrollTo(key, anchor: .center)
+                        scrollToDetailKey = nil
                     }
                 }
             }
         }
         .scrollDismissesKeyboard(.interactively)
-        .navigationTitle("Kursziele")
+        .navigationTitle("Kursziele · \(BankStore.selectedBank.name)")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button(action: { showDebugLog = true }) {
@@ -2017,9 +2782,10 @@ struct KurszielListenView: View {
 private struct KurszielZeileView: View {
     @Bindable var aktie: Aktie
     var modelContext: ModelContext
-    /// true = zuletzt in der Aktien-Detailansicht gewähltes Wertpapier (Stern + farbige Markierung)
+    /// Eindeutiger Schlüssel (BL|ISIN) für Scroll/Markierung bei gleicher ISIN in mehreren BL
+    var detailKey: String = ""
     var isMarked: Bool = false
-    var onCopyISIN: ((String) -> Void)? = nil
+    var onCopyDetailKey: ((String) -> Void)? = nil
     var onRowEdited: ((String) -> Void)? = nil
     var onKurszielSuchenTapped: ((String) -> Void)? = nil
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
@@ -2066,7 +2832,7 @@ private struct KurszielZeileView: View {
         NSPasteboard.general.clearContents()
         NSPasteboard.general.setString(text, forType: .string)
         #endif
-        onCopyISIN?(aktie.isin)
+        onCopyDetailKey?(detailKey)
         showZwischenablageFeedback = true
         DispatchQueue.main.asyncAfter(deadline: .now() + Self.zwischenablageFeedbackDauer) {
             showZwischenablageFeedback = false
@@ -2229,7 +2995,7 @@ private struct KurszielZeileView: View {
                                 aktie.kurszielLow = nil
                                 aktie.kurszielAnalysten = nil
                                 try? modelContext.save()
-                                onRowEdited?(aktie.isin)
+                                onRowEdited?(detailKey)
                             }
                         )
                     )
@@ -2258,7 +3024,7 @@ private struct KurszielZeileView: View {
                                     aktie.kurszielLow = nil
                                     aktie.kurszielAnalysten = nil
                                     try? modelContext.save()
-                                    onRowEdited?(aktie.isin)
+                                    onRowEdited?(detailKey)
                                 }
                             )
                         )
@@ -2306,7 +3072,7 @@ private struct KurszielZeileView: View {
                         .controlSize(.small)
                     }
                     Button("Kursziel suchen") {
-                        onKurszielSuchenTapped?(aktie.isin)
+                        onKurszielSuchenTapped?(detailKey)
                         #if os(iOS)
                         UIApplication.shared.open(googleKurszielURL(isin: aktie.isin))
                         #elseif os(macOS)
@@ -2326,13 +3092,13 @@ private struct KurszielZeileView: View {
         .listRowBackground(isMarked ? Color.accentColor.opacity(0.2) : Color.clear)
         #endif
         .sheet(isPresented: $showFMPTest) {
-            FMPTestSheetView(aktie: aktie, modelContext: modelContext, onRowEdited: onRowEdited)
+            FMPTestSheetView(aktie: aktie, modelContext: modelContext, detailKey: detailKey, onRowEdited: onRowEdited)
         }
         .sheet(isPresented: $showFinanzenNetTest) {
-            FinanzenNetTestSheetView(aktie: aktie, modelContext: modelContext, onRowEdited: onRowEdited)
+            FinanzenNetTestSheetView(aktie: aktie, modelContext: modelContext, detailKey: detailKey, onRowEdited: onRowEdited)
         }
         .sheet(isPresented: $showSnippetTest) {
-            SnippetTestSheetView(aktie: aktie, modelContext: modelContext, onRowEdited: onRowEdited)
+            SnippetTestSheetView(aktie: aktie, modelContext: modelContext, detailKey: detailKey, onRowEdited: onRowEdited)
         }
         .fileImporter(isPresented: $showOpenAIFileImporter, allowedContentTypes: [.json], allowsMultipleSelection: false) { result in
             loadKurszielFromFile(result: result)
@@ -2346,7 +3112,7 @@ private struct KurszielZeileView: View {
                     aktie.kurszielWaehrung = "EUR"
                     aktie.kurszielManuellGeaendert = false
                     try? modelContext.save()
-                    onRowEdited?(aktie.isin)
+                    onRowEdited?(detailKey)
                 }
                 pendingKurszielFromFile = nil
             }
@@ -2368,7 +3134,7 @@ private struct KurszielZeileView: View {
                     aktie.kurszielWaehrung = info.waehrung
                     aktie.kurszielManuellGeaendert = false
                     try? modelContext.save()
-                    onRowEdited?(aktie.isin)
+                    onRowEdited?(detailKey)
                 }
                 pendingOpenAIInfo = nil
             }
@@ -2544,6 +3310,8 @@ struct AktieDetailView: View {
     @State private var kurszielError: String?
     @State private var positionSnapshots: [ImportPositionSnapshot] = []
     @State private var verlaufChartZoomScale: CGFloat = 1.0
+    @State private var isLoadingISIN = false
+    @State private var isinLookupError: String?
     
     var body: some View {
         Form {
@@ -2561,7 +3329,36 @@ struct AktieDetailView: View {
                     Text(aktie.wkn)
                 }
                 LabeledContent("ISIN") {
-                    Text(aktie.isin)
+                    HStack {
+                        Text(aktie.isin.isEmpty ? "—" : aktie.isin)
+                        Spacer()
+                        if !aktie.wkn.trimmingCharacters(in: .whitespaces).isEmpty && aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
+                            Button {
+                                Task { await isinErmitteln() }
+                            } label: {
+                                if isLoadingISIN {
+                                    ProgressView().scaleEffect(0.8)
+                                } else {
+                                    Text("ISIN ermitteln")
+                                        .font(.caption)
+                                }
+                            }
+                            .disabled(isLoadingISIN)
+                        } else if !aktie.isin.trimmingCharacters(in: .whitespaces).isEmpty {
+                            Button("Zurücksetzen") {
+                                aktie.isin = ""
+                                isinLookupError = nil
+                                try? modelContext.save()
+                            }
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        }
+                    }
+                }
+                if let err = isinLookupError {
+                    Text(err)
+                        .font(.caption)
+                        .foregroundColor(.red)
                 }
                 LabeledContent("Währung") {
                     Text(aktie.waehrung)
@@ -2826,6 +3623,21 @@ struct AktieDetailView: View {
         #endif
     }
     
+    @MainActor
+    private func isinErmitteln() async {
+        let wkn = aktie.wkn.trimmingCharacters(in: .whitespaces)
+        guard !wkn.isEmpty else { return }
+        isLoadingISIN = true
+        isinLookupError = nil
+        defer { isLoadingISIN = false }
+        if let isin = await KurszielService.fetchISINFromWKN(wkn: wkn) {
+            aktie.isin = isin
+            try? modelContext.save()
+        } else {
+            isinLookupError = "ISIN konnte nicht ermittelt werden."
+        }
+    }
+    
     private func loadKursziel() {
         KurszielService.clearCachesForApiCalls()
         guard !aktie.kurszielManuellGeaendert else {
@@ -2873,6 +3685,7 @@ struct AktieDetailView: View {
 private struct FMPTestSheetView: View {
     @Bindable var aktie: Aktie
     var modelContext: ModelContext
+    var detailKey: String = ""
     var onRowEdited: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
     
@@ -2943,7 +3756,7 @@ private struct FMPTestSheetView: View {
                             aktie.kurszielAnalysten = result.kurszielAnalysten
                             aktie.kurszielManuellGeaendert = false
                             try? modelContext.save()
-                            onRowEdited?(aktie.isin)
+                            onRowEdited?(detailKey)
                             dismiss()
                         }
                         .buttonStyle(.borderedProminent)
@@ -3000,10 +3813,14 @@ private struct FMPTestSheetView: View {
     }
 }
 
+/// Schwellwert: Kursziel über 1 Mio. wird als unrealistisch behandelt (finanzen.net-Parsefehler o. ä.)
+private let kurszielUnrealistischSchwellwert: Double = 1_000_000
+
 /// Sheet zum finanzen.net-Abruf testen mit Debug-Ausgabe (pro Aktie auf der Kursziele-Karte)
 private struct FinanzenNetTestSheetView: View {
     @Bindable var aktie: Aktie
     var modelContext: ModelContext
+    var detailKey: String = ""
     var onRowEdited: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
     
@@ -3048,29 +3865,37 @@ private struct FinanzenNetTestSheetView: View {
                 if let info = result {
                     Section {
                         VStack(alignment: .leading, spacing: 6) {
-                            Text("Kursziel: \(info.kursziel, specifier: "%.2f") \(info.waehrung ?? "EUR")")
-                                .font(.headline)
-                            if let abstand = info.spalte4Durchschnitt {
-                                Text("Abstand: \(abstand >= 0 ? "+" : "")\(abstand, specifier: "%.1f")%")
-                                    .font(.caption)
+                            if info.kursziel > kurszielUnrealistischSchwellwert {
+                                Text("Unrealistisch")
+                                    .font(.headline)
                                     .foregroundColor(.secondary)
+                            } else {
+                                Text("Kursziel: \(info.kursziel, specifier: "%.2f") \(info.waehrung ?? "EUR")")
+                                    .font(.headline)
+                                if let abstand = info.spalte4Durchschnitt {
+                                    Text("Abstand: \(abstand >= 0 ? "+" : "")\(abstand, specifier: "%.1f")%")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
                             }
                         }
-                        Button("Übernehmen") {
-                            aktie.kursziel = info.kursziel
-                            aktie.kurszielDatum = info.datum
-                            aktie.kurszielAbstand = info.spalte4Durchschnitt
-                            aktie.kurszielQuelle = KurszielQuelle.finanzenNet.rawValue
-                            aktie.kurszielWaehrung = info.waehrung
-                            aktie.kurszielHigh = nil
-                            aktie.kurszielLow = nil
-                            aktie.kurszielAnalysten = nil
-                            aktie.kurszielManuellGeaendert = false
-                            try? modelContext.save()
-                            onRowEdited?(aktie.isin)
-                            dismiss()
+                        if info.kursziel <= kurszielUnrealistischSchwellwert {
+                            Button("Übernehmen") {
+                                aktie.kursziel = info.kursziel
+                                aktie.kurszielDatum = info.datum
+                                aktie.kurszielAbstand = info.spalte4Durchschnitt
+                                aktie.kurszielQuelle = KurszielQuelle.finanzenNet.rawValue
+                                aktie.kurszielWaehrung = info.waehrung
+                                aktie.kurszielHigh = nil
+                                aktie.kurszielLow = nil
+                                aktie.kurszielAnalysten = nil
+                                aktie.kurszielManuellGeaendert = false
+                                try? modelContext.save()
+                                onRowEdited?(detailKey)
+                                dismiss()
+                            }
+                            .buttonStyle(.borderedProminent)
                         }
-                        .buttonStyle(.borderedProminent)
                     } header: {
                         Text("Ergebnis")
                     }
@@ -3148,6 +3973,7 @@ private struct FinanzenNetTestSheetView: View {
 private struct SnippetTestSheetView: View {
     @Bindable var aktie: Aktie
     var modelContext: ModelContext
+    var detailKey: String = ""
     var onRowEdited: ((String) -> Void)?
     @Environment(\.dismiss) private var dismiss
     
@@ -3207,7 +4033,7 @@ private struct SnippetTestSheetView: View {
                             aktie.kurszielAnalysten = nil
                             aktie.kurszielManuellGeaendert = false
                             try? modelContext.save()
-                            onRowEdited?(aktie.isin)
+                            onRowEdited?(detailKey)
                             dismiss()
                         }
                         .buttonStyle(.borderedProminent)
@@ -3343,6 +4169,7 @@ struct RechtlichesSheetView: View {
             Group {
                 if entwicklermodus {
                     VStack(spacing: 0) {
+                        rechtlichesLinks
                         TextEditor(text: $editableText)
                             .font(.body)
                             .padding(.horizontal, 4)
@@ -3352,22 +4179,21 @@ struct RechtlichesSheetView: View {
                                     hasLoaded = true
                                 }
                             }
-                        rechtlichesLinks
                     }
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 20) {
+                            rechtlichesLinks
                             Text(displayText)
                                 .font(.body)
                                 .frame(maxWidth: .infinity, alignment: .leading)
                                 .textSelection(.enabled)
-                            rechtlichesLinks
                         }
                         .padding()
                     }
                 }
             }
-            .navigationTitle("Rechtliches")
+            .navigationTitle("Rechtliches · \(BankStore.selectedBank.name)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -3394,10 +4220,239 @@ struct RechtlichesSheetView: View {
     }
 }
 
+// MARK: - Quick Look für gebündelte Word/PDF (Programm-Beschreibung)
+#if os(iOS)
+private struct DocumentPreviewViewController: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeCoordinator() -> Coordinator { Coordinator(parent: self) }
+
+    func makeUIViewController(context: Context) -> QLPreviewController {
+        let controller = QLPreviewController()
+        controller.dataSource = context.coordinator
+        return controller
+    }
+
+    func updateUIViewController(_ uiViewController: QLPreviewController, context: Context) {}
+
+    class Coordinator: NSObject, QLPreviewControllerDataSource {
+        let parent: DocumentPreviewViewController
+        init(parent: DocumentPreviewViewController) { self.parent = parent }
+        func numberOfPreviewItems(in controller: QLPreviewController) -> Int { 1 }
+        func previewController(_ controller: QLPreviewController, previewItemAt index: Int) -> QLPreviewItem {
+            parent.url as NSURL
+        }
+    }
+}
+#endif
+
+// MARK: - Programm-Beschreibung (Startseite, Buch-Symbol; getrennt von Rechtliches, großer Bereich)
+/// Word-Datei anbinden: Im Xcode-Projekt die .docx-Datei per Drag & Drop in den Projektnavigator legen, „Copy items if needed“ und Target „Aktien“ aktivieren. Dateiname exakt: Programmbeschreibung.docx (oder Namen unten anpassen).
+private let programmBeschreibungBundleName = "Programmbeschreibung"
+private let programmBeschreibungBundleExtension = "docx"
+
+private let defaultProgrammBeschreibungText = """
+Programm-Beschreibung und Funktionsweise
+
+Hier können Sie eine ausführliche Beschreibung der App, der Bedienung und der Funktionen hinterlegen.
+
+• Startseite: Bank auswählen, CSV-Spalten zuordnen (bei anderen Banken), „Einlesen“ startet den Import für die gewählte Bank.
+• Nach „Start“: Aktienliste, Verlauf, Kursziele; „Statistik“ für Einlesungen; Einstellungen für API-Keys und CSV-Zuordnung.
+• Fester Wert (z. B. Bankleistungsnummer): In der CSV-Zuordnung „Fester Wert“ wählen – gilt für alle Zeilen dieser Bank.
+• Einlesung löschen: In der Statistik pro Einlesung möglich; löscht alle zugehörigen Positionen (gleiches Datum).
+
+Im Entwicklermodus (Einstellungen) ist dieser Text bearbeitbar und wird gespeichert.
+"""
+
+#if os(iOS)
+private struct BundledDocumentSheetView: View {
+    let url: URL
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            DocumentPreviewViewController(url: url)
+                .ignoresSafeArea(.container)
+                .navigationTitle("Programm-Beschreibung")
+                .navigationBarTitleDisplayMode(.inline)
+                .toolbar {
+                    ToolbarItem(placement: .cancellationAction) {
+                        Button("Schließen") { dismiss() }
+                    }
+                }
+        }
+    }
+}
+#endif
+
+struct ProgrammBeschreibungSheetView: View {
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage("ProgrammBeschreibungText") private var programmBeschreibungText = ""
+    @AppStorage("Entwicklermodus") private var entwicklermodus = false
+    @State private var editableText = ""
+    @State private var hasLoaded = false
+    @State private var showBundledDocument = false
+
+    private var displayText: String {
+        programmBeschreibungText.isEmpty ? defaultProgrammBeschreibungText : programmBeschreibungText
+    }
+
+    private var bundledDocumentURL: URL? {
+        #if os(iOS)
+        return Bundle.main.url(forResource: programmBeschreibungBundleName, withExtension: programmBeschreibungBundleExtension)
+        #else
+        return nil
+        #endif
+    }
+
+    var body: some View {
+        NavigationStack {
+            Group {
+                if entwicklermodus {
+                    VStack(spacing: 0) {
+                        if bundledDocumentURL != nil {
+                            Button {
+                                showBundledDocument = true
+                            } label: {
+                                Label("Vollständige Beschreibung (Word) öffnen", systemImage: "doc.fill")
+                                    .frame(maxWidth: .infinity)
+                                    .padding(.vertical, 8)
+                            }
+                            .buttonStyle(.bordered)
+                            .padding(.horizontal, 16)
+                            .padding(.top, 12)
+                        }
+                        TextEditor(text: $editableText)
+                            .font(.body)
+                            .padding(16)
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .onAppear {
+                                if !hasLoaded {
+                                    editableText = programmBeschreibungText.isEmpty ? defaultProgrammBeschreibungText : programmBeschreibungText
+                                    hasLoaded = true
+                                }
+                            }
+                    }
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 16) {
+                            if bundledDocumentURL != nil {
+                                Button {
+                                    showBundledDocument = true
+                                } label: {
+                                    Label("Vollständige Beschreibung (Word) öffnen", systemImage: "doc.fill")
+                                        .font(.headline)
+                                        .frame(maxWidth: .infinity)
+                                        .padding(.vertical, 12)
+                                }
+                                .buttonStyle(.borderedProminent)
+                                Divider()
+                            }
+                            Text(displayText)
+                                .font(.body)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .textSelection(.enabled)
+                        }
+                        .padding(24)
+                    }
+                }
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .navigationTitle("Programm-Beschreibung")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Schließen") {
+                        dismiss()
+                    }
+                }
+                if entwicklermodus {
+                    ToolbarItem(placement: .confirmationAction) {
+                        Button("Speichern") {
+                            programmBeschreibungText = editableText
+                            dismiss()
+                        }
+                    }
+                }
+            }
+        }
+        #if os(iOS)
+        .sheet(isPresented: $showBundledDocument) {
+            if let url = bundledDocumentURL {
+                BundledDocumentSheetView(url: url)
+            }
+        }
+        #endif
+        .onAppear {
+            if entwicklermodus && !hasLoaded {
+                editableText = programmBeschreibungText.isEmpty ? defaultProgrammBeschreibungText : programmBeschreibungText
+                hasLoaded = true
+            }
+        }
+    }
+}
+
+/// Sheet zum Teilen/Speichern der exportierten CSV
+struct ExportCSVShareSheet: View {
+    let fileURL: URL
+    var onDismiss: () -> Void = {}
+    
+    var body: some View {
+        #if os(iOS)
+        ShareSheetController(activityItems: [fileURL]) {
+            onDismiss()
+        }
+        #elseif os(macOS)
+        VStack(spacing: 20) {
+            Image(systemName: "doc.text")
+                .font(.system(size: 40))
+                .foregroundColor(.accentColor)
+            Text("CSV exportiert")
+                .font(.headline)
+            Text(fileURL.lastPathComponent)
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .lineLimit(2)
+                .multilineTextAlignment(.center)
+            Text("Über „Im Finder anzeigen“ können Sie die Datei prüfen oder weitergeben.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+            HStack(spacing: 16) {
+                Button("Im Finder anzeigen") {
+                    NSWorkspace.shared.activateFileViewerSelecting([fileURL])
+                    onDismiss()
+                }
+                .buttonStyle(.borderedProminent)
+                Button("Schließen") { onDismiss() }
+                    .buttonStyle(.bordered)
+            }
+        }
+        .padding(32)
+        .frame(minWidth: 320, minHeight: 200)
+        #endif
+    }
+}
+
+#if os(iOS)
+private struct ShareSheetController: UIViewControllerRepresentable {
+    let activityItems: [Any]
+    var onDismiss: (() -> Void)?
+    
+    func makeUIViewController(context: Context) -> UIActivityViewController {
+        let vc = UIActivityViewController(activityItems: activityItems, applicationActivities: nil)
+        vc.completionWithItemsHandler = { _, _, _, _ in onDismiss?() }
+        return vc
+    }
+    func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+}
+#endif
+
 struct CSVSpaltenZuordnungView: View {
-    @State private var mapping: [String: String] = loadCSVColumnMapping()
-    @AppStorage(csvFieldSeparatorUserDefaultsKey) private var fieldSeparator = "auto"
-    @AppStorage(csvDecimalSeparatorUserDefaultsKey) private var decimalSeparator = "german"
+    let bank: Bank
+    @State private var mapping: [String: String] = [:]
+    @State private var fieldSeparator = "auto"
+    @State private var decimalSeparator = "german"
     @Environment(\.dismiss) private var dismiss
     
     private func binding(for id: String) -> Binding<String> {
@@ -3405,20 +4460,59 @@ struct CSVSpaltenZuordnungView: View {
             get: { mapping[id] ?? "" },
             set: { newValue in
                 var m = mapping
-                if newValue.trimmingCharacters(in: .whitespaces).isEmpty {
+                if newValue.trimmingCharacters(in: .whitespaces).isEmpty, !newValue.hasPrefix("=") {
                     m.removeValue(forKey: id)
                 } else {
-                    m[id] = newValue.trimmingCharacters(in: .whitespaces)
+                    m[id] = newValue.hasPrefix("=") ? newValue : newValue.trimmingCharacters(in: .whitespaces)
                 }
                 mapping = m
             }
         )
     }
-    
+
+    /// Picker-Auswahl: Spalte (A,B,C…) oder "=" für Fester Wert
+    private func bindingColumnOrFixed(for id: String) -> Binding<String> {
+        Binding(
+            get: { (mapping[id] ?? "").hasPrefix("=") ? "=" : (mapping[id] ?? "") },
+            set: { newValue in
+                var m = mapping
+                if newValue == "=" {
+                    let rest = (mapping[id] ?? "").hasPrefix("=") ? String((mapping[id] ?? "").dropFirst(1)) : ""
+                    m[id] = "=" + rest
+                } else {
+                    m[id] = newValue
+                }
+                mapping = m
+            }
+        )
+    }
+
+    /// Nur der Teil nach "=" (fester Wert)
+    private func bindingFixedValue(for id: String) -> Binding<String> {
+        Binding(
+            get: {
+                let v = mapping[id] ?? ""
+                return v.hasPrefix("=") ? String(v.dropFirst(1)) : ""
+            },
+            set: { newValue in
+                var m = mapping
+                m[id] = "=" + newValue
+                mapping = m
+            }
+        )
+    }
+
     var body: some View {
         Form {
             Section {
-                Text("Tragen Sie rechts den exakten Spaltennamen aus Ihrer CSV-Datei ein (so wie in der ersten Zeile Ihrer Datei). Links steht die Bedeutung in der App. Nach „Speichern“ wird beim CSV-Import diese Zuordnung verwendet.")
+                Text("Möglichst ISIN und WKN in der CSV mitgeben. Ohne ISIN kann die App sie aus der WKN ermitteln – bei US-/GB-ISIN kann die automatische Ermittlung jedoch falsche Werte liefern (dann in der Detailansicht „ISIN zurücksetzen“).")
+                    .font(.subheadline)
+                    .textSelection(.enabled)
+            } header: {
+                Text("CSV-Schnittstelle")
+            }
+            Section {
+                Text("Öffnen Sie Ihre CSV in Excel, dann ordnen Sie jeder Spalte (A, B, C, … wie in Excel) das passende App-Feld zu. Aus Spalte A wird dann der Text in das zugeordnete Feld gelesen usw. Wenn die CSV ein Feld nicht hat (z. B. keine Bankleistungsnummer), wählen Sie „Fester Wert“ und tragen z. B. = Ihre Kontonummer ein oder 1. Wichtig: Nach dem Ändern „Speichern“ tippen – und beim Einlesen muss dieselbe Bank ausgewählt sein (Haken auf der Startseite).")
                     .font(.subheadline)
                     .textSelection(.enabled)
             } header: {
@@ -3426,22 +4520,40 @@ struct CSVSpaltenZuordnungView: View {
             }
             Section {
                 ForEach(csvSpaltenFields) { field in
-                    HStack(alignment: .top, spacing: 12) {
-                        Text(field.label)
-                            .font(.subheadline)
-                            .foregroundColor(field.optional ? .secondary : .primary)
-                        Spacer(minLength: 8)
-                        TextField("Spaltenname in Ihrer CSV", text: binding(for: field.id))
-                            .font(.subheadline)
-                            .multilineTextAlignment(.trailing)
-                            .autocapitalization(.none)
-                            .disableAutocorrection(true)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(alignment: .center, spacing: 12) {
+                            Text(field.label)
+                                .font(.subheadline)
+                                .foregroundColor(field.optional ? .secondary : .primary)
+                            Spacer(minLength: 8)
+                            Picker("Spalte", selection: bindingColumnOrFixed(for: field.id)) {
+                                Text("—").tag("")
+                                ForEach(csvColumnLetterOptions.dropFirst(), id: \.self) { letter in
+                                    Text(letter).tag(letter)
+                                }
+                                Text("Fester Wert").tag("=")
+                            }
+                            .labelsHidden()
+                            .pickerStyle(.menu)
+                            .frame(minWidth: 100)
+                        }
+                        if field.id == "bankleistungsnummer" {
+                            Text("Keine Depot-/BL-Nummer in der CSV? → „Fester Wert“ wählen und z. B. = Ihre Kontonummer eintragen oder 1.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        if (mapping[field.id] ?? "").hasPrefix("=") {
+                            TextField("Fester Wert (z. B. für alle Zeilen)", text: bindingFixedValue(for: field.id))
+                                .font(.subheadline)
+                                .textFieldStyle(.roundedBorder)
+                                .autocapitalization(.none)
+                        }
                     }
                 }
             } header: {
-                Text("Feld in der App")
+                Text("App-Feld")
             } footer: {
-                Text("Basis: Ohne Zuordnung (oder nach „Zurücksetzen“) verwendet die App wie bisher das normale Layout (Deutsche Bank / maxblue). Mindestens Bankleistungsnummer, Bestand, Bezeichnung und WKN sollten Sie zuordnen. Die Spaltenreihenfolge in der CSV ist beliebig – die Zuordnung erfolgt rein über die Spaltennamen in der ersten Zeile.")
+                Text("Spalte A/B/C = aus dieser CSV-Spalte wird der Wert ins App-Feld gelesen. „Fester Wert“ = keine Spalte, gleicher Wert für jede Zeile (z. B. Bankleistungsnummer = Ihre Kontonummer oder 1). Pflicht: Bankleistungsnummer (Spalte oder Fester Wert), Bezeichnung, Bestand, WKN. ISIN optional.\n\nBeim Speichern wird diese Bank ausgewählt – der Import verwendet dann diese Zuordnung.")
             }
             Section {
                 Picker("Feldtrenner", selection: $fieldSeparator) {
@@ -3457,7 +4569,7 @@ struct CSVSpaltenZuordnungView: View {
             } header: {
                 Text("Format der CSV-Datei")
             } footer: {
-                Text("Feldtrenner: Zeichen zwischen den Spalten. „Automatisch“ erkennt ; oder , oder Tab aus der ersten Zeile. Dezimaltrennzeichen: Komma (deutsch) oder Punkt (englisch) bei Zahlen.")
+                Text("Feldtrenner: Zeichen zwischen den Spalten. Dezimaltrennzeichen: Komma (deutsch) oder Punkt (englisch) bei Zahlen.")
             }
             Section {
                 Button("Zurücksetzen (Standard Deutsche Bank / maxblue)") {
@@ -3466,20 +4578,24 @@ struct CSVSpaltenZuordnungView: View {
                 .foregroundColor(.orange)
             }
         }
-        .navigationTitle("CSV-Spalten zuordnen")
+        .navigationTitle("CSV: \(bank.name)")
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Speichern") {
-                    saveCSVColumnMapping(mapping)
+                    BankStore.saveCSVColumnMapping(mapping, for: bank.id)
+                    BankStore.saveCSVFieldSeparator(fieldSeparator, for: bank.id)
+                    BankStore.saveCSVDecimalSeparator(decimalSeparator, for: bank.id)
+                    BankStore.setSelectedBank(bank)
+                    NotificationCenter.default.post(name: .csvMappingDidSave, object: nil)
                     dismiss()
                 }
             }
         }
         .onAppear {
-            if mapping.isEmpty {
-                mapping = loadCSVColumnMapping()
-            }
+            mapping = BankStore.loadCSVColumnMapping(for: bank.id)
+            fieldSeparator = BankStore.loadCSVFieldSeparator(for: bank.id)
+            decimalSeparator = BankStore.loadCSVDecimalSeparator(for: bank.id)
         }
     }
 }
@@ -3599,7 +4715,7 @@ struct WatchlistView: View {
                     Text("Einträge erscheinen in der Aktien-Liste unter Bankleistungsnummer 999999 mit Kennzeichnung „Watchlist“ und werden bei der normalen CSV-Einlesung aktualisiert.")
                 }
             }
-            .navigationTitle("Watchlist")
+            .navigationTitle("Watchlist · \(BankStore.selectedBank.name)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -3758,7 +4874,7 @@ struct DebugLogSheet: View {
                     }
                 }
             }
-            .navigationTitle("Debug-Log")
+            .navigationTitle("Debug-Log · \(BankStore.selectedBank.name)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -4015,7 +5131,7 @@ struct WKNTesterView: View {
                 else if wkn.contains("finanzen.net") { selectedTestQuelle = .finanzenNet }
                 else if !wkn.isEmpty { selectedTestQuelle = .openAI }
             }
-            .navigationTitle("WKN Testen")
+            .navigationTitle("WKN Testen · \(BankStore.selectedBank.name)")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -4093,6 +5209,7 @@ struct SettingsView: View {
     @Binding var fmpAPIKey: String
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
+    @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
     @Environment(\.dismiss) private var dismiss
     @State private var showFilePicker = false
     @State private var keyImportMessage: String? = nil
@@ -4108,10 +5225,24 @@ struct SettingsView: View {
     @State private var isTestingFMPAPIs = false
     @State private var fmpAPIsTestResult: String? = nil
     @State private var showFMPAPIsTestAlert = false
+    @State private var eingeleseneDateinamenAnzahl = 0
     
     var body: some View {
         NavigationStack {
             Form {
+                Section {
+                    Text("\(eingeleseneDateinamenAnzahl) Dateinamen in Merkliste (bereits eingelesen)")
+                        .foregroundColor(.secondary)
+                    Button("EinleseBereich bereinigen") {
+                        BankStore.clearEingeleseneDateinamen()
+                        eingeleseneDateinamenAnzahl = 0
+                    }
+                } header: {
+                    Text("Einlesen")
+                } footer: {
+                    Text("Die App merkt sich eingelesene Dateinamen und fragt bei erneuter Auswahl „Nochmal?“. Hier die Merkliste leeren, damit keine Datei mehr als bereits eingelesen gilt.")
+                }
+                
                 Section {
                     EmptyView()
                 } header: {
@@ -4134,16 +5265,6 @@ struct SettingsView: View {
                 }
                 
                 Section {
-                    NavigationLink("Spalten anderer Banken zuordnen") {
-                        CSVSpaltenZuordnungView()
-                    }
-                } header: {
-                    Text("CSV-Import")
-                } footer: {
-                    Text("Basis: Wenn nichts eingetragen bzw. keine Zuordnung gespeichert ist, bleibt das normale CSV-Layout wie bisher (Deutsche Bank / maxblue). Nur wenn Sie hier eine Zuordnung anlegen und speichern, wird diese beim Import verwendet.")
-                }
-                
-                Section {
                     Toggle("Alle Kursziele überschreiben", isOn: $forceOverwriteAllKursziele)
                 } header: {
                     Text("Kursziel-Überschreiben")
@@ -4153,10 +5274,13 @@ struct SettingsView: View {
                 
                 Section {
                     Toggle("Entwicklermodus", isOn: $entwicklermodus)
+                    #if DEBUG
+                    Toggle("Debug: Nur 1 Zeile einlesen", isOn: $debugEinlesungNurEinSatz)
+                    #endif
                 } header: {
                     Text("Entwickler")
                 } footer: {
-                    Text("Wenn an: Der Text unter „Rechtliches“ kann in der App bearbeitet und gespeichert werden.")
+                    Text("Wenn an: Der Text unter „Rechtliches“ kann in der App bearbeitet und gespeichert werden. „Debug: Nur 1 Zeile“: Beim nächsten CSV-Import wird nur die erste Zeile verarbeitet; Einlesewerte und Satz Deutsche Bank erscheinen in der Xcode-Konsole.")
                 }
                 
                 Section {
@@ -4221,7 +5345,10 @@ struct SettingsView: View {
                     }
                 }
             }
-            .navigationTitle("Einstellungen")
+            .navigationTitle("Einstellungen · \(BankStore.selectedBank.name)")
+            .onAppear {
+                eingeleseneDateinamenAnzahl = BankStore.eingeleseneDateinamen().count
+            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Fertig") { dismiss() }

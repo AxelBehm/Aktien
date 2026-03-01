@@ -39,11 +39,32 @@ struct AktienApp: App {
 
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
         .modelContainer(sharedModelContainer)
         #if os(macOS)
         .defaultSize(width: 1000, height: 700)
         #endif
+    }
+}
+
+/// Beim Start: Bank-Auswahl. Nach Tipp auf „Start“ → Aktien-App. Keine Bank automatisch – bei leerer Liste immer Startseite.
+private struct RootView: View {
+    @Bindable private var startState = StartState.shared
+
+    var body: some View {
+        Group {
+            if BankStore.loadBanks().isEmpty {
+                BankStartView()
+            } else if startState.hasStarted {
+                ContentView()
+            } else {
+                BankStartView()
+            }
+        }
+        .id(startState.hasStarted)
+        .onReceive(NotificationCenter.default.publisher(for: .returnToStartAfterImport)) { _ in
+            startState.hasStarted = false
+        }
     }
 }

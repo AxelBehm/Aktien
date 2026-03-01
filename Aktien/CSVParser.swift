@@ -9,20 +9,32 @@ import Foundation
 
 class CSVParser {
     
-    private static let csvColumnMappingUserDefaultsKey = "CSVColumnMapping"
-    private static let csvFieldSeparatorUserDefaultsKey = "CSVFieldSeparator"
-    private static let csvDecimalSeparatorUserDefaultsKey = "CSVDecimalSeparator"
-    
-    /// Liefert die benutzerdefinierte Spaltenzuordnung (Feld-ID → CSV-Header). Wenn nicht vorhanden oder zu wenige Pflichtfelder, nil.
+    /// Liefert die Spaltenzuordnung (Feld-ID → Spaltenbuchstabe A,B,C oder "=fester Wert"). Wenn zu wenige Pflichtfelder, nil.
     private static func loadCustomColumnMapping() -> [String: String]? {
-        guard let data = UserDefaults.standard.data(forKey: csvColumnMappingUserDefaultsKey),
-              let decoded = try? JSONDecoder().decode([String: String].self, from: data) else { return nil }
+        guard let decoded = BankStore.loadActiveBankCSVMapping() else { return nil }
         let required = ["bankleistungsnummer", "bestand", "bezeichnung", "wkn"]
-        let hasRequired = required.allSatisfy { key in
-            guard let h = decoded[key] else { return false }
-            return !h.trimmingCharacters(in: .whitespaces).isEmpty
+        func isValid(_ val: String?) -> Bool {
+            guard let v = val else { return false }
+            if v.hasPrefix("=") { return !v.dropFirst(1).trimmingCharacters(in: .whitespaces).isEmpty }
+            return columnLetterToIndex(v) >= 0
         }
+        let hasRequired = required.allSatisfy { isValid(decoded[$0]) }
         return hasRequired ? decoded : nil
+    }
+
+    /// Spaltenbuchstabe (A, B, …, Z, AA, AB, …) in 0-basierenden Index. Ungültig → -1.
+    private static func columnLetterToIndex(_ letter: String) -> Int {
+        let s = letter.trimmingCharacters(in: .whitespaces).uppercased()
+        guard !s.isEmpty else { return -1 }
+        if s.count == 1 {
+            let c = s.unicodeScalars.first!.value
+            guard c >= 65, c <= 90 else { return -1 }
+            return Int(c) - 65
+        }
+        if s.count == 2, s.hasPrefix("A") {
+            return 26 + columnLetterToIndex(String(s.dropFirst()))
+        }
+        return -1
     }
     
     // Deutsche Zahlenformate: Komma als Dezimaltrennzeichen
@@ -41,41 +53,81 @@ class CSVParser {
         return formatter
     }()
     
-    /// Parst eine CSV-Datei und gibt ein Array von Aktien zurück
-    static func parseCSV(from url: URL) throws -> [Aktie] {
-        let content = try String(contentsOf: url, encoding: .utf8)
-        return parseCSV(from: content)
+    /// Entfernt UTF-8-BOM und andere unsichtbare Zeichen am Dateianfang (z. B. von Excel-Export).
+    private static func stripBOMAndNormalize(_ content: String) -> String {
+        var s = content
+        if s.hasPrefix("\u{FEFF}") { s = String(s.dropFirst()) }
+        return s.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
     }
     
+    /// Parst eine CSV-Datei und gibt ein Array von Aktien zurück
+    static func parseCSV(from url: URL) throws -> [Aktie] {
+        var content = try String(contentsOf: url, encoding: .utf8)
+        if content.isEmpty { content = try String(contentsOf: url, encoding: .isoLatin1) }
+        return parseCSV(from: stripBOMAndNormalize(content))
+    }
+    
+    /// Format-Fingerabdruck für eine CSV-Datei (Spaltenanzahl der ersten Datenzeile). Zum Abgleich mit gespeichertem Wert pro Bank.
+    static func computeFingerprint(from url: URL) -> String? {
+        guard var content = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        if content.isEmpty, let latin1 = try? String(contentsOf: url, encoding: .isoLatin1) { content = latin1 }
+        let text = stripBOMAndNormalize(content)
+        let lines = text.components(separatedBy: "\n").map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+        guard lines.count >= 2 else { return nil }
+        let firstLine = lines[0]
+        let delimiter = resolveDelimiter(firstLine: firstLine)
+        let firstDataLine = lines[1]
+        let columns = splitCSVLine(firstDataLine, delimiter: delimiter)
+        return "\(columns.count)"
+    }
+
     /// Parst CSV-Datei und gibt Aktien + Statistik zurück (für Diagnose).
     /// Kursziel: aus Spalte „Kursziel_EUR“, „Kursziel“ oder letzter Spalte (Zahl) – wenn vorhanden, wird in der App keine Ermittlung durchgeführt.
     /// Optional: Kursziel_Quelle (z. B. aus Python-Script).
     /// hadKursziele: true, wenn mindestens eine Zeile ein Kursziel aus der CSV geliefert hat (dann werden C-markierten nicht neu berechnet; sonst schon).
-    static func parseCSVWithStats(from url: URL) throws -> (aktien: [Aktie], zeilenGesamt: Int, zeilenImportiert: Int, hadKursziele: Bool) {
-        var content = try String(contentsOf: url, encoding: .utf8)
-        if content.isEmpty, let latin1 = try? String(contentsOf: url, encoding: .isoLatin1) {
-            content = latin1
+    /// firstFailureLine: 1-basierte Datenzeilennummer (Zeile 2 = erste Datenzeile nach Header), bei der die erste Zeile nicht zugeordnet werden konnte.
+    /// firstFailureDiagnostic: Kurzbeschreibung (Feld, gelesener Wert, Grund) für diese Zeile.
+    /// filePreview: Erste Zeile (max 120 Zeichen) + Hex der ersten Bytes, für Diagnose bei 0 importierten Zeilen.
+    static func parseCSVWithStats(from url: URL) throws -> (aktien: [Aktie], zeilenGesamt: Int, zeilenImportiert: Int, hadKursziele: Bool, firstFailureLine: Int?, firstFailureDiagnostic: String?, filePreview: String?) {
+        let data = try Data(contentsOf: url)
+        var content = String(data: data, encoding: .utf8)
+        if content == nil || content?.isEmpty == true {
+            content = String(data: data, encoding: .isoLatin1)
         }
-        content = content.replacingOccurrences(of: "\r\n", with: "\n").replacingOccurrences(of: "\r", with: "\n")
-        let lines = content.components(separatedBy: "\n")
+        var text = content ?? ""
+        text = stripBOMAndNormalize(text)
+        let firstLineRaw = text.components(separatedBy: "\n").first ?? ""
+        let previewLine = String(firstLineRaw.prefix(120))
+        let hexBytes = data.prefix(24).map { String(format: "%02X", $0) }.joined(separator: " ")
+        let filePreview = "Erste Zeile (max 120 Zeichen): \(previewLine)\nErste 24 Bytes (Hex): \(hexBytes) (EF BB BF = BOM)"
+        let lines = text.components(separatedBy: "\n")
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
         let dataLines = lines.count > 1 ? Array(lines.dropFirst()) : []
         let delimiter = resolveDelimiter(firstLine: lines.first ?? "")
         let headerMap = buildHeaderMap(firstLine: lines.first ?? "", delimiter: delimiter)
-        let customMapping = loadCustomColumnMapping()
+        let validMapping = loadCustomColumnMapping()
+        let rawMapping = BankStore.loadActiveBankCSVMapping()
+        let mappingToUse = validMapping ?? (rawMapping.flatMap { $0.isEmpty ? nil : $0 })
         var aktien: [Aktie] = []
-        for line in dataLines {
+        var firstFailureLine: Int?
+        var firstFailureDiagnostic: String?
+        for (index, line) in dataLines.enumerated() {
             let aktie: Aktie?
-            if let map = customMapping {
-                aktie = parseLineWithMapping(line, delimiter: delimiter, headerMap: headerMap, columnMapping: map)
+            if let map = mappingToUse {
+                let (a, diag) = parseLineWithMapping(line, delimiter: delimiter, headerMap: headerMap, columnMapping: map)
+                aktie = a
+                if aktie == nil, firstFailureDiagnostic == nil, let d = diag {
+                    firstFailureLine = index + 2
+                    firstFailureDiagnostic = d
+                }
             } else {
                 aktie = parseLine(line, delimiter: delimiter, headerMap: headerMap)
             }
             if let a = aktie { aktien.append(a) }
         }
         let hadKursziele = aktien.contains { $0.kursziel != nil }
-        return (aktien, dataLines.count, aktien.count, hadKursziele)
+        return (aktien, dataLines.count, aktien.count, hadKursziele, firstFailureLine, firstFailureDiagnostic, filePreview)
     }
     
     /// Baut Map Spaltenname (lowercased) -> Index für Header-basiertes Parsing
@@ -132,9 +184,9 @@ class CSVParser {
         return ";" // Standard für deutsche CSV
     }
     
-    /// Liefert das zu verwendende Feldtrennzeichen: Nutzereinstellung oder Auto-Erkennung.
+    /// Liefert das zu verwendende Feldtrennzeichen: Einstellung der aktiven Bank oder Auto-Erkennung.
     private static func resolveDelimiter(firstLine: String) -> Character {
-        let key = UserDefaults.standard.string(forKey: csvFieldSeparatorUserDefaultsKey) ?? "auto"
+        let key = BankStore.activeBankFieldSeparator()
         switch key {
         case "semicolon": return ";"
         case "comma": return ","
@@ -158,7 +210,7 @@ class CSVParser {
         for line in dataLines {
             let aktie: Aktie?
             if let map = customMapping {
-                aktie = parseLineWithMapping(line, delimiter: delimiter, headerMap: headerMap, columnMapping: map)
+                aktie = parseLineWithMapping(line, delimiter: delimiter, headerMap: headerMap, columnMapping: map).0
             } else {
                 aktie = parseLine(line, delimiter: delimiter, headerMap: headerMap)
             }
@@ -185,24 +237,56 @@ class CSVParser {
         return ""
     }
     
-    /// Parst eine Zeile nur über die benutzerdefinierte Spaltenzuordnung (CSV-Header → App-Feld). Spaltenreihenfolge ist beliebig – Zuordnung erfolgt rein über die Spaltennamen in der Kopfzeile.
-    private static func parseLineWithMapping(_ line: String, delimiter: Character, headerMap: [String: Int], columnMapping: [String: String]) -> Aktie? {
+    /// Format für Diagnose: Spalte oder „Fester Wert“
+    private static func spalteOderFesterWert(_ raw: String?) -> String {
+        guard let r = raw, !r.isEmpty else { return "nicht zugeordnet" }
+        if r.hasPrefix("=") { return "Fester Wert" }
+        return "Spalte \(r)"
+    }
+    
+    /// Parst eine Zeile über die Spaltenzuordnung (App-Feld → Spaltenbuchstabe A, B, C, …). Der Nutzer ordnet in Excel sichtbare Spalten (A, B, C) zu.
+    /// Bei Fehler: zweiter Rückgabewert = Diagnose (Feld, gelesener Wert, Grund).
+    private static func parseLineWithMapping(_ line: String, delimiter: Character, headerMap: [String: Int], columnMapping: [String: String]) -> (Aktie?, diagnostic: String?) {
         let columns = splitCSVLine(line, delimiter: delimiter)
         func valueFor(_ fieldId: String) -> String? {
-            guard let csvHeader = columnMapping[fieldId], !csvHeader.trimmingCharacters(in: .whitespaces).isEmpty,
-                  let idx = headerMap[csvHeader.trimmingCharacters(in: .whitespaces).lowercased()], idx < columns.count else { return nil }
+            guard let raw = columnMapping[fieldId], !raw.isEmpty else { return nil }
+            if raw.hasPrefix("=") {
+                let fixed = String(raw.dropFirst(1)).trimmingCharacters(in: .whitespaces)
+                if fixed.isEmpty { return nil }
+                return fixed
+            }
+            let idx = columnLetterToIndex(raw)
+            guard idx >= 0, idx < columns.count else { return nil }
             let s = columns[idx].trimmingCharacters(in: .whitespaces)
             return s.isEmpty ? nil : s
         }
-        guard let bankleistungsnummer = valueFor("bankleistungsnummer"), !bankleistungsnummer.isEmpty,
-              let bezeichnung = valueFor("bezeichnung"), !bezeichnung.isEmpty,
-              let wkn = valueFor("wkn") else { return nil }
+        func rawFor(_ fieldId: String) -> String {
+            let v = valueFor(fieldId)
+            if let v = v { return v.isEmpty ? "(leer)" : v }
+            return "(leer)"
+        }
+        guard let bankleistungsnummer = valueFor("bankleistungsnummer"), !bankleistungsnummer.isEmpty else {
+            return (nil, "Bankleistungsnummer (\(spalteOderFesterWert(columnMapping["bankleistungsnummer"]))): gelesen '\(rawFor("bankleistungsnummer"))' – muss ausgefüllt sein (oder Fester Wert)")
+        }
+        guard let bezeichnung = valueFor("bezeichnung"), !bezeichnung.isEmpty else {
+            return (nil, "Bezeichnung (\(spalteOderFesterWert(columnMapping["bezeichnung"]))): gelesen '\(rawFor("bezeichnung"))' – muss ausgefüllt sein")
+        }
+        guard let wkn = valueFor("wkn"), !wkn.isEmpty else {
+            return (nil, "WKN (\(spalteOderFesterWert(columnMapping["wkn"]))): gelesen '\(rawFor("wkn"))' – muss ausgefüllt sein")
+        }
         // Summen- und Kopfzeilen nicht als Position importieren (z. B. „Zwischensumme“, wiederholte Kopfzeile)
         let bezeichnungNorm = bezeichnung.lowercased().trimmingCharacters(in: .whitespaces)
-        if summenKopfStichwoerter.contains(bezeichnungNorm) { return nil }
-        if bezeichnungNorm.hasPrefix("zwischensumme") || bezeichnungNorm.hasPrefix("summe ") || bezeichnungNorm.hasPrefix("gesamtsumme") { return nil }
+        if summenKopfStichwoerter.contains(bezeichnungNorm) {
+            return (nil, "Bezeichnung '\(bezeichnung)' – Summen-/Kopfzeile wird übersprungen")
+        }
+        if bezeichnungNorm.hasPrefix("zwischensumme") || bezeichnungNorm.hasPrefix("summe ") || bezeichnungNorm.hasPrefix("gesamtsumme") {
+            return (nil, "Bezeichnung '\(bezeichnung)' – Summenzeile wird übersprungen")
+        }
+        let bestandStr = valueFor("bestand") ?? ""
         let bestandVal = valueFor("bestand").flatMap { parseDouble($0) } ?? 0.0
-        guard bestandVal >= 0 else { return nil }
+        guard bestandVal >= 0 else {
+            return (nil, "Bestand (\(spalteOderFesterWert(columnMapping["bestand"]))): gelesen '\(bestandStr.isEmpty ? "(leer)" : bestandStr)' – keine gültige Zahl (≥ 0)")
+        }
         let bestand = bestandVal
         let isin = valueFor("isin") ?? ""
         let waehrung = (valueFor("waehrung") ?? "").isEmpty ? "EUR" : (valueFor("waehrung") ?? "EUR")
@@ -221,10 +305,9 @@ class CSVParser {
         let branche = (valueFor("branche") ?? "").isEmpty ? "-" : (valueFor("branche") ?? "-")
         let risikoklasse = (valueFor("risikoklasse") ?? "").isEmpty ? "-" : (valueFor("risikoklasse") ?? "-")
         var depotPortfolioName = valueFor("depotPortfolioName") ?? ""
-        // Fallback: Konto/Depot-Spalte auch über typische CSV-Header finden (z. B. „Konto“, „Neues Konto“, „Depot“)
-        if depotPortfolioName.isEmpty {
+        // Fallback: wenn nicht per Spalte zugeordnet, über typische Header suchen (optional)
+        if depotPortfolioName.isEmpty, !headerMap.isEmpty {
             depotPortfolioName = valueForFirstMatchingHeader(columns: columns, headerMap: headerMap, names: ["konto", "neues konto", "depot", "depotname", "kontonummer", "depotnummer", "portfolio", "kontobezeichnung", "depotbezeichnung"])
-            // Zusätzlich: Jeden Header prüfen, der „konto“, „depot“ oder „portfolio“ enthält
             if depotPortfolioName.isEmpty {
                 for (headerName, headerIdx) in headerMap {
                     let lower = headerName.lowercased()
@@ -242,7 +325,7 @@ class CSVParser {
             kurszielQuelle = mapKurszielQuelle(valueFor("kursziel_quelle"))
             if kurszielQuelle == nil { kurszielQuelle = "C" }
         }
-        return Aktie(
+        return (Aktie(
             bankleistungsnummer: bankleistungsnummer,
             bestand: bestand,
             bezeichnung: bezeichnung,
@@ -267,7 +350,7 @@ class CSVParser {
             kursziel: kursziel,
             kurszielQuelle: kurszielQuelle,
             kurszielWaehrung: kursziel != nil ? "EUR" : nil
-        )
+        ), nil)
     }
     
     /// Parst eine einzelne CSV-Zeile mit dem angegebenen Trennzeichen.
@@ -368,7 +451,7 @@ class CSVParser {
     private static func parseDouble(_ value: String) -> Double? {
         let trimmed = value.trimmingCharacters(in: .whitespaces)
         guard !trimmed.isEmpty else { return nil }
-        let decimalStyle = UserDefaults.standard.string(forKey: csvDecimalSeparatorUserDefaultsKey) ?? "german"
+        let decimalStyle = BankStore.activeBankDecimalSeparator()
         if decimalStyle == "english" {
             return parseDoubleEnglish(trimmed)
         }

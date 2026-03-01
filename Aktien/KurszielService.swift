@@ -219,7 +219,7 @@ class KurszielService {
         return nil
     }
     
-    /// Ruft Kursziel für eine Aktie ab. Reihenfolge: 1) FMP (wenn Key, gut → Ende), 2) Finanzen.net + Yahoo (gut → Ende), 3) OpenAI (wenn Key, gut → eintragen, sonst nichts). Kein Treffer → nil (nichts eintragen, ggf. Vortag bleibt).
+    /// Ruft Kursziel für eine Aktie ab. Wenn eine Kennung (kurszielQuelle) von der letzten erfolgreichen Ermittlung gespeichert ist, wird diese Quelle zuerst versucht; sonst: 1) FMP, 2) Finanzen.net + Yahoo, 3) OpenAI.
     /// fmpResult: optionales Vorab-Ergebnis aus Bulk-FMP (wird zuerst geprüft, kein doppelter Abruf).
     static func fetchKursziel(for aktie: Aktie, fmpResult: KurszielInfo? = nil) async -> KurszielInfo? {
         _ = await fetchAppWechselkurse()
@@ -235,66 +235,125 @@ class KurszielService {
                 return eurInfo
             }
             
-            // 1. FMP – wenn API vorhanden; kommt nichts, 0 oder unrealistisch → weiter bei 2 (Finanzen.net/Yahoo/OpenAI)
-            var fmp: KurszielInfo? = (fmpResult != nil && (fmpResult?.kursziel ?? 0) > 0) ? fmpResult : nil
-            if fmp == nil {
-                fmp = await fetchKurszielFromFMP(for: aktie)
-            }
-            if let fmp = fmp, fmp.kursziel > 0 {
-                let eurInfo = await kurszielZuEUR(info: fmp, aktie: aktie)
-                if isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) {
-                    if fmpResult == nil { zugriffeFMP += 1 }
-                    debug("   → FMP: \(eurInfo.kursziel) € (übernommen)")
-                    return eurInfo
+            /// Zuletzt erfolgreiche Quelle (wenn gesetzt): beim 2. Durchlauf zuerst diese versuchen, dann den Rest in fester Reihenfolge
+            let letzteQuelle = (aktie.kurszielQuelle?.trimmingCharacters(in: .whitespaces)).flatMap { KurszielQuelle(rawValue: $0) }
+            let bereitsErstversuch: KurszielQuelle? = letzteQuelle
+            if let q = letzteQuelle, q != .csv {
+                debug("   ⏩ Zuerst erneuter Versuch über zuletzt erfolgreiche Quelle: \(q.rawValue)")
+                switch q {
+                case .fmp:
+                    var fmp: KurszielInfo? = (fmpResult != nil && (fmpResult?.kursziel ?? 0) > 0) ? fmpResult : nil
+                    if fmp == nil { fmp = await fetchKurszielFromFMP(for: aktie) }
+                    if let fmp = fmp, fmp.kursziel > 0 {
+                        let eurInfo = await kurszielZuEUR(info: fmp, aktie: aktie)
+                        if isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) {
+                            if fmpResult == nil { zugriffeFMP += 1 }
+                            debug("   → FMP (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
+                            return eurInfo
+                        }
+                    }
+                case .finanzenNet:
+                    if let info = await fetchKurszielFromFinanzenNet(for: aktie), info.kursziel > 0,
+                       isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
+                        debug("   → Finanzen.net (Erstversuch): \(info.kursziel) € (übernommen)")
+                        return info
+                    }
+                case .yahoo:
+                    let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
+                    let yahooSymbols: [String] = [searchTerm ?? aktie.bezeichnung, aktie.wkn, aktie.isin].filter { !$0.isEmpty }
+                    for symbol in yahooSymbols {
+                        if let info = await fetchKurszielVonYahoo(symbol: symbol),
+                           let eurInfo = await nehmenWennRealistisch(info) {
+                            debug("   → Yahoo (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
+                            return eurInfo
+                        }
+                    }
+                case .openAI:
+                    let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
+                    if hatOpenAIKey, let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin),
+                       let eurInfo = await nehmenWennRealistisch(info) {
+                        debug("   → OpenAI (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
+                        return eurInfo
+                    }
+                case .suchmaschine:
+                    if istFonds(aktie), let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie),
+                       let eurInfo = await nehmenWennRealistisch(info) {
+                        debug("   → Snippet (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
+                        return eurInfo
+                    }
+                case .csv:
+                    break
                 }
-                debug("   → FMP: nichts oder unrealistisch, weiter mit Finanzen.net/Yahoo")
-            } else {
-                let hatFMPKey = (fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
-                if !hatFMPKey { debug("   → Kein FMP-Key, übersprungen") }
+                debug("   → Erstversuch über \(q.rawValue) ohne Treffer, weiter mit fester Reihenfolge")
             }
             
-            // 2. Finanzen.net und Yahoo – kommt nichts oder unrealistisch → weiter bei 4
-            if let info = await fetchKurszielFromFinanzenNet(for: aktie), info.kursziel > 0,
-               isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
-                debug("   → Finanzen.net: \(info.kursziel) € (übernommen)")
-                return info
+            // 1. FMP – wenn nicht bereits als Erstversuch versucht
+            if bereitsErstversuch != .fmp {
+                var fmp: KurszielInfo? = (fmpResult != nil && (fmpResult?.kursziel ?? 0) > 0) ? fmpResult : nil
+                if fmp == nil {
+                    fmp = await fetchKurszielFromFMP(for: aktie)
+                }
+                if let fmp = fmp, fmp.kursziel > 0 {
+                    let eurInfo = await kurszielZuEUR(info: fmp, aktie: aktie)
+                    if isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) {
+                        if fmpResult == nil { zugriffeFMP += 1 }
+                        debug("   → FMP: \(eurInfo.kursziel) € (übernommen)")
+                        return eurInfo
+                    }
+                    debug("   → FMP: nichts oder unrealistisch, weiter mit Finanzen.net/Yahoo")
+                } else {
+                    let hatFMPKey = (fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
+                    if !hatFMPKey { debug("   → Kein FMP-Key, übersprungen") }
+                }
             }
-            let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
-            // Yahoo
-            let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
-            let yahooSymbols: [String] = [searchTerm ?? aktie.bezeichnung, aktie.wkn, aktie.isin].filter { !$0.isEmpty }
-            for symbol in yahooSymbols {
-                if let info = await fetchKurszielVonYahoo(symbol: symbol) {
+            
+            // 2. Finanzen.net und Yahoo
+            if bereitsErstversuch != .finanzenNet {
+                if let info = await fetchKurszielFromFinanzenNet(for: aktie), info.kursziel > 0,
+                   isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
+                    debug("   → Finanzen.net: \(info.kursziel) € (übernommen)")
+                    return info
+                }
+            }
+            if bereitsErstversuch != .yahoo {
+                let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
+                let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
+                let yahooSymbols: [String] = [searchTerm ?? aktie.bezeichnung, aktie.wkn, aktie.isin].filter { !$0.isEmpty }
+                for symbol in yahooSymbols {
+                    if let info = await fetchKurszielVonYahoo(symbol: symbol) {
+                        if let eurInfo = await nehmenWennRealistisch(info) {
+                            debug("   → Yahoo: \(eurInfo.kursziel) € (übernommen)")
+                            return eurInfo
+                        }
+                    }
+                }
+                if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty, let info = await fetchKurszielVonAriva(slug: ersterSlug) {
                     if let eurInfo = await nehmenWennRealistisch(info) {
-                        debug("   → Yahoo: \(eurInfo.kursziel) € (übernommen)")
+                        debug("   → ariva.de: \(eurInfo.kursziel) € (übernommen)")
+                        return eurInfo
+                    }
+                }
+                if bereitsErstversuch != .suchmaschine, istFonds(aktie), let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
+                    if let eurInfo = await nehmenWennRealistisch(info) {
+                        debug("   → Snippet: \(eurInfo.kursziel) € (übernommen)")
                         return eurInfo
                     }
                 }
             }
-            if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty, let info = await fetchKurszielVonAriva(slug: ersterSlug) {
-                if let eurInfo = await nehmenWennRealistisch(info) {
-                    debug("   → ariva.de: \(eurInfo.kursziel) € (übernommen)")
-                    return eurInfo
-                }
-            }
-            if istFonds(aktie), let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
-                if let eurInfo = await nehmenWennRealistisch(info) {
-                    debug("   → Snippet: \(eurInfo.kursziel) € (übernommen)")
-                    return eurInfo
-                }
-            }
             debug("   → Finanzen.net/Yahoo: nichts oder unrealistisch, weiter mit OpenAI")
             
-            // 3. OpenAI – kommt nichts oder unrealistisch → nichts eintragen (nil)
-            let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
-            guard hatOpenAIKey else {
-                debug("   → Kein OpenAI-Key, Ende (nichts eingetragen)")
-                return nil
-            }
-            if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                if let eurInfo = await nehmenWennRealistisch(info) {
-                    debug("   → OpenAI: \(eurInfo.kursziel) € (übernommen)")
-                    return eurInfo
+            // 3. OpenAI
+            if bereitsErstversuch != .openAI {
+                let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
+                guard hatOpenAIKey else {
+                    debug("   → Kein OpenAI-Key, Ende (nichts eingetragen)")
+                    return nil
+                }
+                if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
+                    if let eurInfo = await nehmenWennRealistisch(info) {
+                        debug("   → OpenAI: \(eurInfo.kursziel) € (übernommen)")
+                        return eurInfo
+                    }
                 }
             }
             debug("   → OpenAI: nichts oder unrealistisch, nichts eingetragen")
@@ -672,6 +731,38 @@ class KurszielService {
             debug("   ❌ Kein Kursziel aus HTML geparst")
         }
         return result
+    }
+    
+    /// Ermittelt ISIN aus WKN (z. B. für Einlesung ohne ISIN-Spalte). Lädt finanzen.net/aktien/WKN und parst ISIN aus dem HTML.
+    static func fetchISINFromWKN(wkn: String) async -> String? {
+        let w = wkn.trimmingCharacters(in: .whitespaces)
+        guard w.count >= 5, w.count <= 10 else { return nil }
+        guard let url = URL(string: "https://www.finanzen.net/aktien/\(w)") else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1", forHTTPHeaderField: "User-Agent")
+            request.setValue("de-DE,de;q=0.9,en;q=0.8", forHTTPHeaderField: "Accept-Language")
+            request.setValue("https://www.finanzen.net/", forHTTPHeaderField: "Referer")
+            request.timeoutInterval = 10.0
+            let (data, _) = try await URLSession.shared.data(for: request)
+            guard let html = String(data: data, encoding: .utf8) else { return nil }
+            let isinPattern = "[A-Z]{2}[A-Z0-9]{9}[0-9]"
+            guard let regex = try? NSRegularExpression(pattern: isinPattern) else { return nil }
+            let range = NSRange(html.startIndex..., in: html)
+            let matches = regex.matches(in: html, options: [], range: range)
+            let bekanntePraefixe = ["DE", "US", "XS", "AT", "FR", "LU", "GB", "IE", "CH", "NL"]
+            for match in matches {
+                guard let r = Range(match.range, in: html) else { continue }
+                let candidate = String(html[r])
+                if candidate.count == 12, bekanntePraefixe.contains(where: { candidate.hasPrefix($0) }) {
+                    return candidate
+                }
+            }
+            if let first = matches.first, let r = Range(first.range, in: html) {
+                return String(html[r])
+            }
+        } catch { }
+        return nil
     }
     
     /// Ruft Kursziel von finanzen.net ab (Kursziel-Seite mit Slug, z.B. rheinmetall)

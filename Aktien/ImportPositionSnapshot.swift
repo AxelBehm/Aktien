@@ -20,8 +20,10 @@ final class ImportPositionSnapshot {
     var kursziel: Double?
     /// Abstand Kurs → Kursziel in %; (kursziel - kurs) / kurs * 100
     var abstandPct: Double?
+    /// Eindeutige Lauf-ID des Import-Laufs, zu dem dieser Snapshot gehört (mehrere Läufe pro Tag).
+    var importRunId: UUID?
 
-    init(importDatum: Date, isin: String, wkn: String, bankleistungsnummer: String = "", marktwertEUR: Double? = nil, kurs: Double? = nil, kursziel: Double? = nil, abstandPct: Double? = nil) {
+    init(importDatum: Date, isin: String, wkn: String, bankleistungsnummer: String = "", marktwertEUR: Double? = nil, kurs: Double? = nil, kursziel: Double? = nil, abstandPct: Double? = nil, importRunId: UUID? = nil) {
         self.importDatum = importDatum
         self.isin = isin
         self.wkn = wkn
@@ -30,5 +32,6 @@ final class ImportPositionSnapshot {
         self.kurs = kurs
         self.kursziel = kursziel
         self.abstandPct = abstandPct
+        self.importRunId = importRunId
     }
 }
