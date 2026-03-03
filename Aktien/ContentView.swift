@@ -4522,7 +4522,7 @@ struct CSVSpaltenZuordnungView: View {
                 Text("CSV-Schnittstelle")
             }
             Section {
-                Text("Öffnen Sie Ihre CSV in Excel, dann ordnen Sie jeder Spalte (A, B, C, … wie in Excel) das passende App-Feld zu. Aus Spalte A wird dann der Text in das zugeordnete Feld gelesen usw. Wenn die CSV ein Feld nicht hat (z. B. keine Bankleistungsnummer), wählen Sie „Fester Wert“ und tragen z. B. = Ihre Kontonummer ein oder 1. Wichtig: Nach dem Ändern „Speichern“ tippen – und beim Einlesen muss dieselbe Bank ausgewählt sein (Haken auf der Startseite).")
+                Text("Öffnen Sie Ihre CSV in Excel, dann ordnen Sie jeder Spalte (A, B, C, … wie in Excel) das passende App-Feld zu. Aus Spalte A wird dann der Text in das zugeordnete Feld gelesen usw. Wenn die CSV ein Feld nicht hat (z. B. keine Bankleistungsnummer), wählen Sie „Fester Wert“ und tragen z. B. = Ihre Kontonummer ein oder 1. Wenn Sie Felder nicht zuordnen können – leer lassen. Wichtig: Nach dem Ändern „Speichern“ tippen – und beim Einlesen muss dieselbe Bank ausgewählt sein (Haken auf der Startseite).")
                     .font(.subheadline)
                     .textSelection(.enabled)
             } header: {
@@ -4563,7 +4563,7 @@ struct CSVSpaltenZuordnungView: View {
             } header: {
                 Text("App-Feld")
             } footer: {
-                Text("Spalte A/B/C = aus dieser CSV-Spalte wird der Wert ins App-Feld gelesen. „Fester Wert“ = keine Spalte, gleicher Wert für jede Zeile (z. B. Bankleistungsnummer = Ihre Kontonummer oder 1). Pflicht: Bankleistungsnummer (Spalte oder Fester Wert), Bezeichnung, Bestand, WKN. ISIN optional.\n\nBeim Speichern wird diese Bank ausgewählt – der Import verwendet dann diese Zuordnung.")
+                Text("Spalte A/B/C = aus dieser CSV-Spalte wird der Wert ins App-Feld gelesen. „Fester Wert“ = keine Spalte, gleicher Wert für jede Zeile (z. B. Bankleistungsnummer = Ihre Kontonummer oder 1). Felder, die Sie nicht zuordnen können – leer lassen („—“). Pflicht: Bankleistungsnummer (Spalte oder Fester Wert), Bezeichnung, Bestand, WKN. ISIN optional.\n\nBeim Speichern wird diese Bank ausgewählt – der Import verwendet dann diese Zuordnung.")
             }
             Section {
                 Picker("Feldtrenner", selection: $fieldSeparator) {
@@ -5216,6 +5216,8 @@ struct SettingsView: View {
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
+    @AppStorage("Aktien.SubscriptionManager.simulateTrialExpired") private var simulateTrialExpired = false
+    @State private var subscriptionManager = SubscriptionManager.shared
     @Environment(\.dismiss) private var dismiss
     @State private var showFilePicker = false
     @State private var keyImportMessage: String? = nil
@@ -5231,24 +5233,43 @@ struct SettingsView: View {
     @State private var isTestingFMPAPIs = false
     @State private var fmpAPIsTestResult: String? = nil
     @State private var showFMPAPIsTestAlert = false
-    @State private var eingeleseneDateinamenAnzahl = 0
-    
     var body: some View {
         NavigationStack {
             Form {
                 Section {
-                    Text("\(eingeleseneDateinamenAnzahl) Dateinamen in Merkliste (bereits eingelesen)")
-                        .foregroundColor(.secondary)
-                    Button("EinleseBereich bereinigen") {
-                        BankStore.clearEingeleseneDateinamen()
-                        eingeleseneDateinamenAnzahl = 0
+                    if subscriptionManager.hasActiveSubscription {
+                        Label("Premium aktiv", systemImage: "checkmark.circle.fill")
+                            .foregroundStyle(.green)
+                    } else if subscriptionManager.isInFreeTrialPeriod {
+                        Text("Abo: Kostenlose Testwoche – noch \(subscriptionManager.trialRemainingDays) Tag\(subscriptionManager.trialRemainingDays == 1 ? "" : "e")")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Abo erforderlich (Paywall nach Start)")
+                            .foregroundStyle(.secondary)
+                    }
+                    Button {
+                        Task { await subscriptionManager.restore() }
+                    } label: {
+                        HStack {
+                            Text("Käufe wiederherstellen")
+                            if subscriptionManager.isPurchasing {
+                                Spacer()
+                                ProgressView()
+                                    .scaleEffect(0.8)
+                            }
+                        }
+                    }
+                    .disabled(subscriptionManager.isPurchasing)
+                    if entwicklermodus {
+                        Toggle("Trial abgelaufen simulieren", isOn: $simulateTrialExpired)
+                            .foregroundStyle(.orange)
                     }
                 } header: {
-                    Text("Einlesen")
+                    Text("Abo")
                 } footer: {
-                    Text("Die App merkt sich eingelesene Dateinamen und fragt bei erneuter Auswahl „Nochmal?“. Hier die Merkliste leeren, damit keine Datei mehr als bereits eingelesen gilt.")
+                    Text("Status der kostenlosen Woche bzw. des Abos. „Trial abgelaufen simulieren“ (nur bei Entwicklermodus): zeigt die Paywall beim nächsten Start, ohne 7 Tage zu warten – zum Testen. Abo-Kauf testen: In App Store Connect einen Sandbox-Tester anlegen; auf dem Gerät unter Einstellungen → App Store → Sandbox-Konto abmelden/anmelden. Dann in der App „Kostenlos testen & abonnieren“ – die Abbuchung erfolgt nicht wirklich.")
                 }
-                
+
                 Section {
                     EmptyView()
                 } header: {
@@ -5352,9 +5373,6 @@ struct SettingsView: View {
                 }
             }
             .navigationTitle("Einstellungen · \(BankStore.selectedBank.name)")
-            .onAppear {
-                eingeleseneDateinamenAnzahl = BankStore.eingeleseneDateinamen().count
-            }
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Fertig") { dismiss() }

@@ -38,6 +38,8 @@ extension Notification.Name {
     static let csvMappingDidSave = Notification.Name("Aktien.csvMappingDidSave")
     /// Nach Import-Alert „OK“: RootView wechselt zur Startseite (zuverlässig auf iPad).
     static let returnToStartAfterImport = Notification.Name("Aktien.returnToStartAfterImport")
+    /// „Kostenlos testen“ getippt obwohl kein Abo-Produkt → RootView soll zur Aktien-Ansicht wechseln.
+    static let subscriptionGrantAccessWithoutProduct = Notification.Name("Aktien.subscriptionGrantAccessWithoutProduct")
 }
 
 private let banksListKey = "Aktien.BanksList"

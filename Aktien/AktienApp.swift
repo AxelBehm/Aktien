@@ -48,23 +48,40 @@ struct AktienApp: App {
     }
 }
 
-/// Beim Start: Bank-Auswahl. Nach Tipp auf „Start“ → Aktien-App. Keine Bank automatisch – bei leerer Liste immer Startseite.
+/// Beim Start: Bank-Auswahl. Nach Tipp auf „Start“ → Einlese-Seite (mit Premium) oder direkt Seite „Aktien Premium“ (Paywall).
 private struct RootView: View {
     @Bindable private var startState = StartState.shared
+    @State private var subscriptionManager = SubscriptionManager.shared
+    /// „Kostenlos testen“ ohne Produkt getippt → Wechsel zur Aktien-Ansicht (Notification sorgt für zuverlässiges Update).
+    @State private var grantedAccessByButton = false
+
+    private var showContentView: Bool {
+        subscriptionManager.hasPremiumAccess || grantedAccessByButton
+    }
 
     var body: some View {
         Group {
             if BankStore.loadBanks().isEmpty {
                 BankStartView()
             } else if startState.hasStarted {
-                ContentView()
+                if showContentView {
+                    ContentView()
+                } else {
+                    PaywallView()
+                }
             } else {
                 BankStartView()
             }
         }
         .id(startState.hasStarted)
+        .onChange(of: startState.hasStarted) { _, new in
+            if !new { grantedAccessByButton = false }
+        }
         .onReceive(NotificationCenter.default.publisher(for: .returnToStartAfterImport)) { _ in
             startState.hasStarted = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .subscriptionGrantAccessWithoutProduct)) { _ in
+            grantedAccessByButton = true
         }
     }
 }

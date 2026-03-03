@@ -69,6 +69,7 @@ struct BankStartView: View {
                                 .foregroundColor(.secondary)
                         }
                         ForEach(banks) { bank in
+                            let hasValidMapping = BankStore.hasValidCSVMapping(for: bank.id)
                             HStack(spacing: 12) {
                                 Button {
                                     BankStore.setSelectedBank(bank)
@@ -91,6 +92,7 @@ struct BankStartView: View {
                                 } label: {
                                     Text("CSV")
                                         .font(.subheadline)
+                                        .foregroundStyle(.blue)
                                 }
                                 .fixedSize()
                                 .contentShape(Rectangle())
@@ -101,11 +103,13 @@ struct BankStartView: View {
                                 } label: {
                                     Text("Einlesen")
                                         .font(.subheadline)
+                                        .foregroundStyle(hasValidMapping ? .blue : .secondary)
                                 }
                                 .buttonStyle(.borderless)
                                 .fixedSize()
                                 .contentShape(Rectangle())
-                                .disabled(!BankStore.hasValidCSVMapping(for: bank.id))
+                                .disabled(!hasValidMapping)
+                                .allowsHitTesting(hasValidMapping)
                             }
                             .contextMenu {
                                 Button {
@@ -121,6 +125,7 @@ struct BankStartView: View {
                                 }
                             }
                         }
+                        .id(csvMappingRefresh)
                     } header: {
                         HStack {
                             Text("Legen Sie alle Banken mit ihren Depots hier an. Markieren Sie die Bank, mit der Sie Daten einlesen wollen.")
@@ -138,20 +143,18 @@ struct BankStartView: View {
                     }
                     
                     Section {
-                        HStack {
-                            Text("\(eingeleseneDateinamenAnzahl) Dateinamen in Merkliste")
-                                .foregroundColor(.secondary)
-                            Spacer()
-                            Button("EinleseBereich bereinigen") {
-                                BankStore.clearEingeleseneDateinamen()
-                                eingeleseneDateinamenAnzahl = 0
-                            }
-                            .font(.subheadline)
+                        Text("\(eingeleseneDateinamenAnzahl) Dateinamen in Merkliste")
+                            .foregroundColor(.secondary)
+                        Button("EinleseBereich bereinigen") {
+                            BankStore.clearEingeleseneDateinamen()
+                            eingeleseneDateinamenAnzahl = 0
                         }
+                        .font(.subheadline)
+                        .foregroundStyle(.blue)
                     } header: {
                         Text("Einlesen")
                     } footer: {
-                        Text("Merkliste leeren, damit keine Datei mehr als „bereits eingelesen“ gilt.")
+                        Text("Merkliste leeren, damit keine Datei mehr als „bereits eingelesen“ gilt. Nur der blaue Button leert die Merkliste.")
                     }
                     
                     Section("Letzte Einlesung pro Bank") {
@@ -321,6 +324,7 @@ struct BankStartView: View {
                                     let wasEmpty = banks.isEmpty
                                     let added = BankStore.addBank(name: finalName, bankType: newBankType)
                                     banks = BankStore.loadBanks()
+                                    csvMappingRefresh = UUID()
                                     if wasEmpty {
                                         BankStore.setSelectedBank(added)
                                         selectedBankId = added.id
