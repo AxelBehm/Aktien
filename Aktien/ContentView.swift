@@ -2044,17 +2044,41 @@ struct ContentView: View {
     }
     
     /// Prüft, ob die Filter-Nummer im Dateitext vorkommt – als eigenständige Zahl, nicht als Teil einer längeren Ziffernfolge (z. B. in ISIN).
+    /// Sucht auch nach deutscher Schreibweise mit Tausendertrennzeichen (z. B. 2.522.365), damit CSV-Exporte von Excel o. Ä. erkannt werden.
     private func fileContentContainsFilterNumberAsWhole(_ content: String, _ filterNr: String) -> Bool {
         guard !filterNr.isEmpty else { return false }
+        if containsFilterNumberAsWhole(in: content, needle: filterNr) { return true }
+        // Zusätzlich: Nummer mit deutschem Tausendertrennzeichen (z. B. 2.522.365), falls die CSV so exportiert wurde
+        if filterNr.allSatisfy(\.isNumber), filterNr.count >= 4,
+           let formatted = germanThousandsFormatted(filterNr) {
+            return containsFilterNumberAsWhole(in: content, needle: formatted)
+        }
+        return false
+    }
+
+    private func containsFilterNumberAsWhole(in content: String, needle: String) -> Bool {
         var searchStart = content.startIndex
         while searchStart < content.endIndex,
-              let range = content.range(of: filterNr, range: searchStart..<content.endIndex) {
+              let range = content.range(of: needle, range: searchStart..<content.endIndex) {
             let beforeOk = range.lowerBound == content.startIndex || !content[content.index(before: range.lowerBound)].isNumber
             let afterOk = range.upperBound == content.endIndex || !content[range.upperBound].isNumber
             if beforeOk && afterOk { return true }
             searchStart = range.upperBound
         }
         return false
+    }
+
+    /// Erzeugt z. B. "2.522.365" aus "2522365" (Tausendertrennzeichen von rechts).
+    private func germanThousandsFormatted(_ digits: String) -> String? {
+        guard digits.allSatisfy(\.isNumber), !digits.isEmpty else { return nil }
+        var result = ""
+        let chars = Array(digits)
+        let count = chars.count
+        for (i, c) in chars.enumerated() {
+            if i > 0, (count - i) % 3 == 0 { result += "." }
+            result.append(c)
+        }
+        return result
     }
 
     private func importMultipleCSVFiles(urls: [URL]) {
@@ -2094,18 +2118,24 @@ struct ContentView: View {
         }
         // Immer prüfen: Datei muss mindestens eine Filter-Nummer enthalten (als eigenständige Zahl, nicht in ISIN o. Ä.).
         // So greift die Ablehnung auch bei „BL aus Spalte“ (z. B. Commerzbank-Datei bei ausgewählter Deutscher Bank).
+        // XLSX: Inhalt per CoreXLSX auslesen (wie beim Parsen), da String(contentsOf:) nur Binär/XML liefert.
         for url in urlsToProcess {
             _ = url.startAccessingSecurityScopedResource()
             defer { url.stopAccessingSecurityScopedResource() }
-            let content: String? = (try? String(contentsOf: url, encoding: .utf8))
-                ?? (try? String(contentsOf: url, encoding: .isoLatin1))
-            guard let fileContent = content else {
+            let fileContent: String?
+            if url.pathExtension.lowercased() == "xlsx" {
+                fileContent = try? csvStyleStringFromXLSX(url: url)
+            } else {
+                fileContent = (try? String(contentsOf: url, encoding: .utf8))
+                    ?? (try? String(contentsOf: url, encoding: .isoLatin1))
+            }
+            guard let content = fileContent, !content.isEmpty else {
                 clearPendingKurszielAfterImport()
                 importMessage = "Datei konnte nicht gelesen werden: \(url.lastPathComponent)"
                 showImportMessage = true
                 return
             }
-            let enthaeltKonto = kontoFilterNumbers.contains { fileContentContainsFilterNumberAsWhole(fileContent, $0) }
+            let enthaeltKonto = kontoFilterNumbers.contains { fileContentContainsFilterNumberAsWhole(content, $0) }
             if !enthaeltKonto {
                 clearPendingKurszielAfterImport()
                 let filterPreview = kontoFilterNumbers.prefix(3).joined(separator: ", ") + (kontoFilterNumbers.count > 3 ? "…" : "")
