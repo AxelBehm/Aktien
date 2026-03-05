@@ -16,6 +16,24 @@ enum KurszielQuelle: String {
     case fmp = "M"
     /// Fonds-Fallback: erster Betrag aus Suchmaschinen-Snippet (DuckDuckGo)
     case suchmaschine = "S"
+    
+    /// Anzeigename für UI (Statistik, Filter, Detail)
+    var displayName: String {
+        switch self {
+        case .csv: return "CSV"
+        case .fmp: return "FMP"
+        case .openAI: return "OpenAI"
+        case .finanzenNet: return "finanzen.net"
+        case .yahoo: return "Yahoo"
+        case .suchmaschine: return "Snippet"
+        }
+    }
+    
+    /// Label für rohen Quell-Code (z. B. aus Aktie.kurszielQuelle), inkl. optional „manuell“
+    static func label(for code: String, manuell: Bool = false) -> String {
+        let name = KurszielQuelle(rawValue: code)?.displayName ?? code
+        return manuell ? "\(name), manuell" : name
+    }
 }
 
 struct KurszielInfo {
@@ -219,7 +237,7 @@ class KurszielService {
         return nil
     }
     
-    /// Ruft Kursziel für eine Aktie ab. Wenn eine Kennung (kurszielQuelle) von der letzten erfolgreichen Ermittlung gespeichert ist, wird diese Quelle zuerst versucht; sonst: 1) FMP, 2) Finanzen.net + Yahoo, 3) OpenAI.
+    /// Ruft Kursziel für eine Aktie ab. Automatik nur noch: 1) FMP (wenn API-Key), 2) OpenAI (wenn API-Key). Finanzen.net/Yahoo/Ariva/Snippet aus Automatik entfernt (Lizenz).
     /// fmpResult: optionales Vorab-Ergebnis aus Bulk-FMP (wird zuerst geprüft, kein doppelter Abruf).
     static func fetchKursziel(for aktie: Aktie, fmpResult: KurszielInfo? = nil) async -> KurszielInfo? {
         _ = await fetchAppWechselkurse()
@@ -235,7 +253,6 @@ class KurszielService {
                 return eurInfo
             }
             
-            /// Zuletzt erfolgreiche Quelle (wenn gesetzt): beim 2. Durchlauf zuerst diese versuchen, dann den Rest in fester Reihenfolge
             let letzteQuelle = (aktie.kurszielQuelle?.trimmingCharacters(in: .whitespaces)).flatMap { KurszielQuelle(rawValue: $0) }
             let bereitsErstversuch: KurszielQuelle? = letzteQuelle
             if let q = letzteQuelle, q != .csv {
@@ -252,22 +269,8 @@ class KurszielService {
                             return eurInfo
                         }
                     }
-                case .finanzenNet:
-                    if let info = await fetchKurszielFromFinanzenNet(for: aktie), info.kursziel > 0,
-                       isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
-                        debug("   → Finanzen.net (Erstversuch): \(info.kursziel) € (übernommen)")
-                        return info
-                    }
-                case .yahoo:
-                    let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
-                    let yahooSymbols: [String] = [searchTerm ?? aktie.bezeichnung, aktie.wkn, aktie.isin].filter { !$0.isEmpty }
-                    for symbol in yahooSymbols {
-                        if let info = await fetchKurszielVonYahoo(symbol: symbol),
-                           let eurInfo = await nehmenWennRealistisch(info) {
-                            debug("   → Yahoo (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
-                            return eurInfo
-                        }
-                    }
+                case .finanzenNet, .yahoo, .suchmaschine:
+                    debug("   → Quelle \(q.rawValue) in Automatik deaktiviert (Lizenz), weiter mit FMP/OpenAI")
                 case .openAI:
                     let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
                     if hatOpenAIKey, let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin),
@@ -275,74 +278,35 @@ class KurszielService {
                         debug("   → OpenAI (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
                         return eurInfo
                     }
-                case .suchmaschine:
-                    if istFonds(aktie), let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie),
-                       let eurInfo = await nehmenWennRealistisch(info) {
-                        debug("   → Snippet (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
-                        return eurInfo
-                    }
                 case .csv:
                     break
                 }
-                debug("   → Erstversuch über \(q.rawValue) ohne Treffer, weiter mit fester Reihenfolge")
+                if letzteQuelle != .finanzenNet, letzteQuelle != .yahoo, letzteQuelle != .suchmaschine {
+                    debug("   → Erstversuch über \(letzteQuelle!.rawValue) ohne Treffer, weiter mit fester Reihenfolge")
+                }
             }
             
-            // 1. FMP – wenn nicht bereits als Erstversuch versucht
+            // 1. FMP – nur wenn API-Key gesetzt
             if bereitsErstversuch != .fmp {
-                var fmp: KurszielInfo? = (fmpResult != nil && (fmpResult?.kursziel ?? 0) > 0) ? fmpResult : nil
-                if fmp == nil {
-                    fmp = await fetchKurszielFromFMP(for: aktie)
-                }
-                if let fmp = fmp, fmp.kursziel > 0 {
-                    let eurInfo = await kurszielZuEUR(info: fmp, aktie: aktie)
-                    if isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) {
-                        if fmpResult == nil { zugriffeFMP += 1 }
-                        debug("   → FMP: \(eurInfo.kursziel) € (übernommen)")
-                        return eurInfo
-                    }
-                    debug("   → FMP: nichts oder unrealistisch, weiter mit Finanzen.net/Yahoo")
-                } else {
-                    let hatFMPKey = (fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
-                    if !hatFMPKey { debug("   → Kein FMP-Key, übersprungen") }
-                }
-            }
-            
-            // 2. Finanzen.net und Yahoo
-            if bereitsErstversuch != .finanzenNet {
-                if let info = await fetchKurszielFromFinanzenNet(for: aktie), info.kursziel > 0,
-                   isKurszielRealistisch(kursziel: info.kursziel, refPrice: refPrice) {
-                    debug("   → Finanzen.net: \(info.kursziel) € (übernommen)")
-                    return info
-                }
-            }
-            if bereitsErstversuch != .yahoo {
-                let slugKandidaten = slugKandidaten(from: aktie.bezeichnung)
-                let searchTerm = yahooSearchTerm(from: aktie.bezeichnung)
-                let yahooSymbols: [String] = [searchTerm ?? aktie.bezeichnung, aktie.wkn, aktie.isin].filter { !$0.isEmpty }
-                for symbol in yahooSymbols {
-                    if let info = await fetchKurszielVonYahoo(symbol: symbol) {
-                        if let eurInfo = await nehmenWennRealistisch(info) {
-                            debug("   → Yahoo: \(eurInfo.kursziel) € (übernommen)")
+                let hatFMPKey = (fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
+                if hatFMPKey {
+                    var fmp: KurszielInfo? = (fmpResult != nil && (fmpResult?.kursziel ?? 0) > 0) ? fmpResult : nil
+                    if fmp == nil { fmp = await fetchKurszielFromFMP(for: aktie) }
+                    if let fmp = fmp, fmp.kursziel > 0 {
+                        let eurInfo = await kurszielZuEUR(info: fmp, aktie: aktie)
+                        if isKurszielRealistisch(kursziel: eurInfo.kursziel, refPrice: refPrice) {
+                            if fmpResult == nil { zugriffeFMP += 1 }
+                            debug("   → FMP: \(eurInfo.kursziel) € (übernommen)")
                             return eurInfo
                         }
                     }
-                }
-                if let ersterSlug = slugKandidaten.first, !ersterSlug.isEmpty, let info = await fetchKurszielVonAriva(slug: ersterSlug) {
-                    if let eurInfo = await nehmenWennRealistisch(info) {
-                        debug("   → ariva.de: \(eurInfo.kursziel) € (übernommen)")
-                        return eurInfo
-                    }
-                }
-                if bereitsErstversuch != .suchmaschine, istFonds(aktie), let info = await fetchKurszielVonSuchmaschinenSnippet(aktie: aktie) {
-                    if let eurInfo = await nehmenWennRealistisch(info) {
-                        debug("   → Snippet: \(eurInfo.kursziel) € (übernommen)")
-                        return eurInfo
-                    }
+                    debug("   → FMP: nichts oder unrealistisch, weiter mit OpenAI")
+                } else {
+                    debug("   → Kein FMP-Key, übersprungen")
                 }
             }
-            debug("   → Finanzen.net/Yahoo: nichts oder unrealistisch, weiter mit OpenAI")
             
-            // 3. OpenAI
+            // 2. OpenAI – nur wenn API-Key gesetzt
             if bereitsErstversuch != .openAI {
                 let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
                 guard hatOpenAIKey else {
@@ -918,7 +882,7 @@ class KurszielService {
         if slug == "adidas" { return "ADS" }
         if slug == "basf" { return "BAS" }
         if slug == "rheinmetall" { return "RHM" }
-        if slug == "deutsche telekom" || slug == "telekom" { return "DTE" }
+        if slug == "deutsche_telekom" || slug == "deutsche telekom" || slug == "telekom" { return "DTE" }
         if slug == "volkswagen" || slug == "vw" { return "VOW3" }
         if slug == "bmw" { return "BMW" }
         if slug == "bayer" { return "BAYN" }
@@ -926,11 +890,11 @@ class KurszielService {
         if slug == "mercedes" || slug == "daimler" { return "MBG" }
         if slug == "puma" { return "PUM" }
         if slug == "am3d" { return "AM3D" }
-        if slug == "deutsche bank" { return "DBK" }
+        if slug == "deutsche_bank" || slug == "deutsche bank" { return "DBK" }
         if slug == "commerzbank" { return "CBK" }
         if slug == "infineon" { return "IFX" }
         if slug == "covestro" { return "1COV" }
-        if slug == "deutsche börse" { return "DB1" }
+        if slug == "deutsche_boerse" || slug == "deutsche börse" { return "DB1" }
         if slug == "porsche" { return "PAH3" }
         if slug == "glencore" { return "GLEN" }
         if slug == "apple" { return "AAPL" }
@@ -984,6 +948,30 @@ class KurszielService {
         return nil
     }
     
+    /// FMP search-name API: Bezeichnung/Name → Symbol (wie Python). Fallback wenn search-isin und WKN-Mapping nichts liefern.
+    private static func fmpSymbolFromSearchName(name: String, limit: Int = 12) async -> String? {
+        let query = name.trimmingCharacters(in: .whitespaces)
+        guard !query.isEmpty, let apiKey = fmpExtractAPIKey() else { return nil }
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: CharacterSet.urlQueryAllowed.subtracting(CharacterSet(charactersIn: "&"))) ?? query
+        guard let url = URL(string: "https://financialmodelingprep.com/stable/search-name?query=\(encoded)&apikey=\(apiKey)") else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try? JSONSerialization.jsonObject(with: data)
+            guard let arr = json as? [[String: Any]], !arr.isEmpty else { return nil }
+            let toCheck = Array(arr.prefix(limit))
+            for row in toCheck {
+                if let sym = row["symbol"] as? String, !sym.isEmpty { return sym }
+                if let sym = row["ticker"] as? String, !sym.isEmpty { return sym }
+            }
+        } catch {
+            debug("   ⚠️ FMP search-name '\(query.prefix(30))…': \(error.localizedDescription)")
+        }
+        return nil
+    }
+    
     /// Bulk-Abruf FMP Price Target – eine API-Anfrage für alle Aktien. Rückgabe: [WKN: KurszielInfo]
     /// Bei forceOverwrite: auch Aktien mit bestehendem Kursziel (z. B. aus CSV) abfragen.
     /// Wechselkurse: direkter Zugriff (fetchAppWechselkurse), keine alte Zwischenspeicherung.
@@ -1006,15 +994,25 @@ class KurszielService {
             if isinNorm.count >= 12 {
                 let isin12 = String(isinNorm.uppercased().prefix(12))
                 if let cached = isinToSymbolCache[isin12] {
-                    sym = cached
+                    sym = (isin12.hasPrefix("DE") && cached == "DB") ? "DBK" : cached
                 } else if let resolved = await fmpSymbolFromSearchISIN(isin: a.isin) {
-                    isinToSymbolCache[isin12] = resolved
-                    sym = resolved
-                    debug("   ✅ FMP search-isin: \(isin12) → \(resolved) (\(a.bezeichnung))")
+                    var symbolToUse = resolved
+                    if isin12.hasPrefix("DE"), resolved == "DB" {
+                        symbolToUse = "DBK"
+                        debug("   ✅ FMP search-isin: \(isin12) → \(resolved) (Deutsche Bank → DBK für Xetra)")
+                    } else {
+                        debug("   ✅ FMP search-isin: \(isin12) → \(resolved) (\(a.bezeichnung))")
+                    }
+                    isinToSymbolCache[isin12] = symbolToUse
+                    sym = symbolToUse
                 }
             }
             if sym == nil {
                 sym = fmpSymbol(for: a)
+            }
+            if sym == nil, !a.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty {
+                sym = await fmpSymbolFromSearchName(name: a.bezeichnung)
+                if let s = sym { debug("   ✅ FMP search-name: \(a.bezeichnung.prefix(40))… → \(s)") }
             }
             if let s = sym {
                 if !symbols.contains(s) { symbols.append(s) }
@@ -1490,14 +1488,20 @@ class KurszielService {
         return urlStr
     }
     
-    /// Ruft Kursziel von FMP für eine einzelne Aktie ab. Bevorzugt ISIN (search-isin), sonst WKN/Bezeichnungs-Mapping.
+    /// Ruft Kursziel von FMP für eine einzelne Aktie ab. Wie Python: search-isin → WKN-Mapping/Bezeichnung → search-name. Bei DE-ISIN und Symbol „DB“ wird DBK (Xetra) verwendet.
     static func fetchKurszielFromFMP(for aktie: Aktie) async -> KurszielInfo? {
         var sym: String?
         if aktie.isin.trimmingCharacters(in: .whitespaces).count >= 12 {
             sym = await fmpSymbolFromSearchISIN(isin: aktie.isin)
+            if sym == "DB", aktie.isin.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix("DE") {
+                sym = "DBK"
+            }
         }
         if sym == nil {
             sym = fmpSymbol(for: aktie)
+        }
+        if sym == nil, !aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty {
+            sym = await fmpSymbolFromSearchName(name: aktie.bezeichnung)
         }
         guard let symbol = sym, let url = fmpURLForRequest(symbol: symbol) else { return nil }
         return await fetchKurszielFromFMPURL(url.absoluteString)
@@ -1564,7 +1568,7 @@ class KurszielService {
     /// Liefert bei vorhandenem Satz aber Kursziel 0 ein Tuple mit consensus 0, damit Aufrufer finanzen.net nachziehen kann.
     private static func parseFMPConsensusItem(_ item: [String: Any], symbol: String) -> (consensus: Double, high: Double?, low: Double?, analysts: Int?, datum: Date?)? {
         let median = (item["targetMedian"] as? Double) ?? (item["adjMedian"] as? Double) ?? (item["medianPriceTarget"] as? Double)
-        let consensus = (item["targetConsensus"] as? Double) ?? (item["adjConsensus"] as? Double) ?? (item["consensus"] as? Double) ?? (item["consensusPriceTarget"] as? Double) ?? (item["publishedPriceTarget"] as? Double)
+        let consensus = (item["targetConsensus"] as? Double) ?? (item["adjConsensus"] as? Double) ?? (item["consensus"] as? Double) ?? (item["mean"] as? Double) ?? (item["targetMean"] as? Double) ?? (item["consensusPriceTarget"] as? Double) ?? (item["publishedPriceTarget"] as? Double)
         let kz: Double?
         if let m = median, m > 0 {
             kz = m

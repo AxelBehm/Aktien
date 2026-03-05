@@ -3,6 +3,7 @@
 //  Aktien
 //
 //  Paywall: 7 Tage kostenlos, danach 9,99 €/Monat. Rechtstext gemäß App Store.
+//  Gilt für iPhone, iPad und (falls Zielplattform) Mac – keine Geräte-Einschränkung.
 //
 
 import SwiftUI
@@ -10,6 +11,7 @@ import StoreKit
 
 struct PaywallView: View {
     @State private var subscriptionManager = SubscriptionManager.shared
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
 
     var body: some View {
         NavigationStack {
@@ -23,6 +25,11 @@ struct PaywallView: View {
                     }
                 }
         }
+    }
+
+    /// Max. Breite des Inhalts auf iPad/Mac, damit die Lesbarkeit gut bleibt.
+    private var contentMaxWidth: CGFloat? {
+        horizontalSizeClass == .regular ? 480 : nil
     }
 
     private var paywallContent: some View {
@@ -90,6 +97,8 @@ struct PaywallView: View {
                 .padding(.vertical, 24)
                 .padding(.bottom, 8)
             }
+            .frame(maxWidth: contentMaxWidth)
+            .frame(maxWidth: .infinity)
             .frame(maxHeight: .infinity)
 
             VStack(spacing: 10) {

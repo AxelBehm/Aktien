@@ -255,6 +255,97 @@ private struct StableDecimalField: View {
     }
 }
 
+#if os(iOS)
+/// Dezimalfeld mit festem „Fertig“-Button über der Tastatur (inputAccessoryView), damit es in Listenzellen zuverlässig erscheint.
+private struct StableDecimalFieldWithFertig: View {
+    let placeholder: String
+    @Binding var value: Double?
+    var onCommit: (() -> Void)?
+    
+    var body: some View {
+        DecimalFieldWithAccessoryRepresentable(placeholder: placeholder, value: $value, onCommit: onCommit)
+    }
+}
+
+private struct DecimalFieldWithAccessoryRepresentable: UIViewRepresentable {
+    let placeholder: String
+    @Binding var value: Double?
+    var onCommit: (() -> Void)?
+    
+    private static let formatter: NumberFormatter = {
+        let f = NumberFormatter()
+        f.locale = Locale(identifier: "de_DE")
+        f.numberStyle = .decimal
+        f.minimumFractionDigits = 0
+        f.maximumFractionDigits = 2
+        return f
+    }()
+    
+    func makeUIView(context: Context) -> UITextField {
+        let field = UITextField()
+        context.coordinator.textField = field
+        field.placeholder = placeholder
+        field.keyboardType = .decimalPad
+        field.textAlignment = .right
+        field.delegate = context.coordinator
+        field.borderStyle = .roundedRect
+        field.font = .preferredFont(forTextStyle: .body)
+        let bar = UIToolbar()
+        bar.sizeToFit()
+        let done = UIBarButtonItem(title: "Fertig", style: .done, target: context.coordinator, action: #selector(Coordinator.doneTapped))
+        let flex = UIBarButtonItem(barButtonSystemItem: .flexibleSpace, target: nil, action: nil)
+        bar.items = [flex, done]
+        field.inputAccessoryView = bar
+        return field
+    }
+    
+    func updateUIView(_ uiView: UITextField, context: Context) {
+        if !uiView.isFirstResponder {
+            if let v = value {
+                uiView.text = Self.formatter.string(from: NSNumber(value: v))
+            } else {
+                uiView.text = ""
+            }
+        }
+    }
+    
+    func makeCoordinator() -> Coordinator {
+        Coordinator(value: $value, onCommit: onCommit)
+    }
+    
+    class Coordinator: NSObject, UITextFieldDelegate {
+        @Binding var value: Double?
+        var onCommit: (() -> Void)?
+        weak var textField: UITextField?
+        
+        init(value: Binding<Double?>, onCommit: (() -> Void)?) {
+            _value = value
+            self.onCommit = onCommit
+        }
+        
+        @objc func doneTapped() {
+            textField?.resignFirstResponder()
+        }
+        
+        func textFieldDidEndEditing(_ textField: UITextField) {
+            commit(text: textField.text ?? "")
+        }
+        
+        private func commit(text: String) {
+            let cleaned = text
+                .replacingOccurrences(of: " ", with: "")
+                .trimmingCharacters(in: .whitespaces)
+            if cleaned.isEmpty {
+                value = nil
+            } else if let n = DecimalFieldWithAccessoryRepresentable.formatter.number(from: cleaned)?.doubleValue {
+                value = n
+            }
+            onCommit?()
+        }
+    }
+}
+#endif
+
 private extension Double {
     /// Für Umrechnung: 0 vermeiden (Division), sonst self
     var nonzeroOrOne: Double { self == 0 ? 1 : self }
@@ -413,7 +504,7 @@ private struct EinlesungenChartView: View {
 /// Maximale Anzahl Einlese-Läufe, die gespeichert und in der Statistik angezeigt werden (gesamt, nicht pro BL).
 private let maxAnzahlEinlesungen = 20
 
-/// Statistik-Fenster: Einlesestatistik (letzte N Läufe gesamt) + Plattform-Zugriffe (FMP, Finanzen.net, Yahoo, OpenAI)
+/// Statistik-Fenster: Einlesestatistik (letzte N Läufe gesamt) + API-Zugriffe (FMP, OpenAI)
 private struct StatistikSheetView: View {
     var summaries: [ImportSummary]
     @Binding var showEinlesungenChart: Bool
@@ -478,10 +569,8 @@ private struct StatistikSheetView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("Plattform-Zugriffe (pro Kursziel-Durchlauf)") {
-                    LabeledContent("FMP", value: "\(KurszielService.zugriffeFMP)")
-                    LabeledContent("finanzen.net", value: "\(KurszielService.zugriffeFinanzenNet)")
-                    LabeledContent("Yahoo", value: "\(KurszielService.zugriffeYahoo)")
+                Section("API-Zugriffe (automatischer Kursziel-Durchlauf)") {
+                    LabeledContent("FMP (Financial Modeling Prep)", value: "\(KurszielService.zugriffeFMP)")
                     LabeledContent("OpenAI", value: "\(KurszielService.zugriffeOpenAI)")
                 }
                 Section {
@@ -787,13 +876,13 @@ struct ContentView: View {
     @State private var pendingURLsForAlreadyImported: [URL]? = nil
     @State private var alreadyImportedFromStart = false
 
-    /// Filter nach Kursziel-Quelle: Aus = alle, sonst nur die gewählte Quelle
+    /// Filter nach Kursziel-Quelle: Aus = alle, sonst nur die gewählte Quelle. Manuell = von Hand eingegebene/geänderte Kursziele.
     enum KurszielQuelleFilter: String, CaseIterable {
         case aus = "Aus"
-        case openAI = "OpenAI (A)"
-        case fmp = "FMP (M)"
-        case csv = "CSV (C)"
-        case andere = "Andere (Y/F)"
+        case openAI = "OpenAI"
+        case fmp = "FMP"
+        case csv = "CSV"
+        case manuell = "Manuell"
     }
     @State private var kurszielQuelleFilter: KurszielQuelleFilter = .aus
     @State private var filterNurUnrealistischeKursziele = false
@@ -1004,7 +1093,7 @@ struct ContentView: View {
         case .openAI: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.openAI.rawValue }
         case .fmp: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.fmp.rawValue }
         case .csv: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.csv.rawValue }
-        case .andere: byQuelle = aktien.filter { let q = $0.kurszielQuelle; return q == KurszielQuelle.yahoo.rawValue || q == KurszielQuelle.finanzenNet.rawValue || q == KurszielQuelle.suchmaschine.rawValue }
+        case .manuell: byQuelle = aktien.filter { $0.kurszielManuellGeaendert }
         }
         if filterNurUnrealistischeKursziele {
             return byQuelle.filter { $0.kursziel != nil && $0.zeigeAlsUnrealistisch }
@@ -1853,18 +1942,14 @@ struct ContentView: View {
                         Text(isImportingKurszieleOpenAI ? "Kursziele werden via OpenAI abgerufen…" : "Kursziele werden abgerufen…")
                             .font(.caption)
                     }
-                    // Wo überall gesucht wird; FMP/OpenAI ausgegraut wenn kein API-Key
+                    // In der Automatik nur FMP und OpenAI (nur wenn API-Key gesetzt)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Durchsuchte Quellen:")
+                        Text("Quellen (automatischer Durchlauf):")
                             .font(.caption2)
                             .fontWeight(.medium)
                             .foregroundColor(.secondary)
-                        kurszielQuelleZeile(name: "finanzen.net (Slug, WKN, Suche)", brauchtKey: false, hatKey: true)
-                        kurszielQuelleZeile(name: "FMP", brauchtKey: true, hatKey: !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
+                        kurszielQuelleZeile(name: "FMP (Financial Modeling Prep)", brauchtKey: true, hatKey: !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
                         kurszielQuelleZeile(name: "OpenAI", brauchtKey: true, hatKey: !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
-                        kurszielQuelleZeile(name: "ariva.de", brauchtKey: false, hatKey: true)
-                        kurszielQuelleZeile(name: "Yahoo", brauchtKey: false, hatKey: true)
-                        kurszielQuelleZeile(name: "Suchmaschine (Snippet)", brauchtKey: false, hatKey: true)
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     if let aktie = aktuelleKurszielAktie {
@@ -1919,36 +2004,8 @@ struct ContentView: View {
         guard let urls = pendingURLsForAlreadyImported else { return }
         pendingURLsForAlreadyImported = nil
         showAlreadyImportedConfirm = false
-        if alreadyImportedFromStart {
-            guard let first = urls.first else { return }
-            DispatchQueue.main.async { [urls] in
-                let fingerprint = CSVParser.computeFingerprint(from: first)
-                let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
-                if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
-                    clearPendingKurszielAfterImport()
-                    pendingImportURLs = urls
-                    fingerprintMismatchFileSpalten = fp
-                    fingerprintMismatchStoredSpalten = st
-                    showFingerprintMismatchAlert = true
-                } else {
-                    importMultipleCSVFiles(urls: urls)
-                }
-            }
-        } else {
-            guard let first = urls.first else { return }
-            DispatchQueue.main.async { [urls] in
-                let fingerprint = CSVParser.computeFingerprint(from: first)
-                let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
-                if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
-                    clearPendingKurszielAfterImport()
-                    pendingImportURLs = urls
-                    fingerprintMismatchFileSpalten = fp
-                    fingerprintMismatchStoredSpalten = st
-                    showFingerprintMismatchAlert = true
-                } else {
-                    self.importMultipleCSVFiles(urls: urls)
-                }
-            }
+        DispatchQueue.main.async { [urls] in
+            importMultipleCSVFiles(urls: urls)
         }
     }
 
@@ -1960,20 +2017,10 @@ struct ContentView: View {
                 showEinlesenHinweis2Sek = false
             }
         }
-        guard let first = urls.first else { return }
+        guard urls.first != nil else { return }
         ifNotAlreadyImported(urls: urls, fromStart: true) {
             DispatchQueue.main.async { [urls] in
-                let fingerprint = CSVParser.computeFingerprint(from: first)
-                let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
-                if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
-                    clearPendingKurszielAfterImport()
-                    pendingImportURLs = urls
-                    fingerprintMismatchFileSpalten = fp
-                    fingerprintMismatchStoredSpalten = st
-                    showFingerprintMismatchAlert = true
-                } else {
-                    importMultipleCSVFiles(urls: urls)
-                }
+                importMultipleCSVFiles(urls: urls)
             }
         }
     }
@@ -1982,20 +2029,10 @@ struct ContentView: View {
         switch result {
         case .success(let urls):
             isImporting = false
-            guard let first = urls.first else { return }
+            guard urls.first != nil else { return }
             ifNotAlreadyImported(urls: urls, fromStart: false) {
                 DispatchQueue.main.async { [urls] in
-                    let fingerprint = CSVParser.computeFingerprint(from: first)
-                    let stored = BankStore.loadCSVFingerprint(for: BankStore.selectedBankId)
-                    if let st = stored, !st.isEmpty, let fp = fingerprint, st != fp {
-                        clearPendingKurszielAfterImport()
-                        pendingImportURLs = urls
-                        fingerprintMismatchFileSpalten = fp
-                        fingerprintMismatchStoredSpalten = st
-                        showFingerprintMismatchAlert = true
-                    } else {
-                        self.importMultipleCSVFiles(urls: urls)
-                    }
+                    self.importMultipleCSVFiles(urls: urls)
                 }
             }
         case .failure(let error):
@@ -2006,6 +2043,20 @@ struct ContentView: View {
         }
     }
     
+    /// Prüft, ob die Filter-Nummer im Dateitext vorkommt – als eigenständige Zahl, nicht als Teil einer längeren Ziffernfolge (z. B. in ISIN).
+    private func fileContentContainsFilterNumberAsWhole(_ content: String, _ filterNr: String) -> Bool {
+        guard !filterNr.isEmpty else { return false }
+        var searchStart = content.startIndex
+        while searchStart < content.endIndex,
+              let range = content.range(of: filterNr, range: searchStart..<content.endIndex) {
+            let beforeOk = range.lowerBound == content.startIndex || !content[content.index(before: range.lowerBound)].isNumber
+            let afterOk = range.upperBound == content.endIndex || !content[range.upperBound].isNumber
+            if beforeOk && afterOk { return true }
+            searchStart = range.upperBound
+        }
+        return false
+    }
+
     private func importMultipleCSVFiles(urls: [URL]) {
         pendingImportURLs = nil
         showFingerprintMismatchAlert = false
@@ -2030,6 +2081,40 @@ struct ContentView: View {
         var firstFailureFileAny: String?
         var firstFilePreviewAny: String?
         let urlsToProcess = debugEinlesungNurEinSatz ? Array(urls.prefix(1)) : urls
+        let kontoFilterRaw = BankStore.loadKontoFilter(for: BankStore.selectedBankId)
+        let kontoFilterNumbers: [String] = (kontoFilterRaw ?? "")
+            .components(separatedBy: CharacterSet(charactersIn: "|,"))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        if kontoFilterNumbers.isEmpty {
+            clearPendingKurszielAfterImport()
+            importMessage = "Konto-Filter fehlt – unter Einstellungen → \(BankStore.selectedBank.name) → Spalten zuordnen eintragen (z. B. 600252636500|20070000)."
+            showImportMessage = true
+            return
+        }
+        // Immer prüfen: Datei muss mindestens eine Filter-Nummer enthalten (als eigenständige Zahl, nicht in ISIN o. Ä.).
+        // So greift die Ablehnung auch bei „BL aus Spalte“ (z. B. Commerzbank-Datei bei ausgewählter Deutscher Bank).
+        for url in urlsToProcess {
+            _ = url.startAccessingSecurityScopedResource()
+            defer { url.stopAccessingSecurityScopedResource() }
+            let content: String? = (try? String(contentsOf: url, encoding: .utf8))
+                ?? (try? String(contentsOf: url, encoding: .isoLatin1))
+            guard let fileContent = content else {
+                clearPendingKurszielAfterImport()
+                importMessage = "Datei konnte nicht gelesen werden: \(url.lastPathComponent)"
+                showImportMessage = true
+                return
+            }
+            let enthaeltKonto = kontoFilterNumbers.contains { fileContentContainsFilterNumberAsWhole(fileContent, $0) }
+            if !enthaeltKonto {
+                clearPendingKurszielAfterImport()
+                let filterPreview = kontoFilterNumbers.prefix(3).joined(separator: ", ") + (kontoFilterNumbers.count > 3 ? "…" : "")
+                importMessage = "Falsche Bank – in der Datei „\(url.lastPathComponent)“ kommt keine der Kontonummern vor (\(filterPreview))."
+                showImportMessage = true
+                return
+            }
+        }
+        let hasFixedBL = BankStore.fixedBankleistungsnummer(for: BankStore.selectedBankId) != nil
         for url in urlsToProcess {
             do {
                 _ = url.startAccessingSecurityScopedResource()
@@ -2080,6 +2165,21 @@ struct ContentView: View {
         }
         if debugEinlesungNurEinSatz && alleNeuenAktien.isEmpty {
             print(">>> DEBUG: Keine Zeilen in alleNeuenAktien (Parser lieferte 0 Positionen oder alle waren Watchlist-Treffer). Prüfe CSV-Format und Zuordnung. <<<\n")
+        }
+        if !hasFixedBL {
+            let blValues = alleNeuenAktien.map { $0.bankleistungsnummer.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            let hatTreffer = blValues.contains { bl in
+                kontoFilterNumbers.contains { filterNr in
+                    bl.contains(filterNr) || filterNr.contains(bl)
+                }
+            }
+            if !hatTreffer {
+                clearPendingKurszielAfterImport()
+                let filterPreview = kontoFilterNumbers.prefix(3).joined(separator: ", ") + (kontoFilterNumbers.count > 3 ? "…" : "")
+                importMessage = "Falsche Bank – keine Zeile, in der die Bankleistungsnummer eine der Filter-Nummern enthält (\(filterPreview))."
+                showImportMessage = true
+                return
+            }
         }
         
         // Feste Werte aus der Zuordnung: Jedes Feld, bei dem „Fester Wert“ (=…) eingetragen ist, wird auf alle Einlesezeilen angewendet (z. B. Bankleistungsnummer). Die BL aus der CSV-Spalte wird dabei überschrieben.
@@ -2803,7 +2903,6 @@ private struct KurszielZeileView: View {
     @State private var showZwischenablageFeedback = false
     @State private var showChatGPTPromptFeedback = false
     @State private var showFMPTest = false
-    @State private var showFinanzenNetTest = false
     @State private var showSnippetTest = false
     @State private var showOpenAIDebug = false
     @State private var isLoadingOpenAI = false
@@ -2887,6 +2986,121 @@ private struct KurszielZeileView: View {
         }
     }
     
+    @ViewBuilder
+    private var kurszielEingabeZeile: some View {
+        HStack(alignment: .center, spacing: 12) {
+            Text("Kursziel")
+                .font(.caption)
+                .foregroundColor(kurszielSecondary)
+            #if os(iOS)
+            StableDecimalFieldWithFertig(
+                placeholder: "EUR",
+                value: Binding(
+                    get: { aktie.kursziel },
+                    set: { newVal in
+                        aktie.kursziel = newVal
+                        aktie.kurszielManuellGeaendert = true
+                        aktie.kurszielDatum = nil
+                        aktie.kurszielAbstand = nil
+                        aktie.kurszielQuelle = nil
+                        aktie.kurszielWaehrung = nil
+                        aktie.kurszielHigh = nil
+                        aktie.kurszielLow = nil
+                        aktie.kurszielAnalysten = nil
+                        try? modelContext.save()
+                        onRowEdited?(detailKey)
+                    }
+                ),
+                onCommit: { onRowEdited?(detailKey) }
+            )
+            .frame(maxWidth: 100)
+            #else
+            StableDecimalField(
+                placeholder: "EUR",
+                value: Binding(
+                    get: { aktie.kursziel },
+                    set: { newVal in
+                        aktie.kursziel = newVal
+                        aktie.kurszielManuellGeaendert = true
+                        aktie.kurszielDatum = nil
+                        aktie.kurszielAbstand = nil
+                        aktie.kurszielQuelle = nil
+                        aktie.kurszielWaehrung = nil
+                        aktie.kurszielHigh = nil
+                        aktie.kurszielLow = nil
+                        aktie.kurszielAnalysten = nil
+                        try? modelContext.save()
+                        onRowEdited?(detailKey)
+                    }
+                )
+            )
+            .frame(maxWidth: 100)
+            #endif
+            Text("EUR")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            if aktie.waehrung.uppercased() != "EUR" {
+                #if os(iOS)
+                StableDecimalFieldWithFertig(
+                    placeholder: aktie.waehrung,
+                    value: Binding(
+                        get: {
+                            guard let k = aktie.kursziel else { return nil }
+                            let rate = (aktie.devisenkurs ?? 1).nonzeroOrOne
+                            return rate != 0 ? k * rate : k
+                        },
+                        set: { newVal in
+                            let rate = (aktie.devisenkurs ?? 1).nonzeroOrOne
+                            aktie.kursziel = newVal.map { $0 / rate }
+                            aktie.kurszielManuellGeaendert = true
+                            aktie.kurszielDatum = nil
+                            aktie.kurszielAbstand = nil
+                            aktie.kurszielQuelle = nil
+                            aktie.kurszielWaehrung = nil
+                            aktie.kurszielHigh = nil
+                            aktie.kurszielLow = nil
+                            aktie.kurszielAnalysten = nil
+                            try? modelContext.save()
+                            onRowEdited?(detailKey)
+                        }
+                    ),
+                    onCommit: { onRowEdited?(detailKey) }
+                )
+                .frame(maxWidth: 100)
+                #else
+                StableDecimalField(
+                    placeholder: aktie.waehrung,
+                    value: Binding(
+                        get: {
+                            guard let k = aktie.kursziel else { return nil }
+                            let rate = (aktie.devisenkurs ?? 1).nonzeroOrOne
+                            return rate != 0 ? k * rate : k
+                        },
+                        set: { newVal in
+                            let rate = (aktie.devisenkurs ?? 1).nonzeroOrOne
+                            aktie.kursziel = newVal.map { $0 / rate }
+                            aktie.kurszielManuellGeaendert = true
+                            aktie.kurszielDatum = nil
+                            aktie.kurszielAbstand = nil
+                            aktie.kurszielQuelle = nil
+                            aktie.kurszielWaehrung = nil
+                            aktie.kurszielHigh = nil
+                            aktie.kurszielLow = nil
+                            aktie.kurszielAnalysten = nil
+                            try? modelContext.save()
+                            onRowEdited?(detailKey)
+                        }
+                    )
+                )
+                .frame(maxWidth: 100)
+                #endif
+                Text(aktie.waehrung)
+                    .font(.caption)
+                    .foregroundColor(kurszielSecondary)
+            }
+        }
+    }
+    
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack(alignment: .top) {
@@ -2961,7 +3175,7 @@ private struct KurszielZeileView: View {
                     .font(.caption)
                     if let q = aktie.kurszielQuelle {
                         VStack(alignment: .trailing, spacing: 2) {
-                            Text("\(q) · \(quelleLabel(q, manuell: aktie.kurszielManuellGeaendert))")
+                            Text(KurszielQuelle.label(for: q, manuell: aktie.kurszielManuellGeaendert))
                                 .font(.caption2)
                                 .foregroundColor(kurszielSecondary)
                             if q == KurszielQuelle.suchmaschine.rawValue,
@@ -2985,74 +3199,10 @@ private struct KurszielZeileView: View {
             }
             
             VStack(alignment: .leading, spacing: 8) {
-                // Eine Zeile: Kursziel | Eingabefeld EUR | Eingabefeld Währung aus Satz
-                HStack(alignment: .center, spacing: 12) {
-                    Text("Kursziel")
-                        .font(.caption)
-                        .foregroundColor(kurszielSecondary)
-                    StableDecimalField(
-                        placeholder: "EUR",
-                        value: Binding(
-                            get: { aktie.kursziel },
-                            set: { newVal in
-                                aktie.kursziel = newVal
-                                aktie.kurszielManuellGeaendert = true
-                                aktie.kurszielDatum = nil
-                                aktie.kurszielAbstand = nil
-                                aktie.kurszielQuelle = nil
-                                aktie.kurszielWaehrung = nil
-                                aktie.kurszielHigh = nil
-                                aktie.kurszielLow = nil
-                                aktie.kurszielAnalysten = nil
-                                try? modelContext.save()
-                                onRowEdited?(detailKey)
-                            }
-                        )
-                    )
-                    .frame(maxWidth: 100)
-                    Text("EUR")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                    if aktie.waehrung.uppercased() != "EUR" {
-                        StableDecimalField(
-                            placeholder: aktie.waehrung,
-                            value: Binding(
-                                get: {
-                                    guard let k = aktie.kursziel else { return nil }
-                                    let rate = (aktie.devisenkurs ?? 1).nonzeroOrOne
-                                    return rate != 0 ? k * rate : k
-                                },
-                                set: { newVal in
-                                    let rate = (aktie.devisenkurs ?? 1).nonzeroOrOne
-                                    aktie.kursziel = newVal.map { $0 / rate }
-                                    aktie.kurszielManuellGeaendert = true
-                                    aktie.kurszielDatum = nil
-                                    aktie.kurszielAbstand = nil
-                                    aktie.kurszielQuelle = nil
-                                    aktie.kurszielWaehrung = nil
-                                    aktie.kurszielHigh = nil
-                                    aktie.kurszielLow = nil
-                                    aktie.kurszielAnalysten = nil
-                                    try? modelContext.save()
-                                    onRowEdited?(detailKey)
-                                }
-                            )
-                        )
-                        .frame(maxWidth: 100)
-                        Text(aktie.waehrung)
-                            .font(.caption)
-                            .foregroundColor(kurszielSecondary)
-                    }
-                }
-                // finanzen.net testen + FMP testen + OpenAI + Snippet testen (nur Fonds) + Kursziel suchen
+                kurszielEingabeZeile
+                // FMP testen + OpenAI + Aus Datei + Snippet (nur Fonds) + Kursziel suchen
                 HStack {
                     Spacer()
-                    Button("finanzen.net") {
-                        showFinanzenNetTest = true
-                    }
-                    .font(.caption)
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
                     Button("FMP testen") {
                         showFMPTest = true
                     }
@@ -3103,9 +3253,6 @@ private struct KurszielZeileView: View {
         #endif
         .sheet(isPresented: $showFMPTest) {
             FMPTestSheetView(aktie: aktie, modelContext: modelContext, detailKey: detailKey, onRowEdited: onRowEdited)
-        }
-        .sheet(isPresented: $showFinanzenNetTest) {
-            FinanzenNetTestSheetView(aktie: aktie, modelContext: modelContext, detailKey: detailKey, onRowEdited: onRowEdited)
         }
         .sheet(isPresented: $showSnippetTest) {
             SnippetTestSheetView(aktie: aktie, modelContext: modelContext, detailKey: detailKey, onRowEdited: onRowEdited)
@@ -3298,17 +3445,7 @@ private struct KurszielZeileView: View {
     }
     
     private func quelleLabel(_ code: String, manuell: Bool) -> String {
-        let name: String
-        switch code {
-        case "C": name = "CSV"
-        case "M": name = "FMP"
-        case "A": name = "OpenAI"
-        case "F": name = "finanzen.net"
-        case "Y": name = "Yahoo"
-        case "S": name = "Snippet"
-        default: name = code
-        }
-        return manuell ? "\(name), manuell" : name
+        KurszielQuelle.label(for: code, manuell: manuell)
     }
 }
 
@@ -3447,7 +3584,7 @@ struct AktieDetailView: View {
                                 .foregroundColor(.secondary)
                         }
                         if let quelle = aktie.kurszielQuelle {
-                            Text(quelle)
+                            Text(KurszielQuelle.label(for: quelle, manuell: false))
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -4463,6 +4600,7 @@ struct CSVSpaltenZuordnungView: View {
     @State private var mapping: [String: String] = [:]
     @State private var fieldSeparator = "auto"
     @State private var decimalSeparator = "german"
+    @State private var kontoFilterText = ""
     @Environment(\.dismiss) private var dismiss
     
     private func binding(for id: String) -> Binding<String> {
@@ -4566,6 +4704,17 @@ struct CSVSpaltenZuordnungView: View {
                 Text("Spalte A/B/C = aus dieser CSV-Spalte wird der Wert ins App-Feld gelesen. „Fester Wert“ = keine Spalte, gleicher Wert für jede Zeile (z. B. Bankleistungsnummer = Ihre Kontonummer oder 1). Felder, die Sie nicht zuordnen können – leer lassen („—“). Pflicht: Bankleistungsnummer (Spalte oder Fester Wert), Bezeichnung, Bestand, WKN. ISIN optional.\n\nBeim Speichern wird diese Bank ausgewählt – der Import verwendet dann diese Zuordnung.")
             }
             Section {
+                TextField("z. B. 600252636500|20070000", text: $kontoFilterText)
+                    .font(.subheadline)
+                    .textFieldStyle(.roundedBorder)
+                    .autocapitalization(.none)
+                    .autocorrectionDisabled()
+            } header: {
+                Text("Konto-Filter (Pflicht)")
+            } footer: {
+                Text("Mehrere Kontonummern/Bankleistungsnummern mit | oder Komma trennen. Ohne Eintrag wird das Einlesen abgebrochen. Enthält die Datei keine dieser Nummern (in der BL-Spalte bzw. irgendwo im Text bei „Fester Wert“), wird mit „Falsche Bank“ abgebrochen.")
+            }
+            Section {
                 Picker("Feldtrenner", selection: $fieldSeparator) {
                     Text("Automatisch (; oder , oder Tab)").tag("auto")
                     Text("Semikolon (;)").tag("semicolon")
@@ -4596,6 +4745,7 @@ struct CSVSpaltenZuordnungView: View {
                     BankStore.saveCSVColumnMapping(mapping, for: bank.id)
                     BankStore.saveCSVFieldSeparator(fieldSeparator, for: bank.id)
                     BankStore.saveCSVDecimalSeparator(decimalSeparator, for: bank.id)
+                    BankStore.saveKontoFilter(kontoFilterText, for: bank.id)
                     BankStore.setSelectedBank(bank)
                     NotificationCenter.default.post(name: .csvMappingDidSave, object: nil)
                     dismiss()
@@ -4606,6 +4756,7 @@ struct CSVSpaltenZuordnungView: View {
             mapping = BankStore.loadCSVColumnMapping(for: bank.id)
             fieldSeparator = BankStore.loadCSVFieldSeparator(for: bank.id)
             decimalSeparator = BankStore.loadCSVDecimalSeparator(for: bank.id)
+            kontoFilterText = BankStore.loadKontoFilter(for: bank.id) ?? ""
         }
     }
 }

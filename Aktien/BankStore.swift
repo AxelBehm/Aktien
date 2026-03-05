@@ -162,6 +162,19 @@ enum BankStore {
         UserDefaults.standard.set(data, forKey: key)
     }
 
+    /// Konto-Filter pro Bank: Erlaubte Kontonummern/Bankleistungsnummern (z. B. "600252636500|20070000"). Beim Import muss mind. eine vorkommen, sonst "Falsche Bank".
+    private static func kontoFilterKey(for bankId: UUID) -> String {
+        "KontoFilter_\(bankId.uuidString)"
+    }
+    static func loadKontoFilter(for bankId: UUID) -> String? {
+        let s = UserDefaults.standard.string(forKey: kontoFilterKey(for: bankId))?.trimmingCharacters(in: .whitespaces)
+        return s?.isEmpty == true ? nil : s
+    }
+    static func saveKontoFilter(_ value: String, for bankId: UUID) {
+        let trimmed = value.trimmingCharacters(in: .whitespaces)
+        UserDefaults.standard.set(trimmed.isEmpty ? nil : trimmed, forKey: kontoFilterKey(for: bankId))
+    }
+
     private static func csvFingerprintKey(for bankId: UUID) -> String {
         "CSVFingerprint_\(bankId.uuidString)"
     }
