@@ -7,7 +7,7 @@
 
 import Foundation
 
-/// Quelle des Kursziels – für Anzeige "Y" (Yahoo), "F" (finanzen.net), "A" (OpenAI), "C" (CSV), "M" (FMP), "S" (Snippet)
+/// Quelle des Kursziels – für Anzeige "Y" (Yahoo), "F" (finanzen.net), "A" (OpenAI), "C" (CSV), "M" (FMP), "S" (Snippet), "D" (Demo)
 enum KurszielQuelle: String {
     case yahoo = "Y"
     case finanzenNet = "F"
@@ -16,6 +16,8 @@ enum KurszielQuelle: String {
     case fmp = "M"
     /// Fonds-Fallback: erster Betrag aus Suchmaschinen-Snippet (DuckDuckGo)
     case suchmaschine = "S"
+    /// Demo-Modus: plausible Beispielwerte ohne API-Keys (z. B. für App-Store-Review)
+    case demo = "D"
     
     /// Anzeigename für UI (Statistik, Filter, Detail)
     var displayName: String {
@@ -26,6 +28,7 @@ enum KurszielQuelle: String {
         case .finanzenNet: return "finanzen.net"
         case .yahoo: return "Yahoo"
         case .suchmaschine: return "Snippet"
+        case .demo: return "Demo"
         }
     }
     
@@ -70,6 +73,20 @@ class KurszielService {
     // Debug-Modus
     static var debugMode = true
     static var debugLog: [String] = []
+    
+    /// Demo-Modus: Kursziele ohne API-Keys (plausible Beispielwerte). Für App-Store-Connect-Test / TestFlight.
+    static let keyDemoMode = "KurszielService.demoMode"
+    static var isDemoMode: Bool {
+        get { UserDefaults.standard.bool(forKey: keyDemoMode) }
+        set { UserDefaults.standard.set(newValue, forKey: keyDemoMode) }
+    }
+    
+    /// Liefert ein plausibles Mock-Kursziel (z. B. Referenzkurs × 1,12) für Demo-Modus.
+    private static func mockKurszielInfo(for aktie: Aktie) -> KurszielInfo {
+        let ref = aktie.kurs ?? aktie.einstandskurs ?? aktie.marktwertEUR.flatMap { aktie.bestand > 0 ? $0 / Double(aktie.bestand) : nil } ?? 100.0
+        let ziel = (ref * 1.12 * 100).rounded() / 100
+        return KurszielInfo(kursziel: ziel, datum: Date(), spalte4Durchschnitt: 12.0, quelle: .demo, waehrung: "EUR")
+    }
     
     /// Zugriffe pro Plattform (für Statistik-Fenster); in UserDefaults persistiert
     private static let keyZugriffeFMP = "KurszielService.zugriffeFMP"
@@ -177,6 +194,11 @@ class KurszielService {
     /// Ruft Kursziel direkt für eine WKN oder URL ab (für Testzwecke)
     static func fetchKurszielByWKN(_ wkn: String) async -> KurszielInfo? {
         clearDebugLog()
+        if isDemoMode {
+            let ziel = 118.50
+            debug("✅ Demo-Modus: Kursziel \(ziel) EUR")
+            return KurszielInfo(kursziel: ziel, datum: Date(), spalte4Durchschnitt: 12.0, quelle: .demo, waehrung: "EUR")
+        }
         guard !wkn.isEmpty else { 
             debug("❌ WKN/URL ist leer")
             return nil 
@@ -240,6 +262,11 @@ class KurszielService {
     /// Ruft Kursziel für eine Aktie ab. Automatik nur noch: 1) FMP (wenn API-Key), 2) OpenAI (wenn API-Key). Finanzen.net/Yahoo/Ariva/Snippet aus Automatik entfernt (Lizenz).
     /// fmpResult: optionales Vorab-Ergebnis aus Bulk-FMP (wird zuerst geprüft, kein doppelter Abruf).
     static func fetchKursziel(for aktie: Aktie, fmpResult: KurszielInfo? = nil) async -> KurszielInfo? {
+        if isDemoMode {
+            let info = mockKurszielInfo(for: aktie)
+            debug("✅ Demo-Modus: \(aktie.bezeichnung) → \(info.kursziel) €")
+            return info
+        }
         _ = await fetchAppWechselkurse()
         return await withTimeout(seconds: 20) {
             let refPrice = aktie.kurs ?? aktie.einstandskurs
@@ -278,7 +305,7 @@ class KurszielService {
                         debug("   → OpenAI (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
                         return eurInfo
                     }
-                case .csv:
+                case .csv, .demo:
                     break
                 }
                 if letzteQuelle != .finanzenNet, letzteQuelle != .yahoo, letzteQuelle != .suchmaschine {
@@ -976,6 +1003,16 @@ class KurszielService {
     /// Bei forceOverwrite: auch Aktien mit bestehendem Kursziel (z. B. aus CSV) abfragen.
     /// Wechselkurse: direkter Zugriff (fetchAppWechselkurse), keine alte Zwischenspeicherung.
     static func fetchKurszieleBulkFMP(aktien: [Aktie], forceOverwrite: Bool = false) async -> [String: KurszielInfo] {
+        if isDemoMode {
+            let toFetch = aktien.filter { forceOverwrite ? !$0.kurszielManuellGeaendert : (!$0.kurszielManuellGeaendert && $0.kursziel == nil) }
+            var result: [String: KurszielInfo] = [:]
+            for a in toFetch {
+                let wkn = a.wkn.trimmingCharacters(in: .whitespaces)
+                if !wkn.isEmpty { result[wkn] = mockKurszielInfo(for: a) }
+            }
+            debug("━━━ DEMO BULK: \(result.count) Mock-Kursziele ━━━")
+            return result
+        }
         _ = await fetchAppWechselkurse()
         debug("━━━ FMP BULK START ━━━")
         guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {

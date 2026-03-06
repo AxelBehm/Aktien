@@ -878,6 +878,7 @@ struct ContentView: View {
         case openAI = "OpenAI"
         case fmp = "FMP"
         case csv = "CSV"
+        case demo = "Demo"
         case manuell = "Manuell"
     }
     @State private var kurszielQuelleFilter: KurszielQuelleFilter = .aus
@@ -1089,6 +1090,7 @@ struct ContentView: View {
         case .openAI: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.openAI.rawValue }
         case .fmp: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.fmp.rawValue }
         case .csv: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.csv.rawValue }
+        case .demo: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.demo.rawValue }
         case .manuell: byQuelle = aktien.filter { $0.kurszielManuellGeaendert }
         }
         if filterNurUnrealistischeKursziele {
@@ -5372,6 +5374,7 @@ struct SettingsView: View {
     @Binding var openAIAPIKey: String
     @Binding var fmpAPIKey: String
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
+    @AppStorage(KurszielService.keyDemoMode) private var demoMode = false
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
     @AppStorage("Aktien.SubscriptionManager.simulateTrialExpired") private var simulateTrialExpired = false
@@ -5455,6 +5458,14 @@ struct SettingsView: View {
                     Text("Kursziel-Überschreiben")
                 } footer: {
                     Text("Wenn an: Beim nächsten Abruf (z. B. nach CSV-Import oder „Kursziele OpenAI“) werden alle Kursziele neu ermittelt und überschrieben – auch aus CSV oder manuell gesetzte. Wenn aus: Kursziele aus CSV und manuell geänderte werden nicht überschrieben.")
+                }
+                
+                Section {
+                    Toggle("Demo-Modus (ohne API-Keys)", isOn: $demoMode)
+                } header: {
+                    Text("App-Test")
+                } footer: {
+                    Text("Aktivieren, um die App ohne FMP- oder OpenAI-API-Keys zu testen (z. B. für App-Store-Review oder TestFlight). Beim „Kursziele ermitteln“ werden plausible Beispielwerte angezeigt (ca. +12 % zum Referenzkurs). Quelle wird als „Demo“ geführt.")
                 }
                 
                 Section {
