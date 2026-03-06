@@ -47,10 +47,6 @@ struct BankStartView: View {
     @State private var isAuthenticating = false
     @State private var showProgrammBeschreibung = false
     @State private var showSettings = false
-    @State private var showWKNTester = false
-    @State private var testWKN = ""
-    @State private var testKurszielResult: String? = nil
-    @State private var isTestingWKN = false
     @State private var showRechtliches = false
     @State private var isImporting = false
     @State private var importErrorMessage: String?
@@ -230,25 +226,6 @@ struct BankStartView: View {
                             Label("Einstellungen", systemImage: "gear")
                         }
                         Button {
-                            #if os(iOS)
-                            if let clipboard = UIPasteboard.general.string?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
-                                let kandidaten = KurszielService.slugKandidaten(from: clipboard)
-                                let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
-                                if !slug.isEmpty { testWKN = "https://www.finanzen.net/kursziele/\(slug)" }
-                            }
-                            #elseif os(macOS)
-                            if let clipboard = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespaces), !clipboard.isEmpty {
-                                let kandidaten = KurszielService.slugKandidaten(from: clipboard)
-                                let slug = kandidaten.last ?? KurszielService.slugFromBezeichnung(clipboard)
-                                if !slug.isEmpty { testWKN = "https://www.finanzen.net/kursziele/\(slug)" }
-                            }
-                            #endif
-                            if testWKN.isEmpty { testWKN = "https://www.finanzen.net/kursziele/rheinmetall" }
-                            showWKNTester = true
-                        } label: {
-                            Label("WKN testen", systemImage: "magnifyingglass")
-                        }
-                        Button {
                             showRechtliches = true
                         } label: {
                             Label("Rechtliches", systemImage: "doc.plaintext")
@@ -416,16 +393,6 @@ struct BankStartView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
-            }
-            .sheet(isPresented: $showWKNTester) {
-                WKNTesterView(wkn: $testWKN, result: $testKurszielResult, isTesting: $isTestingWKN, urlFromSettings: fmpAPIKeyStore, openAIFromSettings: openAIAPIKeyStore)
-                    .onAppear {
-                        if testWKN.isEmpty, !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty {
-                            testWKN = fmpAPIKeyStore.trimmingCharacters(in: .whitespaces)
-                        } else if testWKN.isEmpty {
-                            testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
-                        }
-                    }
             }
             .sheet(isPresented: $showRechtliches) {
                 RechtlichesSheetView()

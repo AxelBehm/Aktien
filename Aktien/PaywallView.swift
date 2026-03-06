@@ -74,7 +74,7 @@ struct PaywallView: View {
                         }
                     }
 
-                    Text("Wenn zu viele Kursziele nicht ermittelt werden konnten, sollten Sie überlegen, sich API-Keys von OpenAI oder FMP zu besorgen und diese in den Einstellungen einzutragen. Funktionstest unter WKN testen – dann den Button „Kursziele ermitteln“ drücken.")
+                    Text("Wenn zu viele Kursziele nicht ermittelt werden konnten, sollten Sie überlegen, sich API-Keys von OpenAI oder FMP zu besorgen und diese in den Einstellungen einzutragen. Unter Einstellungen können Sie die Verbindung testen; danach „Kursziele ermitteln“ ausführen.")
                         .font(.caption)
                         .foregroundStyle(Color(red: 0.72, green: 0.55, blue: 0))
                         .multilineTextAlignment(.center)

@@ -840,11 +840,7 @@ struct ContentView: View {
     @State private var showDeleteEinlesungConfirmation = false
     @State private var isImportingKursziele = false
     @State private var aktuelleKurszielAktie: (bezeichnung: String, wkn: String)? = nil
-    @State private var showWKNTester = false
     @State private var showDebugLog = false
-    @State private var testWKN = ""
-    @State private var testKurszielResult: String? = nil
-    @State private var isTestingWKN = false
     @State private var showSettings = false
     @State private var showRechtliches = false
     @State private var showWatchlist = false
@@ -1373,16 +1369,6 @@ struct ContentView: View {
             .sheet(isPresented: $showSettings) {
                 SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
             }
-            .sheet(isPresented: $showWKNTester) {
-                WKNTesterView(wkn: $testWKN, result: $testKurszielResult, isTesting: $isTestingWKN, urlFromSettings: fmpAPIKeyStore, openAIFromSettings: openAIAPIKeyStore)
-                    .onAppear {
-                        if testWKN.isEmpty, !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty {
-                            testWKN = fmpAPIKeyStore.trimmingCharacters(in: .whitespaces)
-                        } else if testWKN.isEmpty {
-                            testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
-                        }
-                    }
-            }
             .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
             .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
             .sheet(isPresented: $showWatchlist) { WatchlistView() }
@@ -1509,16 +1495,6 @@ struct ContentView: View {
             }
             .sheet(isPresented: $showSettings) {
                 SettingsView(openAIAPIKey: $openAIAPIKeyStore, fmpAPIKey: $fmpAPIKeyStore)
-            }
-            .sheet(isPresented: $showWKNTester) {
-                WKNTesterView(wkn: $testWKN, result: $testKurszielResult, isTesting: $isTestingWKN, urlFromSettings: fmpAPIKeyStore, openAIFromSettings: openAIAPIKeyStore)
-                    .onAppear {
-                        if testWKN.isEmpty, !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty {
-                            testWKN = fmpAPIKeyStore.trimmingCharacters(in: .whitespaces)
-                        } else if testWKN.isEmpty {
-                            testWKN = "https://www.finanzen.net/kursziele/rheinmetall"
-                        }
-                    }
             }
             .sheet(isPresented: $showDebugLog) { DebugLogSheet() }
             .sheet(isPresented: $showRechtliches) { RechtlichesSheetView() }
@@ -2172,7 +2148,7 @@ struct ContentView: View {
                 for neueAktie in neueAktienToInsert {
                     alleNeuenAktien.append(neueAktie)
                 }
-                // Nach erfolgreichem Einlesen: Umbenennen in EX_<Dateiname> (in Place; bei iCloud oft nur Lesezugriff → Kopie ins App-Documents)
+                // Nach erfolgreichem Einlesen: Umbenennen in EX_<Dateiname> (in Place). Wenn nicht möglich (z. B. schreibgeschützt), Datei löschen; sonst Kopie ins App-Documents.
                 if url.isFileURL {
                     let ursprungsname = url.lastPathComponent
                     let neuerName = "EX_" + ursprungsname
@@ -2182,7 +2158,8 @@ struct ContentView: View {
                     do {
                         try fm.moveItem(at: url, to: neuesURLInPlace)
                     } catch {
-                        if let docDir = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
+                        // Umbenennen fehlgeschlagen (z. B. nur Lesezugriff) → versuchen zu löschen
+                        if (try? fm.removeItem(at: url)) == nil, let docDir = fm.urls(for: .documentDirectory, in: .userDomainMask).first {
                             let zielURL = docDir.appendingPathComponent(neuerName)
                             try? fm.removeItem(at: zielURL)
                             try? fm.copyItem(at: url, to: zielURL)
@@ -2495,7 +2472,7 @@ struct ContentView: View {
         let querstrich = "\n\n━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n\nHinweis:\n"
         var hinweisTeile: [String] = []
         if !eingeleseneDateinamen.isEmpty {
-            hinweisTeile.append("Damit Sie in der Dateien-App erkennen, welche Dateien schon eingelesen wurden: Datei dort umbenennen (z. B. „EX_“ vor den Namen setzen).")
+            hinweisTeile.append("Eingelesene Dateien werden nach dem Import umbenannt (EX_…) oder – falls nicht möglich – gelöscht, damit Sie in der Dateien-App sehen, was schon verarbeitet wurde.")
         }
         if alleNeuenAktien.isEmpty, let diag = firstFailureDiagnosticAny {
             let filePart = firstFailureFileAny.map { " (\($0))" } ?? ""
