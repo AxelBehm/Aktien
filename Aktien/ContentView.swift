@@ -4543,7 +4543,8 @@ private struct DocumentPreviewViewController: UIViewControllerRepresentable {
 #endif
 
 // MARK: - Programm-Beschreibung (Startseite, Buch-Symbol; getrennt von Rechtliches, großer Bereich)
-/// Word-Datei anbinden: Im Xcode-Projekt die .docx-Datei per Drag & Drop in den Projektnavigator legen, „Copy items if needed“ und Target „Aktien“ aktivieren. Dateiname exakt: Programmbeschreibung.docx (oder Namen unten anpassen).
+/// Dokument anbinden: Im Xcode-Projekt die Datei(en) per Drag & Drop in den Projektnavigator legen, „Copy items if needed“ und Target „Aktien“ aktivieren.
+/// PDF wird bevorzugt (funktioniert für alle Nutzer ohne Word); falls keine PDF vorhanden, wird Programmbeschreibung.docx verwendet (iOS kann .docx oft in Quick Look anzeigen, Garantie nur mit PDF).
 private let programmBeschreibungBundleName = "Programmbeschreibung"
 private let programmBeschreibungBundleExtension = "docx"
 
@@ -4593,9 +4594,19 @@ struct ProgrammBeschreibungSheetView: View {
         programmBeschreibungText.isEmpty ? defaultProgrammBeschreibungText : programmBeschreibungText
     }
 
+    /// Bevorzugt PDF (immer in Quick Look ohne Word), sonst .docx. Sucht zuerst Programmbeschreibung.pdf, dann Programmbeschreibung 2.pdf (Xcode-Vergabe).
     private var bundledDocumentURL: URL? {
         #if os(iOS)
-        return Bundle.main.url(forResource: programmBeschreibungBundleName, withExtension: programmBeschreibungBundleExtension)
+        if let pdf = Bundle.main.url(forResource: programmBeschreibungBundleName, withExtension: "pdf") {
+            return pdf
+        }
+        if let pdf2 = Bundle.main.url(forResource: "Programmbeschreibung 2", withExtension: "pdf") {
+            return pdf2
+        }
+        if let docx = Bundle.main.url(forResource: programmBeschreibungBundleName, withExtension: programmBeschreibungBundleExtension) {
+            return docx
+        }
+        return Bundle.main.url(forResource: "Programmbeschreibung 2", withExtension: programmBeschreibungBundleExtension)
         #else
         return nil
         #endif
@@ -4610,7 +4621,7 @@ struct ProgrammBeschreibungSheetView: View {
                             Button {
                                 showBundledDocument = true
                             } label: {
-                                Label("Vollständige Beschreibung (Word) öffnen", systemImage: "doc.fill")
+                                Label("Vollständige Beschreibung öffnen", systemImage: "doc.fill")
                                     .frame(maxWidth: .infinity)
                                     .padding(.vertical, 8)
                             }
@@ -4636,7 +4647,7 @@ struct ProgrammBeschreibungSheetView: View {
                                 Button {
                                     showBundledDocument = true
                                 } label: {
-                                    Label("Vollständige Beschreibung (Word) öffnen", systemImage: "doc.fill")
+                                    Label("Vollständige Beschreibung öffnen", systemImage: "doc.fill")
                                         .font(.headline)
                                         .frame(maxWidth: .infinity)
                                         .padding(.vertical, 12)
