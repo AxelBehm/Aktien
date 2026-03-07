@@ -75,6 +75,37 @@ enum BankStore {
         return bank
     }
 
+    // MARK: - Demo-Bank (für App-Store-Tester)
+
+    /// Reihenfolge der App-Felder wie in der CSV-Zuordnung (A, B, C, …).
+    private static let csvFieldIdsInOrder = [
+        "bankleistungsnummer", "bestand", "bezeichnung", "wkn", "isin", "waehrung",
+        "hinweisEinstandskurs", "einstandskurs", "deviseneinstandskurs", "kurs", "devisenkurs",
+        "gewinnVerlustEUR", "gewinnVerlustProzent", "marktwertEUR", "stueckzinsenEUR", "anteilProzent",
+        "datumLetzteBewegung", "gattung", "branche", "risikoklasse", "depotPortfolioName",
+        "kursziel", "kursziel_quelle"
+    ]
+
+    private static func columnLetter(for index: Int) -> String {
+        if index < 26 { return String(Character(Unicode.Scalar(65 + index)!)) }
+        return "A" + String(Character(Unicode.Scalar(65 + index - 26)!))
+    }
+
+    /// Legt die Demo-Bank „Dem-Bank“ an: CSV-Zuordnung A, B, C, D, E, F, … (wie Felderreihenfolge), Kontonummerfilter 2222229. Gibt die angelegte Bank zurück.
+    static func createDemoBank() -> Bank {
+        let bank = addBank(name: "Dem-Bank")
+        var mapping: [String: String] = [:]
+        for (idx, fieldId) in csvFieldIdsInOrder.enumerated() {
+            mapping[fieldId] = columnLetter(for: idx)
+        }
+        saveCSVColumnMapping(mapping, for: bank.id)
+        saveKontoFilter("2222229", for: bank.id)
+        saveCSVFieldSeparator("auto", for: bank.id)
+        saveCSVDecimalSeparator("german", for: bank.id)
+        setSelectedBank(bank)
+        return bank
+    }
+
     static func deleteBank(_ bank: Bank) {
         var banks = loadBanks().filter { $0.id != bank.id }
         saveBanks(banks)

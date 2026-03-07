@@ -48,10 +48,11 @@ struct AktienApp: App {
     }
 }
 
-/// Beim Start: Bank-Auswahl. Nach Tipp auf „Start“ → Einlese-Seite (mit Premium) oder direkt Seite „Aktien Premium“ (Paywall).
+/// Beim Start: Login (Demokonto für App-Store-Prüfung). Danach Bank-Auswahl → Einlese-Seite oder Paywall.
 private struct RootView: View {
     @Bindable private var startState = StartState.shared
     @State private var subscriptionManager = SubscriptionManager.shared
+    @State private var authManager = AuthManager.shared
     /// „Kostenlos testen“ ohne Produkt getippt → Wechsel zur Aktien-Ansicht (Notification sorgt für zuverlässiges Update).
     @State private var grantedAccessByButton = false
 
@@ -61,7 +62,9 @@ private struct RootView: View {
 
     var body: some View {
         Group {
-            if BankStore.loadBanks().isEmpty {
+            if !authManager.isLoggedIn {
+                LoginView()
+            } else if BankStore.loadBanks().isEmpty {
                 BankStartView()
             } else if startState.hasStarted {
                 if showContentView {
@@ -73,7 +76,7 @@ private struct RootView: View {
                 BankStartView()
             }
         }
-        .id(startState.hasStarted)
+        .id("\(authManager.isLoggedIn)-\(startState.hasStarted)")
         .onChange(of: startState.hasStarted) { _, new in
             if !new { grantedAccessByButton = false }
         }

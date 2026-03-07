@@ -58,21 +58,25 @@ struct PaywallView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
 
-                    Text("Danach 9,99 € pro Monat. Jederzeit kündbar.")
-                        .font(.body)
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal)
-
-                    if let product = subscriptionManager.monthlyProduct {
-                        VStack(spacing: 4) {
+                    // Richtlinie 3.1.2(c): Abo-Titel, Laufzeit, Preis einmalig klar erkennbar
+                    VStack(spacing: 6) {
+                        if let product = subscriptionManager.monthlyProduct {
                             Text(product.displayPrice)
                                 .font(.title)
                                 .fontWeight(.semibold)
-                            Text("Laufzeit: 1 Monat")
+                            Text("Laufzeit: 1 Monat (automatisch verlängerbar). Jederzeit kündbar.")
+                                .font(.subheadline)
+                                .foregroundStyle(.secondary)
+                        } else {
+                            Text("9,99 € / Monat")
+                                .font(.title2)
+                                .fontWeight(.semibold)
+                            Text("Laufzeit: 1 Monat. Jederzeit kündbar.")
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         }
                     }
+                    .padding(.vertical, 4)
 
                     Text("Wenn zu viele Kursziele nicht ermittelt werden konnten, sollten Sie überlegen, sich API-Keys von OpenAI oder FMP zu besorgen und diese in den Einstellungen einzutragen. Unter Einstellungen können Sie die Verbindung testen; danach „Kursziele ermitteln“ ausführen.")
                         .font(.caption)
@@ -128,6 +132,21 @@ struct PaywallView: View {
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
                 .disabled(subscriptionManager.isPurchasing || subscriptionManager.isLoadingProducts)
+                Button {
+                    Task { await subscriptionManager.restore() }
+                } label: {
+                    HStack {
+                        if subscriptionManager.isPurchasing {
+                            ProgressView()
+                                .scaleEffect(0.8)
+                        } else {
+                            Text("Käufe wiederherstellen")
+                        }
+                    }
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                }
+                .disabled(subscriptionManager.isPurchasing)
             }
             .padding(.horizontal, 20)
             .padding(.top, 12)
@@ -146,18 +165,25 @@ struct PaywallView: View {
         }
     }
 
-    /// Datenschutz- und Nutzungsbedingungen-URLs (wie unter Rechtliches in der App)
+    /// Richtlinie 3.1.2(c): Funktionale Links zu Datenschutzerklärung und EULA im Kaufprozess
     private static let datenschutzURL = URL(string: "https://kisoft4you.com/datenschutzerklaerung")!
     private static let nutzungsbedingungenURL = URL(string: "https://kisoft4you.com/agb")!
 
     private var legalLinks: some View {
-        HStack(spacing: 20) {
-            Link("Datenschutz", destination: Self.datenschutzURL)
+        VStack(spacing: 10) {
+            Text("Datenschutz & Nutzungsbedingungen")
                 .font(.caption2)
-            Link("Nutzungsbedingungen", destination: Self.nutzungsbedingungenURL)
-                .font(.caption2)
+                .fontWeight(.medium)
+                .foregroundStyle(.secondary)
+            HStack(spacing: 20) {
+                Link("Datenschutzerklärung", destination: Self.datenschutzURL)
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+                Link("Nutzungsbedingungen (EULA)", destination: Self.nutzungsbedingungenURL)
+                    .font(.caption)
+                    .foregroundStyle(.blue)
+            }
         }
-        .foregroundStyle(.secondary)
     }
 }
 

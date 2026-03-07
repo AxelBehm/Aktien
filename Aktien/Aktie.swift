@@ -56,6 +56,10 @@ final class Aktie {
     var previousKurs: Double?
     /// true = Eintrag aus der Watchlist (BL 999999), nicht aus CSV-Import
     var isWatchlist: Bool = false
+    /// Manueller Kommentar/Notiz zur Position (wird bei erneuter Einlesung übernommen)
+    var kommentar: String = ""
+    /// Datum der letzten Bearbeitung des Kommentars (z. B. per „Datum setzen“); wird bei Einlesung übernommen
+    var kommentarLetzteBearbeitung: Date?
     
     init(
         bankleistungsnummer: String,
@@ -91,7 +95,9 @@ final class Aktie {
         previousMarktwertEUR: Double? = nil,
         previousBestand: Double? = nil,
         previousKurs: Double? = nil,
-        isWatchlist: Bool = false
+        isWatchlist: Bool = false,
+        kommentar: String = "",
+        kommentarLetzteBearbeitung: Date? = nil
     ) {
         self.bankleistungsnummer = bankleistungsnummer
         self.bestand = bestand
@@ -128,6 +134,8 @@ final class Aktie {
         self.previousBestand = previousBestand
         self.previousKurs = previousKurs
         self.isWatchlist = isWatchlist
+        self.kommentar = kommentar
+        self.kommentarLetzteBearbeitung = kommentarLetzteBearbeitung
     }
 }
 

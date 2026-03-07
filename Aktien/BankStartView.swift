@@ -36,6 +36,7 @@ struct BankStartView: View {
     @State private var banks: [Bank] = BankStore.loadBanks()
     @State private var selectedBankId: UUID = BankStore.selectedBankId
     @State private var csvMappingRefresh = UUID()
+    @State private var authManager = AuthManager.shared
     @State private var einlesungenRefreshId = UUID()
     @State private var showAddBank = false
     @State private var newBankType: BankType = .deutscheBankMaxblue
@@ -59,7 +60,7 @@ struct BankStartView: View {
             VStack(spacing: 0) {
                 List {
                     Section {
-                        if banks.isEmpty {
+                        if banks.isEmpty, !authManager.isDemoUser {
                             Text("Noch keine Bank angelegt. Tippen Sie auf + und wählen Sie ein Institut (z. B. Deutsche Bank/maxblue, Commerzbank, DKB).")
                                 .font(.subheadline)
                                 .foregroundColor(.secondary)
@@ -250,6 +251,9 @@ struct BankStartView: View {
                 if let msg = importErrorMessage { Text(msg) }
             }
             .onAppear {
+                if authManager.isDemoUser, BankStore.loadBanks().isEmpty {
+                    _ = BankStore.createDemoBank()
+                }
                 banks = BankStore.loadBanks()
                 selectedBankId = BankStore.selectedBankId
                 if banks.count == 1 {

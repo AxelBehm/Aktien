@@ -74,10 +74,18 @@ class KurszielService {
     static var debugMode = true
     static var debugLog: [String] = []
     
-    /// Demo-Modus: Kursziele ohne API-Keys (plausible Beispielwerte). Für App-Store-Connect-Test / TestFlight.
+    /// Demo-Modus: Kursziele ohne API-Keys (plausible Beispielwerte). Gilt bei Demo-Login; bei kostenlosem Zeitraum ohne FMP/OpenAI-Keys; ansonsten alter Schalter in UserDefaults.
     static let keyDemoMode = "KurszielService.demoMode"
     static var isDemoMode: Bool {
-        get { UserDefaults.standard.bool(forKey: keyDemoMode) }
+        get {
+            if AuthManager.shared.isDemoUser { return true }
+            if UserDefaults.standard.bool(forKey: keyDemoMode) { return true }
+            // Kostenloser Zeitraum ohne API-Keys → Demo-Kursziele
+            let trialOhneKeys = SubscriptionManager.shared.isInFreeTrialPeriod
+                && (fmpAPIKey ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+                && (openAIAPIKey ?? "").trimmingCharacters(in: .whitespaces).isEmpty
+            return trialOhneKeys
+        }
         set { UserDefaults.standard.set(newValue, forKey: keyDemoMode) }
     }
     

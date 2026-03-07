@@ -851,6 +851,7 @@ struct ContentView: View {
     @State private var fingerprintMismatchStoredSpalten: String? = nil
     @AppStorage(KurszielService.openAIAPIKeyKey) private var openAIAPIKeyStore: String = ""
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
+    @State private var subscriptionManager = SubscriptionManager.shared
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
     /// Wenn an (nur in Einstellungen sichtbar bei Debug-Build): Beim CSV-Import nur 1 Zeile einlesen und Einlesewerte + Satz Deutsche Bank in die Konsole drucken.
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
@@ -892,6 +893,9 @@ struct ContentView: View {
     @State private var visibleDetailKeysOnAktienList: Set<String> = []
     /// true = Liste nach grösster Differenz Kurs ↔ Kursziel sortieren, mit % zum Ziel
     @State private var sortiereNachAbstandKursziel = false
+    @State private var sortiereNachKommentarBearbeitung = false
+    /// Kurzer Hinweis „Datum bearbeitet“, wenn Sortierung „Nach letzte Bearbeitung“ aktiviert wird
+    @State private var showDatumBearbeitetHint = false
     /// true = Chart über den 5 Einlesungen (Gesamtwert pro Datum) anzeigen
     @State private var showEinlesungenChart = false
     @State private var showStatistik = false
@@ -1099,6 +1103,15 @@ struct ContentView: View {
         return byQuelle
     }
     
+    /// Sortiert nach letzter Kommentar-Bearbeitung (neueste zuerst); ohne Datum ans Ende
+    private var aktienSortiertNachKommentarBearbeitung: [Aktie] {
+        aktienZurAnzeige.sorted { a, b in
+            let da = a.kommentarLetzteBearbeitung ?? .distantPast
+            let db = b.kommentarLetzteBearbeitung ?? .distantPast
+            return da > db
+        }
+    }
+    
     /// Sortiert nach Abstand (%) zum Kursziel: positive % (Aufwärtspotenzial) oben, grösste zuerst; negative % (Abwärtspotenzial) unten; ohne Kursziel ans Ende
     private var aktienSortiertNachAbstandKursziel: [Aktie] {
         aktienZurAnzeige.sorted { a, b in
@@ -1158,6 +1171,12 @@ struct ContentView: View {
                         Image(systemName: "building.2.fill")
                             .font(.caption2)
                             .foregroundColor(.purple)
+                    }
+                    if aktie.kommentarLetzteBearbeitung != nil {
+                        Circle()
+                            .fill(Color.orange)
+                            .frame(width: 8, height: 8)
+                            .accessibilityLabel("Kommentar bearbeitet")
                     }
                 }
                 // Zeile 1: Bestand + Anzahl, Marktwert + Wert (gekürzte Labels). Marktwert aus CSV oder berechnet (Kurs × Bestand).
@@ -1579,8 +1598,25 @@ struct ContentView: View {
         #endif
         Group {
             ToolbarItem {
-                Button(action: { sortiereNachAbstandKursziel.toggle() }) {
+                Button(action: {
+                    sortiereNachKommentarBearbeitung = false
+                    sortiereNachAbstandKursziel.toggle()
+                }) {
                     Label(sortiereNachAbstandKursziel ? "Sortierung: Standard" : "Nach Abstand zum Kursziel", systemImage: sortiereNachAbstandKursziel ? "list.bullet" : "chart.line.uptrend.xyaxis")
+                }
+            }
+            ToolbarItem {
+                Button(action: {
+                    sortiereNachAbstandKursziel = false
+                    sortiereNachKommentarBearbeitung.toggle()
+                    if sortiereNachKommentarBearbeitung {
+                        showDatumBearbeitetHint = true
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                            showDatumBearbeitetHint = false
+                        }
+                    }
+                }) {
+                    Label(sortiereNachKommentarBearbeitung ? "Sortierung: Standard" : "Nach letzte Bearbeitung", systemImage: sortiereNachKommentarBearbeitung ? "list.bullet" : "calendar")
                 }
             }
             ToolbarItem {
@@ -1678,7 +1714,51 @@ struct ContentView: View {
                 }
                 .listRowBackground(Color.clear)
                 
-                if sortiereNachAbstandKursziel {
+                if sortiereNachKommentarBearbeitung {
+                    Section {
+                        ForEach(aktienSortiertNachKommentarBearbeitung) { aktie in
+                            Button {
+                                if let sel = selectionForThreeColumn { sel.wrappedValue = detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn) } else { aktienDetailPath.append(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
+                            } label: {
+                                HStack {
+                                    aktienZeileLabel(aktie: aktie, zeigeProzentZumZiel: false)
+                                    if let d = aktie.kommentarLetzteBearbeitung {
+                                        Text(d.formatted(date: .abbreviated, time: .omitted))
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    if aktie.isWatchlist {
+                                        Text("Watchlist")
+                                            .font(.caption2)
+                                            .fontWeight(.medium)
+                                            .foregroundColor(.white)
+                                            .padding(.horizontal, 6)
+                                            .padding(.vertical, 2)
+                                            .background(Color.orange.opacity(0.9))
+                                            .cornerRadius(4)
+                                    }
+                                    Spacer(minLength: 8)
+                                    Image(systemName: "chevron.right")
+                                        .font(.body.weight(.semibold))
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            .buttonStyle(.plain)
+                            .transaction { t in t.animation = .easeOut(duration: 0.22) }
+                            .id(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn))
+                            .onAppear { visibleDetailKeysOnAktienList.insert(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
+                            .onDisappear { visibleDetailKeysOnAktienList.remove(detailKey(bl: aktie.bankleistungsnummer, isin: aktie.isin, wkn: aktie.wkn)) }
+                        }
+                    } header: {
+                        Text("Nach letzte Bearbeitung (neueste zuerst)")
+                            .font(.caption.weight(.bold))
+                            .foregroundColor(.secondary)
+                    } footer: {
+                        Text("Sortierung nach dem Datum des Kommentars („Datum setzen“ in der Detailansicht). Toolbar: „Sortierung: Standard“ für normale Ansicht.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } else if sortiereNachAbstandKursziel {
                     Section {
                         ForEach(aktienSortiertNachAbstandKursziel) { aktie in
                             Button {
@@ -1854,9 +1934,26 @@ struct ContentView: View {
         .transition(.opacity)
     }
 
+    /// Hinweis anzeigen, wenn kostenloser Zeitraum und noch keine API-Keys (FMP/OpenAI) → Demo-Kursziele
+    private var showDemoTrialHint: Bool {
+        subscriptionManager.isInFreeTrialPeriod
+            && fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty
+            && openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty
+    }
+    
     @ViewBuilder
     private var contentView: some View {
-        Group {
+        VStack(spacing: 0) {
+            if showDemoTrialHint {
+                Text("Echte Werte erst nach API-Kauf/Installation bei FMP oder/und OpenAI")
+                    .font(.caption)
+                    .foregroundStyle(.yellow)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 8)
+                    .background(Color.secondary.opacity(0.12))
+            }
+            Group {
             if useThreeColumnLayout {
                 threeColumnLayout
                     .task {
@@ -1885,6 +1982,7 @@ struct ContentView: View {
                     }
                 }
             }
+            }
         }
         #if os(iOS)
         .toolbar {
@@ -1897,6 +1995,19 @@ struct ContentView: View {
         }
         #endif
         .overlay { importingOverlay }
+        .overlay(alignment: .top) {
+            if showDatumBearbeitetHint {
+                Text("Datum bearbeitet")
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.top, 12)
+                    .transition(.opacity)
+            }
+        }
+        .animation(.easeInOut(duration: 0.25), value: showDatumBearbeitetHint)
         .confirmationDialog(unrealistischConfirm.dialogTitle.isEmpty ? "OpenAI-Ersatz übernehmen?" : unrealistischConfirm.dialogTitle, isPresented: $unrealistischConfirm.isPresented) {
             Button("Ja, übernehmen") { unrealistischConfirm.choose(true) }
             Button("Nein, nicht übernehmen") { unrealistischConfirm.choose(false) }
@@ -2365,6 +2476,8 @@ struct ContentView: View {
                 neue.previousMarktwertEUR = alte.marktwertEUR
                 neue.previousBestand = alte.bestand
                 neue.previousKurs = alte.kurs ?? alte.devisenkurs
+                neue.kommentar = alte.kommentar
+                neue.kommentarLetzteBearbeitung = alte.kommentarLetzteBearbeitung
                 
                 // Kursziel übernehmen, wenn manuell geändert oder aus CSV (C) – sonst beim Abruf neu ermitteln
                 // Bei Fonds/Fund/ETF werden keine Kursziele ermittelt; gesetzte Werte bei nächster Einlesung übernehmen
@@ -3521,6 +3634,33 @@ struct AktieDetailView: View {
                 }
                 LabeledContent("Bestand") {
                     Text(formatBetragDE(aktie.bestand))
+                }
+            }
+            
+            Section("Kommentar") {
+                TextField("Notiz zur Position (wird bei Einlesung übernommen)", text: $aktie.kommentar, axis: .vertical)
+                    .lineLimit(3...8)
+                    .onSubmit {
+                        aktie.kommentarLetzteBearbeitung = Date()
+                        try? modelContext.save()
+                    }
+                    .onChange(of: aktie.kommentar) { _, _ in
+                        try? modelContext.save()
+                    }
+                HStack {
+                    if let datum = aktie.kommentarLetzteBearbeitung {
+                        Text("Letzte Bearbeitung: \(datum.formatted(date: .abbreviated, time: .shortened))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    Spacer()
+                    Button {
+                        aktie.kommentarLetzteBearbeitung = Date()
+                        try? modelContext.save()
+                    } label: {
+                        Label("Datum setzen", systemImage: "calendar.badge.plus")
+                            .font(.subheadline)
+                    }
                 }
             }
             
@@ -5374,11 +5514,11 @@ struct SettingsView: View {
     @Binding var openAIAPIKey: String
     @Binding var fmpAPIKey: String
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
-    @AppStorage(KurszielService.keyDemoMode) private var demoMode = false
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
     @AppStorage("Aktien.SubscriptionManager.simulateTrialExpired") private var simulateTrialExpired = false
     @State private var subscriptionManager = SubscriptionManager.shared
+    @State private var authManager = AuthManager.shared
     @Environment(\.dismiss) private var dismiss
     @State private var showFilePicker = false
     @State private var keyImportMessage: String? = nil
@@ -5397,6 +5537,24 @@ struct SettingsView: View {
     var body: some View {
         NavigationStack {
             Form {
+                if authManager.isLoggedIn {
+                    Section {
+                        if authManager.isDemoUser {
+                            Label("Demokonto (abgelaufenes Abo)", systemImage: "person.crop.circle")
+                            if let name = authManager.loggedInUsername {
+                                Text("Angemeldet: \(name)")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                        Button("Abmelden", role: .destructive) {
+                            dismiss()
+                            authManager.logout()
+                        }
+                    } header: {
+                        Text("Konto")
+                    }
+                }
                 Section {
                     if subscriptionManager.hasActiveSubscription {
                         Label("Premium aktiv", systemImage: "checkmark.circle.fill")
@@ -5458,14 +5616,6 @@ struct SettingsView: View {
                     Text("Kursziel-Überschreiben")
                 } footer: {
                     Text("Wenn an: Beim nächsten Abruf (z. B. nach CSV-Import oder „Kursziele OpenAI“) werden alle Kursziele neu ermittelt und überschrieben – auch aus CSV oder manuell gesetzte. Wenn aus: Kursziele aus CSV und manuell geänderte werden nicht überschrieben.")
-                }
-                
-                Section {
-                    Toggle("Demo-Modus (ohne API-Keys)", isOn: $demoMode)
-                } header: {
-                    Text("App-Test")
-                } footer: {
-                    Text("Aktivieren, um die App ohne FMP- oder OpenAI-API-Keys zu testen (z. B. für App-Store-Review oder TestFlight). Beim „Kursziele ermitteln“ werden plausible Beispielwerte angezeigt (ca. +12 % zum Referenzkurs). Quelle wird als „Demo“ geführt.")
                 }
                 
                 Section {

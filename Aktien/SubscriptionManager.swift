@@ -54,8 +54,9 @@ final class SubscriptionManager {
     /// 1 Woche (7 Tage) in Sekunden
     private static let trialDuration: TimeInterval = 7 * 24 * 60 * 60
 
-    /// true = Nutzer darf die App nutzen (1 Woche Trial oder aktives Abo). Bei Entwicklermodus + „Trial abgelaufen simulieren“ zählt nur Abo. Wenn noch keine Verkaufsversion oder Nutzer hat „Kostenlos testen“ ohne Produkt getippt: Zugriff erlauben.
+    /// true = Nutzer darf die App nutzen (1 Woche Trial oder aktives Abo). Demo-User (Login) gilt als abgelaufenes Abo → Paywall für App-Store-Prüfung.
     var hasPremiumAccess: Bool {
+        if AuthManager.shared.isDemoUser { return false }
         if simulateTrialExpired { return hasActiveSubscription }
         if allowAccessTappedWithoutProduct { return true }
         if productsLoadAttempted && monthlyProduct == nil { return true }
@@ -74,9 +75,10 @@ final class SubscriptionManager {
         }
     }
 
-    /// Noch innerhalb der 1 Woche ab erstem Start (ohne Abo). Bei simulateTrialExpired bleibt true (echter Status), Zugriff entscheidet hasPremiumAccess.
+    /// Noch innerhalb der 1 Woche ab erstem Start (ohne Abo). Demo-User: immer false (abgelaufenes Abo für Prüfer).
     var isInFreeTrialPeriod: Bool {
-        Date().timeIntervalSince(firstLaunchDate) < Self.trialDuration
+        if AuthManager.shared.isDemoUser { return false }
+        return Date().timeIntervalSince(firstLaunchDate) < Self.trialDuration
     }
 
     /// Verbleibende Tage in der kostenlosen Testphase (0 wenn abgelaufen oder Abo aktiv). Für Anzeige „noch X Tage“.
