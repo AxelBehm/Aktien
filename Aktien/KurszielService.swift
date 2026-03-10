@@ -7,13 +7,15 @@
 
 import Foundation
 
-/// Quelle des Kursziels – für Anzeige "Y" (Yahoo), "F" (finanzen.net), "A" (OpenAI), "C" (CSV), "M" (FMP), "S" (Snippet), "D" (Demo)
+/// Quelle des Kursziels – für Anzeige "Y" (Yahoo), "F" (finanzen.net), "A" (OpenAI), "C" (CSV), "M" (FMP), "K" (KGV), "S" (Snippet), "D" (Demo)
 enum KurszielQuelle: String {
     case yahoo = "Y"
     case finanzenNet = "F"
     case openAI = "A"
     case csv = "C"
     case fmp = "M"
+    /// Kursziel aus KGV-Methode: EPS × faires KGV (FMP Key-Metrics, Alternative zu Analysten/OpenAI)
+    case kgv = "K"
     /// Fonds-Fallback: erster Betrag aus Suchmaschinen-Snippet (DuckDuckGo)
     case suchmaschine = "S"
     /// Demo-Modus: plausible Beispielwerte ohne API-Keys (z. B. für App-Store-Review)
@@ -25,6 +27,7 @@ enum KurszielQuelle: String {
         case .csv: return "CSV"
         case .fmp: return "FMP"
         case .openAI: return "OpenAI"
+        case .kgv: return "KGV"
         case .finanzenNet: return "finanzen.net"
         case .yahoo: return "Yahoo"
         case .suchmaschine: return "Snippet"
@@ -117,6 +120,11 @@ class KurszielService {
         get { UserDefaults.standard.integer(forKey: keyZugriffeOpenAI) }
         set { UserDefaults.standard.set(newValue, forKey: keyZugriffeOpenAI) }
     }
+    private static let keyZugriffeKGV = "KurszielService.zugriffeKGV"
+    static var zugriffeKGV: Int {
+        get { UserDefaults.standard.integer(forKey: keyZugriffeKGV) }
+        set { UserDefaults.standard.set(newValue, forKey: keyZugriffeKGV) }
+    }
     
     /// Setzt die Zugriffsstatistik auf 0 (wird zu Beginn jedes Kursziel-Durchlaufs aufgerufen, damit pro Durchlauf gezählt wird).
     static func resetZugriffeStatistik() {
@@ -124,6 +132,7 @@ class KurszielService {
         zugriffeFinanzenNet = 0
         zugriffeYahoo = 0
         zugriffeOpenAI = 0
+        zugriffeKGV = 0
     }
     
     /// Zuletzt ermittelte Wechselkurse (Frankfurter API) – nur Puffer für rateUSDtoEUR/rateGBPtoEUR/rateDKKtoEUR; vor jeder Nutzung per fetchAppWechselkurse() direkt neu geladen.
@@ -313,6 +322,13 @@ class KurszielService {
                         debug("   → OpenAI (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
                         return eurInfo
                     }
+                case .kgv:
+                    if let info = await fetchKurszielFromFMPKGV(for: aktie),
+                       let eurInfo = await nehmenWennRealistisch(info) {
+                        zugriffeKGV += 1
+                        debug("   → KGV (Erstversuch): \(eurInfo.kursziel) € (übernommen)")
+                        return eurInfo
+                    }
                 case .csv, .demo:
                     break
                 }
@@ -344,18 +360,27 @@ class KurszielService {
             // 2. OpenAI – nur wenn API-Key gesetzt
             if bereitsErstversuch != .openAI {
                 let hatOpenAIKey = (openAIAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines)).map { !$0.isEmpty } ?? false
-                guard hatOpenAIKey else {
-                    debug("   → Kein OpenAI-Key, Ende (nichts eingetragen)")
-                    return nil
-                }
-                if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin) {
-                    if let eurInfo = await nehmenWennRealistisch(info) {
+                if hatOpenAIKey {
+                    if let info = await fetchKurszielVonOpenAI(wkn: aktie.wkn, bezeichnung: aktie.bezeichnung, isin: aktie.isin),
+                       let eurInfo = await nehmenWennRealistisch(info) {
                         debug("   → OpenAI: \(eurInfo.kursziel) € (übernommen)")
                         return eurInfo
                     }
+                    debug("   → OpenAI: nichts oder unrealistisch, weiter mit KGV")
                 }
             }
-            debug("   → OpenAI: nichts oder unrealistisch, nichts eingetragen")
+            
+            // 3. KGV (FMP Key-Metrics: EPS × faires KGV) – nur wenn FMP-Key als API-Key (nicht Voll-URL) gesetzt
+            if bereitsErstversuch != .kgv, fmpKeyMetricsURL(symbol: "AAPL") != nil {
+                if let info = await fetchKurszielFromFMPKGV(for: aktie),
+                   let eurInfo = await nehmenWennRealistisch(info) {
+                    zugriffeKGV += 1
+                    debug("   → KGV: \(eurInfo.kursziel) € (übernommen)")
+                    return eurInfo
+                }
+                debug("   → KGV: nichts oder unrealistisch")
+            }
+            debug("   → Ende (kein Kursziel ermittelt)")
             return nil
         }
     }
@@ -1605,6 +1630,157 @@ class KurszielService {
         }
         let urlStr = "https://financialmodelingprep.com/stable/price-target-consensus?symbol=\(symbol)&apikey=\(key)"
         return URL(string: urlStr)
+    }
+    
+    /// Einstellung: Faires KGV für KGV-Methode (Kursziel = EPS × dieses KGV). Standard 15.
+    private static let keyKGVTargetKGV = "KurszielService.kgvTargetKGV"
+    static var kgvTargetKGV: Double {
+        get {
+            let v = UserDefaults.standard.double(forKey: keyKGVTargetKGV)
+            return v > 0 ? v : 15
+        }
+        set { UserDefaults.standard.set(newValue, forKey: keyKGVTargetKGV) }
+    }
+    
+    /// FMP Key-Metrics-URL für Symbol (nur bei reinem API-Key; bei gespeicherter Voll-URL nur price-target).
+    private static func fmpKeyMetricsURL(symbol: String) -> URL? {
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        if raw.hasPrefix("https://") || raw.hasPrefix("http://") { return nil }
+        guard let key = fmpExtractAPIKey(), !key.isEmpty else { return nil }
+        return URL(string: "https://financialmodelingprep.com/stable/key-metrics?symbol=\(symbol)&apikey=\(key)")
+    }
+    
+    /// FMP Dividends-URL für Symbol (nur bei reinem API-Key).
+    private static func fmpDividendsURL(symbol: String) -> URL? {
+        guard let raw = fmpAPIKey?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        if raw.hasPrefix("https://") || raw.hasPrefix("http://") { return nil }
+        guard let key = fmpExtractAPIKey(), !key.isEmpty else { return nil }
+        return URL(string: "https://financialmodelingprep.com/stable/dividends?symbol=\(symbol)&apikey=\(key)")
+    }
+    
+    /// Kursziel per KGV-Methode: EPS × faires KGV. Nutzt FMP Key-Metrics (EPS, ggf. P/E). Alternative zu FMP-Analysten/OpenAI.
+    static func fetchKurszielFromFMPKGV(for aktie: Aktie) async -> KurszielInfo? {
+        var sym: String?
+        if aktie.isin.trimmingCharacters(in: .whitespaces).count >= 12 {
+            sym = await fmpSymbolFromSearchISIN(isin: aktie.isin)
+            if sym == "DB", aktie.isin.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix("DE") { sym = "DBK" }
+        }
+        if sym == nil { sym = fmpSymbol(for: aktie) }
+        if sym == nil, !aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty {
+            sym = await fmpSymbolFromSearchName(name: aktie.bezeichnung)
+        }
+        guard let symbol = sym, let url = fmpKeyMetricsURL(symbol: symbol) else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 20
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try? JSONSerialization.jsonObject(with: data)
+            var item: [String: Any]?
+            if let arr = json as? [[String: Any]], !arr.isEmpty { item = arr.first }
+            else if let obj = json as? [String: Any] { item = obj }
+            guard let it = item else { return nil }
+            let eps: Double? = (it["netIncomePerShare"] as? Double)
+                ?? (it["eps"] as? Double)
+                ?? (it["earningsPerShare"] as? Double)
+                ?? (it["epsTTM"] as? Double)
+            guard let epsVal = eps, epsVal > 0 else {
+                debug("   ⏭️ KGV: Kein EPS für \(symbol)")
+                return nil
+            }
+            let targetKGV = kgvTargetKGV
+            let kursziel = (epsVal * targetKGV * 100).rounded() / 100
+            var waehrung = "USD"
+            if gbpTicker.contains(symbol) { waehrung = "GBP" }
+            else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) { waehrung = "USD" }
+            else if (it["currency"] as? String)?.uppercased() == "EUR" { waehrung = "EUR" }
+            debug("   📊 KGV \(symbol): EPS \(String(format: "%.2f", epsVal)) × KGV \(String(format: "%.1f", targetKGV)) = \(String(format: "%.2f", kursziel)) \(waehrung)")
+            return KurszielInfo(kursziel: kursziel, datum: Date(), spalte4Durchschnitt: nil, quelle: .kgv, waehrung: waehrung)
+        } catch {
+            debug("   ❌ KGV/Key-Metrics \(symbol): \(error.localizedDescription)")
+            return nil
+        }
+    }
+    
+    /// Liefert Gewinn pro Aktie (EPS) und optional KGV (P/E) aus FMP Key-Metrics für die Detailansicht. Nil wenn kein API-Key oder kein EPS.
+    static func fetchEPSFromFMP(for aktie: Aktie) async -> (eps: Double, peRatio: Double?, waehrung: String)? {
+        var sym: String?
+        if aktie.isin.trimmingCharacters(in: .whitespaces).count >= 12 {
+            sym = await fmpSymbolFromSearchISIN(isin: aktie.isin)
+            if sym == "DB", aktie.isin.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix("DE") { sym = "DBK" }
+        }
+        if sym == nil { sym = fmpSymbol(for: aktie) }
+        if sym == nil, !aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty {
+            sym = await fmpSymbolFromSearchName(name: aktie.bezeichnung)
+        }
+        guard let symbol = sym, let url = fmpKeyMetricsURL(symbol: symbol) else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 20
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try? JSONSerialization.jsonObject(with: data)
+            var item: [String: Any]?
+            if let arr = json as? [[String: Any]], !arr.isEmpty { item = arr.first }
+            else if let obj = json as? [String: Any] { item = obj }
+            guard let it = item else { return nil }
+            let eps: Double? = (it["netIncomePerShare"] as? Double)
+                ?? (it["eps"] as? Double)
+                ?? (it["earningsPerShare"] as? Double)
+                ?? (it["epsTTM"] as? Double)
+            guard let epsVal = eps, epsVal > 0 else { return nil }
+            let pe: Double? = (it["peRatio"] as? Double)
+                ?? (it["peRatioTTM"] as? Double)
+                ?? (it["priceEarningsRatio"] as? Double)
+            var waehrung = "USD"
+            if gbpTicker.contains(symbol) { waehrung = "GBP" }
+            else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) { waehrung = "USD" }
+            else if (it["currency"] as? String)?.uppercased() == "EUR" { waehrung = "EUR" }
+            return (epsVal, pe, waehrung)
+        } catch {
+            return nil
+        }
+    }
+    
+    /// Liefert erwartete Dividende pro Aktie aus FMP Dividends-API (letzte/aktuelle Ausschüttung). Nil wenn kein API-Key oder keine Dividende.
+    static func fetchDividendeFromFMP(for aktie: Aktie) async -> (dividendeProAktie: Double, waehrung: String, paymentDate: Date?)? {
+        var sym: String?
+        if aktie.isin.trimmingCharacters(in: .whitespaces).count >= 12 {
+            sym = await fmpSymbolFromSearchISIN(isin: aktie.isin)
+            if sym == "DB", aktie.isin.trimmingCharacters(in: .whitespaces).uppercased().hasPrefix("DE") { sym = "DBK" }
+        }
+        if sym == nil { sym = fmpSymbol(for: aktie) }
+        if sym == nil, !aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty {
+            sym = await fmpSymbolFromSearchName(name: aktie.bezeichnung)
+        }
+        guard let symbol = sym, let url = fmpDividendsURL(symbol: symbol) else { return nil }
+        do {
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 20
+            request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36", forHTTPHeaderField: "User-Agent")
+            let (data, _) = try await URLSession.shared.data(for: request)
+            let json = try? JSONSerialization.jsonObject(with: data)
+            guard let arr = json as? [[String: Any]], !arr.isEmpty else { return nil }
+            // Erstes Element = neueste Dividende (FMP sortiert oft neueste zuerst)
+            let item = arr.first!
+            let amount: Double? = (item["dividend"] as? Double)
+                ?? (item["adjDividend"] as? Double)
+                ?? (item["dividendPerShare"] as? Double)
+            guard let div = amount, div > 0 else { return nil }
+            var waehrung = "USD"
+            if gbpTicker.contains(symbol) { waehrung = "GBP" }
+            else if usTicker.contains(symbol) || isLikelyUSTicker(symbol) { waehrung = "USD" }
+            else if (item["currency"] as? String)?.uppercased() == "EUR" { waehrung = "EUR" }
+            var paymentDate: Date?
+            if let pd = (item["paymentDate"] as? String) ?? (item["date"] as? String), !pd.isEmpty {
+                let fmt = ISO8601DateFormatter()
+                fmt.formatOptions = [.withFullDate, .withDashSeparatorInDate]
+                paymentDate = fmt.date(from: String(pd.prefix(10)))
+            }
+            return (div, waehrung, paymentDate)
+        } catch {
+            return nil
+        }
     }
     
     /// Parst FMP price-target-consensus Response (stable: targetHigh, targetLow, targetConsensus, targetMedian)

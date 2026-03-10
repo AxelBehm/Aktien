@@ -48,6 +48,10 @@ final class Aktie {
     var kurszielAnalysten: Int?
     /// true = manuell geändert, nicht automatisch überschreiben
     var kurszielManuellGeaendert: Bool = false
+    /// Höchst-Kurs als Referenz für „Kurs fällt?“-Hinweis (Trailing Stop)
+    var startKurs: Double?
+    /// Datum, an dem der Höchst-Kurs zuletzt gesetzt/aktualisiert wurde
+    var startKursDatum: Date?
     /// Marktwert aus der Voreinlesung (für Vergleich bei Ersetzung)
     var previousMarktwertEUR: Double?
     /// Bestand aus der Voreinlesung (für Vergleich bei Ersetzung)
@@ -97,7 +101,9 @@ final class Aktie {
         previousKurs: Double? = nil,
         isWatchlist: Bool = false,
         kommentar: String = "",
-        kommentarLetzteBearbeitung: Date? = nil
+        kommentarLetzteBearbeitung: Date? = nil,
+        startKurs: Double? = nil,
+        startKursDatum: Date? = nil
     ) {
         self.bankleistungsnummer = bankleistungsnummer
         self.bestand = bestand
@@ -136,6 +142,8 @@ final class Aktie {
         self.isWatchlist = isWatchlist
         self.kommentar = kommentar
         self.kommentarLetzteBearbeitung = kommentarLetzteBearbeitung
+        self.startKurs = startKurs
+        self.startKursDatum = startKursDatum
     }
 }
 

@@ -572,6 +572,7 @@ private struct StatistikSheetView: View {
                 Section("API-Zugriffe (automatischer Kursziel-Durchlauf)") {
                     LabeledContent("FMP (Financial Modeling Prep)", value: "\(KurszielService.zugriffeFMP)")
                     LabeledContent("OpenAI", value: "\(KurszielService.zugriffeOpenAI)")
+                    LabeledContent("KGV (EPS × KGV)", value: "\(KurszielService.zugriffeKGV)")
                 }
                 Section {
                     if letzteEinlesungen.isEmpty {
@@ -872,12 +873,16 @@ struct ContentView: View {
     @State private var alreadyImportedFilenamesForAlert: [String] = []
     @State private var pendingURLsForAlreadyImported: [URL]? = nil
     @State private var alreadyImportedFromStart = false
+    /// Schwelle in % für „Verkaufen – Kurs fällt?“ (z. B. 5 = 5 %)
+    @AppStorage("VerkaufWarnschwelleProzent") private var verkaufWarnschwelleProzent: Double = 5.0
+    @State private var suchTextName: String = ""
 
     /// Filter nach Kursziel-Quelle: Aus = alle, sonst nur die gewählte Quelle. Manuell = von Hand eingegebene/geänderte Kursziele.
     enum KurszielQuelleFilter: String, CaseIterable {
         case aus = "Aus"
         case openAI = "OpenAI"
         case fmp = "FMP"
+        case kgv = "KGV"
         case csv = "CSV"
         case demo = "Demo"
         case manuell = "Manuell"
@@ -1093,6 +1098,7 @@ struct ContentView: View {
         case .aus: byQuelle = aktien
         case .openAI: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.openAI.rawValue }
         case .fmp: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.fmp.rawValue }
+        case .kgv: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.kgv.rawValue }
         case .csv: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.csv.rawValue }
         case .demo: byQuelle = aktien.filter { $0.kurszielQuelle == KurszielQuelle.demo.rawValue }
         case .manuell: byQuelle = aktien.filter { $0.kurszielManuellGeaendert }
@@ -1105,7 +1111,7 @@ struct ContentView: View {
     
     /// Sortiert nach letzter Kommentar-Bearbeitung (neueste zuerst); ohne Datum ans Ende
     private var aktienSortiertNachKommentarBearbeitung: [Aktie] {
-        aktienZurAnzeige.sorted { a, b in
+        aktienGefiltertNachName.sorted { a, b in
             let da = a.kommentarLetzteBearbeitung ?? .distantPast
             let db = b.kommentarLetzteBearbeitung ?? .distantPast
             return da > db
@@ -1114,7 +1120,7 @@ struct ContentView: View {
     
     /// Sortiert nach Abstand (%) zum Kursziel: positive % (Aufwärtspotenzial) oben, grösste zuerst; negative % (Abwärtspotenzial) unten; ohne Kursziel ans Ende
     private var aktienSortiertNachAbstandKursziel: [Aktie] {
-        aktienZurAnzeige.sorted { a, b in
+        aktienGefiltertNachName.sorted { a, b in
             let kursA = a.kurs ?? a.devisenkurs ?? 0
             let kursB = b.kurs ?? b.devisenkurs ?? 0
             let pctA: Double? = (a.kursziel != nil && kursA > 0) ? (a.kursziel! - kursA) / kursA * 100 : nil
@@ -1130,12 +1136,23 @@ struct ContentView: View {
         }
     }
     
+    /// Nach Name/WKN/ISIN gefiltert (für Suche im Bestand)
+    private var aktienGefiltertNachName: [Aktie] {
+        let t = suchTextName.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !t.isEmpty else { return aktienZurAnzeige }
+        return aktienZurAnzeige.filter { aktie in
+            aktie.bezeichnung.lowercased().contains(t)
+                || aktie.wkn.trimmingCharacters(in: .whitespaces).lowercased().contains(t)
+                || aktie.isin.trimmingCharacters(in: .whitespaces).lowercased().contains(t)
+        }
+    }
+    
     /// Gruppiert nach Bankleistungsnummer für Zwischensummen
     private var gruppierteAktien: [(bl: String, aktien: [Aktie])] {
         var groups: [(bl: String, aktien: [Aktie])] = []
         var currentBL = ""
         var currentGroup: [Aktie] = []
-        for aktie in aktienZurAnzeige {
+        for aktie in aktienGefiltertNachName {
             let bl = aktie.bankleistungsnummer.isEmpty ? "—" : aktie.bankleistungsnummer
             if bl != currentBL {
                 if !currentGroup.isEmpty {
@@ -1154,7 +1171,7 @@ struct ContentView: View {
     }
     
     private var gesamtMarktwert: Double {
-        aktienZurAnzeige.compactMap { $0.marktwertEUR }.reduce(0, +)
+        aktienGefiltertNachName.compactMap { $0.marktwertEUR }.reduce(0, +)
     }
     
     @ViewBuilder
@@ -1253,6 +1270,27 @@ struct ContentView: View {
                             }
                         }
                         .frame(height: 6)
+                    }
+                }
+                // Zeile 5: Verkaufs-Hinweis bei starkem Kursrückgang oder erreichtem Kursziel
+                if let aktuellerKurs = (aktie.kurs ?? aktie.devisenkurs).flatMap({ $0 > 0 ? $0 : nil }),
+                   let start = aktie.startKurs, start > 0 {
+                    let schwelle = max(0.1, verkaufWarnschwelleProzent) // minimale sinnvolle Schwelle 0,1 %
+                    let grenze = start * (1.0 - schwelle / 100.0)
+                    let istKurszielErreicht = {
+                        if let kz = aktie.kursziel, kz > 0 {
+                            // Kursziel erreicht oder überschritten (leichte Toleranz)
+                            return aktuellerKurs >= kz * 0.99
+                        }
+                        return false
+                    }()
+                    let istUnterSchwelle = aktuellerKurs <= grenze
+                    if istUnterSchwelle || istKurszielErreicht {
+                        Text(istKurszielErreicht ? "Verkaufen – Kursziel erreicht" : "Verkaufen – Kurs fällt?")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.yellow)
+                            .padding(.top, 2)
                     }
                 }
             }
@@ -1651,6 +1689,18 @@ struct ContentView: View {
     @ViewBuilder
     private func aktienListContent(proxy: ScrollViewProxy, selectionForThreeColumn: Binding<String?>? = nil) -> some View {
         List {
+                Section {
+                    TextField("Suchen nach Name, WKN oder ISIN", text: $suchTextName)
+                        .textContentType(.none)
+                        .autocorrectionDisabled()
+                    if !suchTextName.trimmingCharacters(in: .whitespaces).isEmpty {
+                        Text("\(aktienGefiltertNachName.count) Treffer")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    Text("Suche")
+                }
                 // Legende oben – Fonds/Fund/ETF-Positionen ggf. manuell mit Kurszielen versehen
                 Section {
                     VStack(alignment: .leading, spacing: 6) {
@@ -2031,7 +2081,7 @@ struct ContentView: View {
                         Text(isImportingKurszieleOpenAI ? "Kursziele werden via OpenAI abgerufen…" : "Kursziele werden abgerufen…")
                             .font(.caption)
                     }
-                    // In der Automatik nur FMP und OpenAI (nur wenn API-Key gesetzt)
+                    // In der Automatik: FMP, OpenAI, KGV (FMP Key-Metrics)
                     VStack(alignment: .leading, spacing: 2) {
                         Text("Quellen (automatischer Durchlauf):")
                             .font(.caption2)
@@ -2039,6 +2089,7 @@ struct ContentView: View {
                             .foregroundColor(.secondary)
                         kurszielQuelleZeile(name: "FMP (Financial Modeling Prep)", brauchtKey: true, hatKey: !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
                         kurszielQuelleZeile(name: "OpenAI", brauchtKey: true, hatKey: !openAIAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty)
+                        kurszielQuelleZeile(name: "KGV (EPS × KGV)", brauchtKey: false, hatKey: !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty && !fmpAPIKeyStore.hasPrefix("http"))
                     }
                     .frame(maxWidth: .infinity, alignment: .leading)
                     if let aktie = aktuelleKurszielAktie {
@@ -2455,7 +2506,7 @@ struct ContentView: View {
             return s
         }()
         
-        // 2. Vergleiche alt/neu: previousMarktwertEUR, previousBestand, previousKurs, Kursziel etc. von alter Position übernehmen
+        // 2. Vergleiche alt/neu: previousMarktwertEUR, previousBestand, previousKurs, Höchst-Kurs, Kursziel etc. von alter Position übernehmen
         // Immer nur die Kombination (Bankleistungsnummer + WKN oder ISIN) – andere Kombinationen gelten nicht. Bei festem BL: Such-BL = fester Wert (BL aus Datei ignoriert).
         for neue in alleNeuenAktien {
             let bl = neue.bankleistungsnummer.trimmingCharacters(in: .whitespaces)
@@ -2479,6 +2530,26 @@ struct ContentView: View {
                 neue.kommentar = alte.kommentar
                 neue.kommentarLetzteBearbeitung = alte.kommentarLetzteBearbeitung
                 
+                // Höchst-Kurs aktualisieren: Erstes Einlesen → aktueller Kurs; bei späteren Einlesungen Höchst-Kurs nur erhöhen (neue Hochs), nicht senken.
+                if let aktuellerKurs = neue.kurs ?? neue.devisenkurs, aktuellerKurs > 0 {
+                    if let alterStart = alte.startKurs, alterStart > 0 {
+                        if aktuellerKurs > alterStart {
+                            neue.startKurs = aktuellerKurs
+                            neue.startKursDatum = Date()
+                        } else {
+                            neue.startKurs = alterStart
+                            neue.startKursDatum = alte.startKursDatum
+                        }
+                    } else if neue.startKurs == nil {
+                        neue.startKurs = aktuellerKurs
+                        neue.startKursDatum = Date()
+                    }
+                } else if let alterStart = alte.startKurs {
+                    // Kein aktueller Kurs, aber alter Höchst-Kurs vorhanden → übernehmen
+                    neue.startKurs = alterStart
+                    neue.startKursDatum = alte.startKursDatum
+                }
+
                 // Kursziel übernehmen, wenn manuell geändert oder aus CSV (C) – sonst beim Abruf neu ermitteln
                 // Bei Fonds/Fund/ETF werden keine Kursziele ermittelt; gesetzte Werte bei nächster Einlesung übernehmen
                 if let kz = alte.kursziel {
@@ -3581,6 +3652,11 @@ struct AktieDetailView: View {
     @State private var verlaufChartZoomScale: CGFloat = 1.0
     @State private var isLoadingISIN = false
     @State private var isinLookupError: String?
+    @State private var epsResult: (eps: Double, peRatio: Double?, waehrung: String)? = nil
+    @State private var isLoadingEPS = false
+    @State private var dividendeResult: (dividendeProAktie: Double, waehrung: String, paymentDate: Date?)? = nil
+    @State private var isLoadingDividende = false
+    @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
     
     var body: some View {
         Form {
@@ -3681,6 +3757,99 @@ struct AktieDetailView: View {
                 if let kurs = aktie.kurs {
                     LabeledContent("Aktueller Kurs") {
                         Text(formatBetragDE(kurs, decimals: 4))
+                    }
+                }
+                LabeledContent("Höchst-Kurs") {
+                    if let start = aktie.startKurs, start > 0 {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(formatBetragDE(start, decimals: 4))
+                            if let d = aktie.startKursDatum {
+                                Text("seit \(d.formatted(date: .abbreviated, time: .omitted))")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    } else {
+                        Text("—")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                if (aktie.kurs ?? aktie.devisenkurs) != nil {
+                    Button {
+                        let k = aktie.kurs ?? aktie.devisenkurs
+                        guard let kurs = k, kurs > 0 else { return }
+                        aktie.startKurs = kurs
+                        aktie.startKursDatum = Date()
+                        try? modelContext.save()
+                    } label: {
+                        Label("Kurs fällt-Hinweis zurücksetzen", systemImage: "arrow.counterclockwise")
+                            .font(.subheadline)
+                    }
+                    .disabled((aktie.kurs ?? aktie.devisenkurs) == nil)
+                    Text("Setzt Höchst-Kurs auf den aktuellen Kurs – der Hinweis „Verkaufen – Kurs fällt?“ verschwindet, neues Niveau gilt als Referenz.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+                LabeledContent("Gewinn pro Aktie (EPS)") {
+                    if isLoadingEPS {
+                        HStack(spacing: 6) {
+                            ProgressView().scaleEffect(0.85)
+                            Text("Wird geladen…")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    } else if let r = epsResult {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(formatBetragDE(r.eps, decimals: 4)) \(r.waehrung)")
+                            if let pe = r.peRatio, pe > 0 {
+                                Text("KGV (P/E): \(formatBetragDE(pe, decimals: 1))")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Button("Aktualisieren") { loadEPS() }
+                                .font(.caption2)
+                        }
+                    } else if !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty, !fmpAPIKeyStore.hasPrefix("http") {
+                        Button("EPS laden") {
+                            loadEPS()
+                        }
+                        .font(.subheadline)
+                    } else {
+                        Text("—")
+                            .foregroundColor(.secondary)
+                    }
+                }
+                LabeledContent("Erwartete Dividende (pro Aktie)") {
+                    if isLoadingDividende {
+                        HStack(spacing: 6) {
+                            ProgressView().scaleEffect(0.85)
+                            Text("Wird geladen…")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        }
+                    } else if let r = dividendeResult {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("\(formatBetragDE(r.dividendeProAktie, decimals: 4)) \(r.waehrung)")
+                            let gesamt = r.dividendeProAktie * aktie.bestand
+                            Text("Erwarteter Betrag: \(formatBetragDE(gesamt, decimals: 2)) \(r.waehrung) (\(formatBetragDE(r.dividendeProAktie, decimals: 2)) × \(formatBetragDE(aktie.bestand, decimals: 0)) Stück)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                            if let d = r.paymentDate {
+                                Text("Zahlung: \(d.formatted(date: .abbreviated, time: .omitted))")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+                            Button("Aktualisieren") { loadDividende() }
+                                .font(.caption2)
+                        }
+                    } else if !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty, !fmpAPIKeyStore.hasPrefix("http") {
+                        Button("Dividende laden") {
+                            loadDividende()
+                        }
+                        .font(.subheadline)
+                    } else {
+                        Text("—")
+                            .foregroundColor(.secondary)
                     }
                 }
                 LabeledContent("Kursziel") {
@@ -3931,6 +4100,32 @@ if let high = aktie.kurszielHigh { LabeledContent("Hochziel") { Text("\(formatBe
             try? modelContext.save()
         } else {
             isinLookupError = "ISIN konnte nicht ermittelt werden."
+        }
+    }
+    
+    private func loadEPS() {
+        guard !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty, !fmpAPIKeyStore.hasPrefix("http") else { return }
+        isLoadingEPS = true
+        epsResult = nil
+        Task {
+            let result = await KurszielService.fetchEPSFromFMP(for: aktie)
+            await MainActor.run {
+                epsResult = result
+                isLoadingEPS = false
+            }
+        }
+    }
+    
+    private func loadDividende() {
+        guard !fmpAPIKeyStore.trimmingCharacters(in: .whitespaces).isEmpty, !fmpAPIKeyStore.hasPrefix("http") else { return }
+        isLoadingDividende = true
+        dividendeResult = nil
+        Task {
+            let result = await KurszielService.fetchDividendeFromFMP(for: aktie)
+            await MainActor.run {
+                dividendeResult = result
+                isLoadingDividende = false
+            }
         }
     }
     
@@ -4938,6 +5133,7 @@ struct WatchlistView: View {
     @Environment(\.dismiss) private var dismiss
     @Query(sort: [SortDescriptor<Aktie>(\.bezeichnung)]) private var alleAktien: [Aktie]
     @State private var isinWknEingabe = ""
+    @State private var suchTextName: String = ""
     @State private var lookupResult: KurszielService.WatchlistLookupResult?
     @State private var isLookingUp = false
     @State private var bearbeiteterKurs: String = ""
@@ -4947,6 +5143,17 @@ struct WatchlistView: View {
     
     private var watchlistAktien: [Aktie] {
         alleAktien.filter { $0.isWatchlist }
+    }
+    
+    private var watchlistGefiltertNachName: [Aktie] {
+        let t = suchTextName.trimmingCharacters(in: .whitespaces).lowercased()
+        guard !t.isEmpty else { return watchlistAktien }
+        return watchlistAktien.filter { aktie in
+            let bez = (aktie.bezeichnung.isEmpty ? watchlistBezeichnungFallback(wkn: aktie.wkn, isin: aktie.isin) : aktie.bezeichnung).lowercased()
+            return bez.contains(t)
+                || aktie.wkn.trimmingCharacters(in: .whitespaces).lowercased().contains(t)
+                || aktie.isin.trimmingCharacters(in: .whitespaces).lowercased().contains(t)
+        }
     }
     
     var body: some View {
@@ -5000,10 +5207,22 @@ struct WatchlistView: View {
                     }
                 }
                 Section {
-                    ForEach(watchlistAktien) { aktie in
+                    TextField("Suchen nach Name, WKN oder ISIN", text: $suchTextName)
+                        .textContentType(.none)
+                        .autocorrectionDisabled()
+                    if !suchTextName.trimmingCharacters(in: .whitespaces).isEmpty {
+                        Text("\(watchlistGefiltertNachName.count) Treffer")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    Text("Suche")
+                }
+                Section {
+                    ForEach(watchlistGefiltertNachName) { aktie in
                         HStack {
                             VStack(alignment: .leading, spacing: 2) {
-                                Text(aktie.bezeichnung)
+                                Text(aktie.bezeichnung.trimmingCharacters(in: .whitespaces).isEmpty ? watchlistBezeichnungFallback(wkn: aktie.wkn, isin: aktie.isin) : aktie.bezeichnung)
                                     .font(.headline)
                                 Text(aktie.isin.isEmpty ? aktie.wkn : aktie.isin)
                                     .font(.caption)
@@ -5136,9 +5355,10 @@ struct WatchlistView: View {
     
     private func deleteWatchlistItems(offsets: IndexSet) {
         withAnimation {
+            let list = watchlistGefiltertNachName
             for i in offsets {
-                if i < watchlistAktien.count {
-                    modelContext.delete(watchlistAktien[i])
+                if i < list.count {
+                    modelContext.delete(list[i])
                 }
             }
             try? modelContext.save()
@@ -5524,6 +5744,17 @@ struct WKNTesterView: View {
 struct SettingsView: View {
     @Binding var openAIAPIKey: String
     @Binding var fmpAPIKey: String
+    @AppStorage("VerkaufWarnschwelleProzent") private var verkaufWarnschwelleProzent: Double = 5.0
+    @State private var kgvTargetLocal: Double = 15
+    private var kgvTargetBinding: Binding<Double> {
+        Binding(
+            get: { kgvTargetLocal },
+            set: { new in
+                kgvTargetLocal = new
+                KurszielService.kgvTargetKGV = new > 0 ? new : 15
+            }
+        )
+    }
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
@@ -5630,6 +5861,36 @@ struct SettingsView: View {
                 }
                 
                 Section {
+                    HStack {
+                        Text("Warnschwelle Kurs fällt (%)")
+                        Spacer()
+                        TextField("5", value: $verkaufWarnschwelleProzent, format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 56)
+                    }
+                } header: {
+                    Text("Verkaufen-Hinweis")
+                } footer: {
+                    Text("Ab diesem prozentualen Rückgang vom Höchst-Kurs erscheint auf der Startseite der Hinweis „Verkaufen – Kurs fällt?“. Standard 5 %.")
+                }
+                
+                Section {
+                    HStack {
+                        Text("Faires KGV (für KGV-Methode)")
+                        Spacer()
+                        TextField("KGV", value: kgvTargetBinding, format: .number)
+                            .keyboardType(.decimalPad)
+                            .multilineTextAlignment(.trailing)
+                            .frame(width: 56)
+                    }
+                } header: {
+                    Text("KGV-Methode")
+                } footer: {
+                    Text("Kursziel = Gewinn pro Aktie (EPS) × dieses KGV. Wird genutzt, wenn FMP Key-Metrics verfügbar sind und weder FMP-Analysten noch OpenAI ein Kursziel liefern. Typisch 10–25; Standard 15.")
+                }
+                
+                Section {
                     Toggle("Entwicklermodus", isOn: $entwicklermodus)
                     #if DEBUG
                     Toggle("Debug: Nur 1 Zeile einlesen", isOn: $debugEinlesungNurEinSatz)
@@ -5701,6 +5962,10 @@ struct SettingsView: View {
                         Text("Nach der Generierung in OpenAI wird der API-Key zum Kopieren angeboten. Falls das direkte Einfügen in die Einstellung nicht klappt: Key kopieren und in eine E-Mail einfügen (nicht in eine separate Datei). Auf dem iPhone die Mail öffnen und den Key von dort in die Einstellung einfügen – das funktioniert.")
                     }
                 }
+            }
+            .onAppear {
+                let v = KurszielService.kgvTargetKGV
+                if v > 0 { kgvTargetLocal = v }
             }
             .navigationTitle("Einstellungen · \(BankStore.selectedBank.name)")
             .toolbar {

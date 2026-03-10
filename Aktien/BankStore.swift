@@ -40,6 +40,8 @@ extension Notification.Name {
     static let returnToStartAfterImport = Notification.Name("Aktien.returnToStartAfterImport")
     /// „Kostenlos testen“ getippt obwohl kein Abo-Produkt → RootView soll zur Aktien-Ansicht wechseln.
     static let subscriptionGrantAccessWithoutProduct = Notification.Name("Aktien.subscriptionGrantAccessWithoutProduct")
+    /// Nutzer hat auf der Paywall „Weiter“ getippt (Trial – freie Tage gesehen) → RootView zeigt ContentView.
+    static let paywallTrialAcknowledged = Notification.Name("Aktien.paywallTrialAcknowledged")
 }
 
 private let banksListKey = "Aktien.BanksList"

@@ -55,9 +55,17 @@ private struct RootView: View {
     @State private var authManager = AuthManager.shared
     /// „Kostenlos testen“ ohne Produkt getippt → Wechsel zur Aktien-Ansicht (Notification sorgt für zuverlässiges Update).
     @State private var grantedAccessByButton = false
+    /// Nutzer hat auf der Paywall „Weiter“ getippt (Trial) → freie Tage gesehen, jetzt ContentView zeigen.
+    @State private var trialPaywallAcknowledged = false
 
     private var showContentView: Bool {
         subscriptionManager.hasPremiumAccess || grantedAccessByButton
+    }
+
+    /// Paywall anzeigen: wenn kein Zugriff (blockierend) oder wenn Trial (Nutzer soll freie Tage sehen, dann „Weiter“).
+    private var showPaywallBeforeContent: Bool {
+        guard startState.hasStarted, showContentView else { return !showContentView && startState.hasStarted }
+        return subscriptionManager.isInFreeTrialPeriod && !trialPaywallAcknowledged
     }
 
     var body: some View {
@@ -67,10 +75,10 @@ private struct RootView: View {
             } else if BankStore.loadBanks().isEmpty {
                 BankStartView()
             } else if startState.hasStarted {
-                if showContentView {
-                    ContentView()
-                } else {
+                if showPaywallBeforeContent {
                     PaywallView()
+                } else {
+                    ContentView()
                 }
             } else {
                 BankStartView()
@@ -78,13 +86,19 @@ private struct RootView: View {
         }
         .id("\(authManager.isLoggedIn)-\(startState.hasStarted)")
         .onChange(of: startState.hasStarted) { _, new in
-            if !new { grantedAccessByButton = false }
+            if !new {
+                grantedAccessByButton = false
+                trialPaywallAcknowledged = false
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: .returnToStartAfterImport)) { _ in
             startState.hasStarted = false
         }
         .onReceive(NotificationCenter.default.publisher(for: .subscriptionGrantAccessWithoutProduct)) { _ in
             grantedAccessByButton = true
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .paywallTrialAcknowledged)) { _ in
+            trialPaywallAcknowledged = true
         }
     }
 }

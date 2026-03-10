@@ -114,6 +114,18 @@ struct PaywallView: View {
                         .lineLimit(2)
                         .padding(.horizontal, 8)
                 }
+                if subscriptionManager.isInFreeTrialPeriod {
+                    Button {
+                        NotificationCenter.default.post(name: .paywallTrialAcknowledged, object: nil)
+                    } label: {
+                        Text("Weiter – App nutzen")
+                            .frame(maxWidth: .infinity)
+                            .padding()
+                            .background(Color.accentColor)
+                            .foregroundStyle(.white)
+                            .clipShape(RoundedRectangle(cornerRadius: 12))
+                    }
+                }
                 Button {
                     Task { await subscriptionManager.purchase() }
                 } label: {
@@ -127,7 +139,7 @@ struct PaywallView: View {
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
-                    .background(Color.accentColor)
+                    .background(subscriptionManager.isInFreeTrialPeriod ? Color.accentColor.opacity(0.7) : Color.accentColor)
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 }

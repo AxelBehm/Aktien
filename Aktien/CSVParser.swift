@@ -162,6 +162,7 @@ class CSVParser {
         if lower.contains("yahoo") { return "Y" }
         if lower.contains("ariva") { return "F" }
         if lower.contains("openai") { return "A" }
+        if lower.contains("kgv") { return "K" }
         return s
     }
     
