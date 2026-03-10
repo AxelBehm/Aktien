@@ -7,6 +7,11 @@
 
 import SwiftUI
 import SwiftData
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 
 @main
 struct AktienApp: App {
@@ -50,6 +55,7 @@ struct AktienApp: App {
 
 /// Beim Start: Login (Demokonto für App-Store-Prüfung). Danach Bank-Auswahl → Einlese-Seite oder Paywall.
 private struct RootView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @Bindable private var startState = StartState.shared
     @State private var subscriptionManager = SubscriptionManager.shared
     @State private var authManager = AuthManager.shared
@@ -57,6 +63,25 @@ private struct RootView: View {
     @State private var grantedAccessByButton = false
     /// Nutzer hat auf der Paywall „Weiter“ getippt (Trial) → freie Tage gesehen, jetzt ContentView zeigen.
     @State private var trialPaywallAcknowledged = false
+    /// Auf iPhone: Inhalt erst anzeigen, wenn Scene aktiv ist (vermeidet weißen Bildschirm beim manuellen Öffnen).
+    @State private var sceneBecameActive = false
+
+    private static var systemBackground: Color {
+        #if os(iOS)
+        Color(uiColor: .systemBackground)
+        #else
+        Color(nsColor: .windowBackgroundColor)
+        #endif
+    }
+
+    /// Auf iPhone oft .inactive beim ersten Frame; erst bei .active zuverlässig layouten.
+    private var mayShowContent: Bool {
+        #if os(iOS)
+        return sceneBecameActive
+        #else
+        return true
+        #endif
+    }
 
     private var showContentView: Bool {
         subscriptionManager.hasPremiumAccess || grantedAccessByButton
@@ -69,22 +94,55 @@ private struct RootView: View {
     }
 
     var body: some View {
-        Group {
-            if !authManager.isLoggedIn {
-                LoginView()
-            } else if BankStore.loadBanks().isEmpty {
-                BankStartView()
-            } else if startState.hasStarted {
-                if showPaywallBeforeContent {
-                    PaywallView()
-                } else {
-                    ContentView()
+        ZStack {
+            if mayShowContent {
+                Group {
+                    if !authManager.isLoggedIn {
+                        LoginView()
+                    } else if BankStore.loadBanks().isEmpty {
+                        BankStartView()
+                    } else if startState.hasStarted {
+                        if showPaywallBeforeContent {
+                            PaywallView()
+                        } else {
+                            ContentView()
+                        }
+                    } else {
+                        BankStartView()
+                    }
                 }
-            } else {
-                BankStartView()
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Self.systemBackground)
+            }
+
+            if !mayShowContent {
+                VStack(spacing: 12) {
+                    ProgressView()
+                    Text("Laden…")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .background(Self.systemBackground)
             }
         }
         .id("\(authManager.isLoggedIn)-\(startState.hasStarted)")
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                sceneBecameActive = true
+            }
+        }
+        .onAppear {
+            if scenePhase == .active {
+                sceneBecameActive = true
+            }
+            #if os(iOS)
+            // Fallback: Nach 1,5 s Inhalt anzeigen (falls scenePhase auf iPhone nicht zu .active wechselt).
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                sceneBecameActive = true
+            }
+            #endif
+        }
         .onChange(of: startState.hasStarted) { _, new in
             if !new {
                 grantedAccessByButton = false

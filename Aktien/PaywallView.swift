@@ -58,9 +58,12 @@ struct PaywallView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
 
-                    // Richtlinie 3.1.2(c): Abo-Titel, Laufzeit, Preis einmalig klar erkennbar
+                    // App Store: Auto-renewable subscription – Titel, Laufzeit, Preis, Links zu Datenschutz & EULA (alle in der App)
                     VStack(spacing: 6) {
                         if let product = subscriptionManager.monthlyProduct {
+                            Text(product.displayName)
+                                .font(.headline)
+                                .foregroundStyle(.primary)
                             Text(product.displayPrice)
                                 .font(.title)
                                 .fontWeight(.semibold)
@@ -68,6 +71,9 @@ struct PaywallView: View {
                                 .font(.subheadline)
                                 .foregroundStyle(.secondary)
                         } else {
+                            Text("Aktien Premium (monatlich)")
+                                .font(.headline)
+                                .foregroundStyle(.primary)
                             Text("9,99 € / Monat")
                                 .font(.title2)
                                 .fontWeight(.semibold)
@@ -77,6 +83,29 @@ struct PaywallView: View {
                         }
                     }
                     .padding(.vertical, 4)
+
+                    // App Store: Pflichtangaben – funktionale Links zu Datenschutz und EULA im Kaufprozess sichtbar
+                    VStack(spacing: 10) {
+                        Text("Datenschutz & Nutzungsbedingungen (EULA)")
+                            .font(.subheadline)
+                            .fontWeight(.medium)
+                            .foregroundStyle(.secondary)
+                        HStack(spacing: 20) {
+                            Link(destination: Self.datenschutzURL) {
+                                Text("Datenschutzerklärung (Privacy Policy)")
+                                    .font(.subheadline)
+                                    .underline()
+                            }
+                            Link(destination: Self.nutzungsbedingungenURL) {
+                                Text("Nutzungsbedingungen (Terms of Use / EULA)")
+                                    .font(.subheadline)
+                                    .underline()
+                            }
+                        }
+                        .multilineTextAlignment(.center)
+                    }
+                    .padding(.vertical, 8)
+                    .padding(.horizontal, 16)
 
                     Text("Wenn zu viele Kursziele nicht ermittelt werden konnten, sollten Sie überlegen, sich API-Keys von OpenAI oder FMP zu besorgen und diese in den Einstellungen einzutragen. Unter Einstellungen können Sie die Verbindung testen; danach „Kursziele ermitteln“ ausführen.")
                         .font(.caption)
@@ -179,7 +208,8 @@ struct PaywallView: View {
 
     /// Richtlinie 3.1.2(c): Funktionale Links zu Datenschutzerklärung und EULA im Kaufprozess
     private static let datenschutzURL = URL(string: "https://kisoft4you.com/datenschutzerklaerung")!
-    private static let nutzungsbedingungenURL = URL(string: "https://kisoft4you.com/agb")!
+    /// Standard-EULA von Apple (App Store Terms of Use)
+    private static let nutzungsbedingungenURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
 
     private var legalLinks: some View {
         VStack(spacing: 10) {

@@ -4601,6 +4601,8 @@ private struct SnippetTestSheetView: View {
 }
 
 private let defaultRechtlichesText = """
+Terms of Use (EULA): https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
+
 Programm-technische Beschreibung
 
 Diese App dient der Verwaltung von Wertpapierpositionen (Aktien, Fonds, ETFs) und der Ermittlung von Kurszielen.
@@ -4623,9 +4625,19 @@ struct RechtlichesSheetView: View {
         rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
     }
     
+    private static let appleEULAURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
+
     @ViewBuilder
     private var rechtlichesLinks: some View {
         VStack(alignment: .leading, spacing: 12) {
+            Link(destination: Self.appleEULAURL) {
+                HStack {
+                    Label("Terms of Use (EULA)", systemImage: "doc.plaintext.fill")
+                    Spacer()
+                    Image(systemName: "arrow.up.right.square")
+                        .font(.caption)
+                }
+            }
             Link(destination: URL(string: "https://kisoft4you.com/impressum")!) {
                 HStack {
                     Label("Impressum", systemImage: "doc.text.fill")
@@ -4746,6 +4758,8 @@ private let programmBeschreibungBundleExtension = "docx"
 private let defaultProgrammBeschreibungText = """
 Programm-Beschreibung und Funktionsweise
 
+Terms of Use (EULA): https://www.apple.com/legal/internet-services/itunes/dev/stdeula/
+
 Hier können Sie eine ausführliche Beschreibung der App, der Bedienung und der Funktionen hinterlegen.
 
 • Startseite: Bank auswählen, CSV-Spalten zuordnen (bei anderen Banken), „Einlesen“ startet den Import für die gewählte Bank.
@@ -4812,6 +4826,17 @@ struct ProgrammBeschreibungSheetView: View {
             Group {
                 if entwicklermodus {
                     VStack(spacing: 0) {
+                        Link(destination: URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!) {
+                            HStack {
+                                Label("Terms of Use (EULA)", systemImage: "doc.plaintext.fill")
+                                Spacer()
+                                Image(systemName: "arrow.up.right.square")
+                                    .font(.caption)
+                            }
+                            .font(.subheadline)
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 8)
+                        }
                         if bundledDocumentURL != nil {
                             Button {
                                 showBundledDocument = true
@@ -4838,6 +4863,16 @@ struct ProgrammBeschreibungSheetView: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
+                            Link(destination: URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!) {
+                                HStack {
+                                    Label("Terms of Use (EULA)", systemImage: "doc.plaintext.fill")
+                                    Spacer()
+                                    Image(systemName: "arrow.up.right.square")
+                                        .font(.caption)
+                                }
+                                .font(.subheadline)
+                            }
+                            Divider()
                             if bundledDocumentURL != nil {
                                 Button {
                                     showBundledDocument = true
