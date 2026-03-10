@@ -84,29 +84,6 @@ struct PaywallView: View {
                     }
                     .padding(.vertical, 4)
 
-                    // App Store: Pflichtangaben – funktionale Links zu Datenschutz und EULA im Kaufprozess sichtbar
-                    VStack(spacing: 10) {
-                        Text("Datenschutz & Nutzungsbedingungen (EULA)")
-                            .font(.subheadline)
-                            .fontWeight(.medium)
-                            .foregroundStyle(.secondary)
-                        HStack(spacing: 20) {
-                            Link(destination: Self.datenschutzURL) {
-                                Text("Datenschutzerklärung (Privacy Policy)")
-                                    .font(.subheadline)
-                                    .underline()
-                            }
-                            Link(destination: Self.nutzungsbedingungenURL) {
-                                Text("Nutzungsbedingungen (Terms of Use / EULA)")
-                                    .font(.subheadline)
-                                    .underline()
-                            }
-                        }
-                        .multilineTextAlignment(.center)
-                    }
-                    .padding(.vertical, 8)
-                    .padding(.horizontal, 16)
-
                     Text("Wenn zu viele Kursziele nicht ermittelt werden konnten, sollten Sie überlegen, sich API-Keys von OpenAI oder FMP zu besorgen und diese in den Einstellungen einzutragen. Unter Einstellungen können Sie die Verbindung testen; danach „Kursziele ermitteln“ ausführen.")
                         .font(.caption)
                         .foregroundStyle(Color(red: 0.72, green: 0.55, blue: 0))
