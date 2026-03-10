@@ -11,6 +11,7 @@ import Observation
 import UniformTypeIdentifiers
 #if os(iOS)
 import QuickLook
+import SafariServices
 import UIKit
 extension URL: Identifiable {
     public var id: String { absoluteString }
@@ -4620,51 +4621,44 @@ struct RechtlichesSheetView: View {
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @State private var editableText = ""
     @State private var hasLoaded = false
-    
+    #if os(iOS)
+    @State private var safariURL: URL?
+    #endif
+
     private var displayText: String {
         rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
     }
-    
+
     private static let appleEULAURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
 
     @ViewBuilder
     private var rechtlichesLinks: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Link(destination: Self.appleEULAURL) {
-                HStack {
-                    Label("Terms of Use (EULA)", systemImage: "doc.plaintext.fill")
-                    Spacer()
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.caption)
-                }
-            }
-            Link(destination: URL(string: "https://kisoft4you.com/impressum")!) {
-                HStack {
-                    Label("Impressum", systemImage: "doc.text.fill")
-                    Spacer()
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.caption)
-                }
-            }
-            Link(destination: URL(string: "https://kisoft4you.com/datenschutzerklaerung")!) {
-                HStack {
-                    Label("Datenschutz", systemImage: "lock.shield.fill")
-                    Spacer()
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.caption)
-                }
-            }
-            Link(destination: URL(string: "https://kisoft4you.com/agb")!) {
-                HStack {
-                    Label("AGB", systemImage: "list.clipboard.fill")
-                    Spacer()
-                    Image(systemName: "arrow.up.right.square")
-                        .font(.caption)
-                }
-            }
+            rechtlichesLink(title: "Terms of Use (EULA)", systemImage: "doc.plaintext.fill", url: Self.appleEULAURL)
+            rechtlichesLink(title: "Impressum", systemImage: "doc.text.fill", url: URL(string: "https://kisoft4you.com/impressum")!)
+            rechtlichesLink(title: "Datenschutz", systemImage: "lock.shield.fill", url: URL(string: "https://kisoft4you.com/datenschutzerklaerung")!)
+            rechtlichesLink(title: "AGB", systemImage: "list.clipboard.fill", url: URL(string: "https://kisoft4you.com/agb")!)
         }
         .padding(.horizontal)
         .padding(.vertical, 12)
+    }
+
+    private func rechtlichesLink(title: String, systemImage: String, url: URL) -> some View {
+        Button {
+            #if os(iOS)
+            safariURL = url
+            #elseif os(macOS)
+            NSWorkspace.shared.open(url)
+            #endif
+        } label: {
+            HStack {
+                Label(title, systemImage: systemImage)
+                Spacer()
+                Image(systemName: "arrow.up.right.square")
+                    .font(.caption)
+            }
+        }
+        .buttonStyle(.plain)
     }
     
     var body: some View {
@@ -4714,6 +4708,11 @@ struct RechtlichesSheetView: View {
                 }
             }
         }
+        #if os(iOS)
+        .sheet(item: $safariURL) { url in
+            SafariView(url: url)
+        }
+        #endif
         .onAppear {
             if entwicklermodus && !hasLoaded {
                 editableText = rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
@@ -4798,6 +4797,9 @@ struct ProgrammBeschreibungSheetView: View {
     @State private var editableText = ""
     @State private var hasLoaded = false
     @State private var showBundledDocument = false
+    #if os(iOS)
+    @State private var safariURL: URL?
+    #endif
 
     private var displayText: String {
         programmBeschreibungText.isEmpty ? defaultProgrammBeschreibungText : programmBeschreibungText
@@ -4826,7 +4828,13 @@ struct ProgrammBeschreibungSheetView: View {
             Group {
                 if entwicklermodus {
                     VStack(spacing: 0) {
-                        Link(destination: URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!) {
+                        Button {
+                            #if os(iOS)
+                            safariURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")
+                            #elseif os(macOS)
+                            NSWorkspace.shared.open(URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!)
+                            #endif
+                        } label: {
                             HStack {
                                 Label("Terms of Use (EULA)", systemImage: "doc.plaintext.fill")
                                 Spacer()
@@ -4837,6 +4845,7 @@ struct ProgrammBeschreibungSheetView: View {
                             .padding(.horizontal, 16)
                             .padding(.vertical, 8)
                         }
+                        .buttonStyle(.plain)
                         if bundledDocumentURL != nil {
                             Button {
                                 showBundledDocument = true
@@ -4863,7 +4872,13 @@ struct ProgrammBeschreibungSheetView: View {
                 } else {
                     ScrollView {
                         VStack(alignment: .leading, spacing: 16) {
-                            Link(destination: URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!) {
+                            Button {
+                                #if os(iOS)
+                                safariURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")
+                                #elseif os(macOS)
+                                NSWorkspace.shared.open(URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!)
+                                #endif
+                            } label: {
                                 HStack {
                                     Label("Terms of Use (EULA)", systemImage: "doc.plaintext.fill")
                                     Spacer()
@@ -4872,6 +4887,7 @@ struct ProgrammBeschreibungSheetView: View {
                                 }
                                 .font(.subheadline)
                             }
+                            .buttonStyle(.plain)
                             Divider()
                             if bundledDocumentURL != nil {
                                 Button {
@@ -4918,6 +4934,9 @@ struct ProgrammBeschreibungSheetView: View {
             if let url = bundledDocumentURL {
                 BundledDocumentSheetView(url: url)
             }
+        }
+        .sheet(item: $safariURL) { url in
+            SafariView(url: url)
         }
         #endif
         .onAppear {
@@ -6136,6 +6155,20 @@ struct SettingsView: View {
         }
     }
 }
+
+#if os(iOS)
+/// In-App-Safari: Jedes Mal neue Instanz, damit beim erneuten Öffnen kein weißer Bildschirm erscheint.
+struct SafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let vc = SFSafariViewController(url: url)
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
+}
+#endif
 
 #Preview {
     ContentView()

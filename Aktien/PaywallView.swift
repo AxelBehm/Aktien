@@ -8,10 +8,18 @@
 
 import SwiftUI
 import StoreKit
+#if os(iOS)
+import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 
 struct PaywallView: View {
     @State private var subscriptionManager = SubscriptionManager.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    #if os(iOS)
+    @State private var safariURL: URL?
+    #endif
 
     var body: some View {
         NavigationStack {
@@ -174,6 +182,11 @@ struct PaywallView: View {
         .task {
             await subscriptionManager.loadProducts()
         }
+        #if os(iOS)
+        .sheet(item: $safariURL) { url in
+            SafariView(url: url)
+        }
+        #endif
     }
 
     private var legalText: some View {
@@ -195,12 +208,28 @@ struct PaywallView: View {
                 .fontWeight(.medium)
                 .foregroundStyle(.secondary)
             HStack(spacing: 20) {
-                Link("Datenschutzerklärung", destination: Self.datenschutzURL)
-                    .font(.caption)
-                    .foregroundStyle(.blue)
-                Link("Nutzungsbedingungen (EULA)", destination: Self.nutzungsbedingungenURL)
-                    .font(.caption)
-                    .foregroundStyle(.blue)
+                Button {
+                    #if os(iOS)
+                    safariURL = Self.datenschutzURL
+                    #elseif os(macOS)
+                    NSWorkspace.shared.open(Self.datenschutzURL)
+                    #endif
+                } label: {
+                    Text("Datenschutzerklärung")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                }
+                Button {
+                    #if os(iOS)
+                    safariURL = Self.nutzungsbedingungenURL
+                    #elseif os(macOS)
+                    NSWorkspace.shared.open(Self.nutzungsbedingungenURL)
+                    #endif
+                } label: {
+                    Text("Nutzungsbedingungen (EULA)")
+                        .font(.caption)
+                        .foregroundStyle(.blue)
+                }
             }
         }
     }
