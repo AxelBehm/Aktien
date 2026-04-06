@@ -381,6 +381,28 @@ extension Aktie {
         return contains(gattung) || contains(bezeichnung)
     }
     
+    /// true, wenn `kurszielDatum` fehlt oder mindestens `intervallTage` zurückliegt (letzter Kursziel-Durchlauf).
+    func kurszielDurchlaufVeraltet(intervallTage: Int) -> Bool {
+        guard intervallTage > 0 else { return true }
+        guard let kd = kurszielDatum else { return true }
+        guard let limit = Calendar.current.date(byAdding: .day, value: intervallTage, to: kd) else { return true }
+        return Date() >= limit
+    }
+    
+    /// Filter für automatischen und manuellen Kursziel-Durchlauf: keine ETFs/Fonds; bei vorhandenem Ziel keine Neuermittlung bis zur eingestellten Frist (außer „Alle überschreiben“).
+    func sollKurszielAutomatischErmitteln(forceOverwrite: Bool, erneuerungIntervallTage: Int) -> Bool {
+        if kurszielManuellGeaendert { return false }
+        if istFonds { return false }
+        if forceOverwrite { return true }
+        // Nach Trial/Demo ohne API: Platzhalter (+12 %) mit frischem Datum – sobald echter Abruf möglich ist, Erneuerungsfrist nicht anwenden
+        if kurszielQuelle == KurszielQuelle.demo.rawValue && !KurszielService.isDemoMode {
+            return true
+        }
+        let keinWert = kursziel == nil || (kursziel ?? 0) == 0
+        if keinWert { return true }
+        return kurszielDurchlaufVeraltet(intervallTage: erneuerungIntervallTage)
+    }
+    
     /// Prüft ob Kursziel plausibel ist (z.B. nicht 19,77€ bei Amazon ~197€). Abwärts: mind. 50 % des Kurses.
     var isKurszielPlausibel: Bool {
         guard let kz = kursziel, kz >= 1 else { return false }
@@ -570,7 +592,7 @@ private struct StatistikSheetView: View {
     var body: some View {
         NavigationStack {
             List {
-                Section("API-Zugriffe (automatischer Kursziel-Durchlauf)") {
+                Section("API-Zugriffe (Kursziel-Durchlauf)") {
                     LabeledContent("FMP (Financial Modeling Prep)", value: "\(KurszielService.zugriffeFMP)")
                     LabeledContent("OpenAI", value: "\(KurszielService.zugriffeOpenAI)")
                     LabeledContent("KGV (EPS × KGV)", value: "\(KurszielService.zugriffeKGV)")
@@ -656,7 +678,7 @@ private struct StatistikSheetView: View {
                     Text("Daten")
                 }
             }
-            .navigationTitle("Statistik · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
                     Button("Schließen") { dismiss() }
@@ -844,6 +866,8 @@ struct ContentView: View {
     @State private var aktuelleKurszielAktie: (bezeichnung: String, wkn: String)? = nil
     @State private var showDebugLog = false
     @State private var showSettings = false
+    /// Beim Öffnen der Einstellungen: hatte der Nutzer schon FMP/OpenAI hinterlegt (für Auto-Nachabruf Demo→echt)
+    @State private var apiKeysPresentWhenSettingsOpened = false
     @State private var showRechtliches = false
     @State private var showWatchlist = false
     @State private var pendingImportURLs: [URL]? = nil
@@ -855,8 +879,18 @@ struct ContentView: View {
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
     @State private var subscriptionManager = SubscriptionManager.shared
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
-    /// Wenn an (nur in Einstellungen sichtbar bei Debug-Build): Beim CSV-Import nur 1 Zeile einlesen und Einlesewerte + Satz Deutsche Bank in die Konsole drucken.
+    /// Mindestabstand zwischen automatischen Kursziel-Abrufen pro Position (Tage). Standard 30 ≈ 1 Monat.
+    @AppStorage("KurszielErneuerungIntervallTage") private var kurszielErneuerungIntervallTage: Int = 30
+    /// Wenn an (nur in Einstellungen bei Debug-Build): Beim CSV-Import nur 1 Zeile einlesen und Einlesewerte + Satz Deutsche Bank in die Konsole drucken.
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
+    /// Release: immer aus (Schalter nur in DEBUG sichtbar).
+    private var debugEinlesungNurEinSatzAktiv: Bool {
+        #if DEBUG
+        debugEinlesungNurEinSatz
+        #else
+        false
+        #endif
+    }
     @State private var isImportingKurszieleOpenAI = false
     /// Nach CSV-Import: Kurszielermittlung erst starten, wenn der Nutzer den Import-Alert mit OK geschlossen hat (verhindert blockierten OK-Button).
     @State private var pendingKurszielFetchAfterImport = false
@@ -964,34 +998,8 @@ struct ContentView: View {
     
     /// CSV aus gegebener Aktienliste bauen (für Export im Hintergrund)
     private func buildExportCSVFrom(aktien list: [Aktie]) -> String {
-        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Einstandskurs;Kurs;Marktwert_EUR;Kursziel;Kursziel_Waehrung;Kursziel_Datum;Kursziel_Quelle"
-        let formatter = NumberFormatter()
-        formatter.locale = Locale(identifier: "de_DE")
-        formatter.numberStyle = .decimal
-        formatter.minimumFractionDigits = 0
-        formatter.maximumFractionDigits = 4
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateFormat = "dd.MM.yyyy"
-        dateFormatter.locale = Locale(identifier: "de_DE")
-        var rows: [String] = [header]
-        for a in list {
-            let bez = Self.csvEscape(a.bezeichnung)
-            let bl = Self.csvEscape(a.bankleistungsnummer)
-            let wkn = Self.csvEscape(a.wkn)
-            let isin = Self.csvEscape(a.isin)
-            let bestand = formatter.string(from: NSNumber(value: a.bestand)) ?? "\(a.bestand)"
-            let waehrung = Self.csvEscape(a.waehrung)
-            let einstand = a.einstandskurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
-            let kurs = a.kurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
-            let marktwert = a.marktwertEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
-            let kursziel = a.kursziel.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
-            let kzWaehrung = (a.kurszielWaehrung ?? "").trimmingCharacters(in: .whitespaces)
-            let kzW = Self.csvEscape(kzWaehrung)
-            let kzDatum = a.kurszielDatum.map { dateFormatter.string(from: $0) } ?? ""
-            let kzQuelle = Self.csvEscape(a.kurszielQuelle ?? "")
-            rows.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(einstand);\(kurs);\(marktwert);\(kursziel);\(kzW);\(kzDatum);\(kzQuelle)")
-        }
-        return rows.joined(separator: "\n")
+        let rows = list.map { exportRow(from: $0) }
+        return Self.buildCSVFromExportRows(rows)
     }
     
     @State private var isExportingCSV = false
@@ -1004,35 +1012,97 @@ struct ContentView: View {
         let isin: String
         let bestand: Double
         let waehrung: String
+        let hinweisEinstandskurs: String
         let einstandskurs: Double?
+        let deviseneinstandskurs: Double?
         let kurs: Double?
+        let stopKursOrderbuch: String
+        let kurszielAbstand: Double?
+        let devisenkurs: Double?
+        let gewinnVerlustEUR: Double?
+        let gewinnVerlustProzent: Double?
         let marktwertEUR: Double?
+        let stueckzinsenEUR: Double?
+        let anteilProzent: Double?
+        let datumLetzteBewegung: Date?
+        let gattung: String
+        let branche: String
+        let risikoklasse: String
+        let depotPortfolioName: String
+        let importDatum: Date
         let kursziel: Double?
         let kurszielWaehrung: String
         let kurszielDatum: Date?
         let kurszielQuelle: String
+        let kurszielHigh: Double?
+        let kurszielLow: Double?
+        let kurszielAnalysten: Int?
+        let kurszielManuellGeaendert: Bool
+        let startKurs: Double?
+        let startKursDatum: Date?
+        let previousMarktwertEUR: Double?
+        let previousBestand: Double?
+        let previousKurs: Double?
+        let isWatchlist: Bool
+        let kommentar: String
+        let kommentarLetzteBearbeitung: Date?
+        let dividendeProAktie: Double?
+        let dividendeWaehrung: String
+        let dividendePaymentDate: Date?
+    }
+
+    private func exportRow(from a: Aktie) -> ExportRow {
+        ExportRow(
+            bl: a.bankleistungsnummer,
+            bezeichnung: a.bezeichnung,
+            wkn: a.wkn,
+            isin: a.isin,
+            bestand: a.bestand,
+            waehrung: a.waehrung,
+            hinweisEinstandskurs: a.hinweisEinstandskurs,
+            einstandskurs: a.einstandskurs,
+            deviseneinstandskurs: a.deviseneinstandskurs,
+            kurs: a.kurs ?? a.devisenkurs,
+            stopKursOrderbuch: "",
+            kurszielAbstand: a.kurszielAbstand,
+            devisenkurs: a.devisenkurs,
+            gewinnVerlustEUR: a.gewinnVerlustEUR,
+            gewinnVerlustProzent: a.gewinnVerlustProzent,
+            marktwertEUR: a.marktwertEUR,
+            stueckzinsenEUR: a.stueckzinsenEUR,
+            anteilProzent: a.anteilProzent,
+            datumLetzteBewegung: a.datumLetzteBewegung,
+            gattung: a.gattung,
+            branche: a.branche,
+            risikoklasse: a.risikoklasse,
+            depotPortfolioName: a.depotPortfolioName,
+            importDatum: a.importDatum,
+            kursziel: a.kursziel,
+            kurszielWaehrung: a.kurszielWaehrung ?? "",
+            kurszielDatum: a.kurszielDatum,
+            kurszielQuelle: a.kurszielQuelle ?? "",
+            kurszielHigh: a.kurszielHigh,
+            kurszielLow: a.kurszielLow,
+            kurszielAnalysten: a.kurszielAnalysten,
+            kurszielManuellGeaendert: a.kurszielManuellGeaendert,
+            startKurs: a.startKurs,
+            startKursDatum: a.startKursDatum,
+            previousMarktwertEUR: a.previousMarktwertEUR,
+            previousBestand: a.previousBestand,
+            previousKurs: a.previousKurs,
+            isWatchlist: a.isWatchlist,
+            kommentar: a.kommentar,
+            kommentarLetzteBearbeitung: a.kommentarLetzteBearbeitung,
+            dividendeProAktie: a.dividendeProAktie,
+            dividendeWaehrung: a.dividendeWaehrung ?? "",
+            dividendePaymentDate: a.dividendePaymentDate
+        )
     }
     
     private func exportAktienToCSV() {
         guard !isExportingCSV else { return }
         isExportingCSV = true
-        let rows = aktien.map { a in
-            ExportRow(
-                bl: a.bankleistungsnummer,
-                bezeichnung: a.bezeichnung,
-                wkn: a.wkn,
-                isin: a.isin,
-                bestand: a.bestand,
-                waehrung: a.waehrung,
-                einstandskurs: a.einstandskurs,
-                kurs: a.kurs ?? a.devisenkurs,
-                marktwertEUR: a.marktwertEUR,
-                kursziel: a.kursziel,
-                kurszielWaehrung: a.kurszielWaehrung ?? "",
-                kurszielDatum: a.kurszielDatum,
-                kurszielQuelle: a.kurszielQuelle ?? ""
-            )
-        }
+        let rows = aktien.map { exportRow(from: $0) }
         Task { @MainActor in
             let result = await Task.detached(priority: .userInitiated) {
                 let csv = Self.buildCSVFromExportRows(rows)
@@ -1063,7 +1133,7 @@ struct ContentView: View {
     
     /// CSV-String aus Rohzeilen bauen (läuft komplett im Hintergrund)
     private static func buildCSVFromExportRows(_ rows: [ExportRow]) -> String {
-        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Einstandskurs;Kurs;Marktwert_EUR;Kursziel;Kursziel_Waehrung;Kursziel_Datum;Kursziel_Quelle"
+        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Hinweis_Einstandskurs;Einstandskurs;Deviseneinstandskurs;Kurs;Kursziel;Abstand_Kursziel;Stop-Kurs_Orderbuch;Devisenkurs;Gewinn_Verlust_EUR;Gewinn_Verlust_Prozent;Marktwert_EUR;Stueckzinsen_EUR;Anteil_Prozent;Datum_letzte_Bewegung;Gattung;Branche;Risikoklasse;Depot_Portfolio_Name;Import_Datum;Kursziel_Datum;Kursziel_Quelle;Kursziel_Waehrung;Kursziel_High;Kursziel_Low;Kursziel_Analysten;Kursziel_Manuell_Geaendert;Start_Kurs;Start_Kurs_Datum;Previous_Marktwert_EUR;Previous_Bestand;Previous_Kurs;IsWatchlist;Kommentar;Kommentar_Letzte_Bearbeitung;Dividende_Pro_Aktie;Dividende_Waehrung;Dividende_Zahltag"
         let formatter = NumberFormatter()
         formatter.locale = Locale(identifier: "de_DE")
         formatter.numberStyle = .decimal
@@ -1072,6 +1142,9 @@ struct ContentView: View {
         let dateFormatter = DateFormatter()
         dateFormatter.dateFormat = "dd.MM.yyyy"
         dateFormatter.locale = Locale(identifier: "de_DE")
+        let dateTimeFormatter = DateFormatter()
+        dateTimeFormatter.dateFormat = "dd.MM.yyyy HH:mm"
+        dateTimeFormatter.locale = Locale(identifier: "de_DE")
         var lines = [header]
         for a in rows {
             let bez = Self.csvEscape(a.bezeichnung)
@@ -1080,14 +1153,49 @@ struct ContentView: View {
             let isin = Self.csvEscape(a.isin)
             let bestand = formatter.string(from: NSNumber(value: a.bestand)) ?? "\(a.bestand)"
             let waehrung = Self.csvEscape(a.waehrung)
+            let hinweisEinstandskurs = Self.csvEscape(a.hinweisEinstandskurs)
             let einstand = a.einstandskurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let devisenEinstand = a.deviseneinstandskurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
             let kurs = a.kurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
-            let marktwert = a.marktwertEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
             let kursziel = a.kursziel.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kzAbstandWert: Double? = {
+                if let existing = a.kurszielAbstand { return existing }
+                guard let k = a.kurs, k > 0, let kz = a.kursziel else { return nil }
+                return ((kz - k) / k) * 100
+            }()
+            let kzAbstand = kzAbstandWert.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let stopKursOrderbuch = Self.csvEscape(a.stopKursOrderbuch)
+            let devisenkurs = a.devisenkurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let gewinnVerlustEUR = a.gewinnVerlustEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let gewinnVerlustProzent = a.gewinnVerlustProzent.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let marktwert = a.marktwertEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let stueckzinsenEUR = a.stueckzinsenEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let anteilProzent = a.anteilProzent.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let datumLetzteBewegung = a.datumLetzteBewegung.map { dateFormatter.string(from: $0) } ?? ""
+            let gattung = Self.csvEscape(a.gattung)
+            let branche = Self.csvEscape(a.branche)
+            let risikoklasse = Self.csvEscape(a.risikoklasse)
+            let depotPortfolioName = Self.csvEscape(a.depotPortfolioName)
+            let importDatum = dateTimeFormatter.string(from: a.importDatum)
             let kzW = Self.csvEscape(a.kurszielWaehrung)
             let kzDatum = a.kurszielDatum.map { dateFormatter.string(from: $0) } ?? ""
             let kzQuelle = Self.csvEscape(a.kurszielQuelle)
-            lines.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(einstand);\(kurs);\(marktwert);\(kursziel);\(kzW);\(kzDatum);\(kzQuelle)")
+            let kzHigh = a.kurszielHigh.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kzLow = a.kurszielLow.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let kzAnalysten = a.kurszielAnalysten.map(String.init) ?? ""
+            let kzManuell = a.kurszielManuellGeaendert ? "1" : "0"
+            let startKurs = a.startKurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let startKursDatum = a.startKursDatum.map { dateFormatter.string(from: $0) } ?? ""
+            let previousMarktwertEUR = a.previousMarktwertEUR.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let previousBestand = a.previousBestand.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let previousKurs = a.previousKurs.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let isWatchlist = a.isWatchlist ? "1" : "0"
+            let kommentar = Self.csvEscape(a.kommentar)
+            let kommentarLetzteBearbeitung = a.kommentarLetzteBearbeitung.map { dateFormatter.string(from: $0) } ?? ""
+            let dividendeProAktie = a.dividendeProAktie.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
+            let dividendeWaehrung = Self.csvEscape(a.dividendeWaehrung)
+            let dividendeZahltag = a.dividendePaymentDate.map { dateFormatter.string(from: $0) } ?? ""
+            lines.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(hinweisEinstandskurs);\(einstand);\(devisenEinstand);\(kurs);\(kursziel);\(kzAbstand);\(stopKursOrderbuch);\(devisenkurs);\(gewinnVerlustEUR);\(gewinnVerlustProzent);\(marktwert);\(stueckzinsenEUR);\(anteilProzent);\(datumLetzteBewegung);\(gattung);\(branche);\(risikoklasse);\(depotPortfolioName);\(importDatum);\(kzDatum);\(kzQuelle);\(kzW);\(kzHigh);\(kzLow);\(kzAnalysten);\(kzManuell);\(startKurs);\(startKursDatum);\(previousMarktwertEUR);\(previousBestand);\(previousKurs);\(isWatchlist);\(kommentar);\(kommentarLetzteBearbeitung);\(dividendeProAktie);\(dividendeWaehrung);\(dividendeZahltag)")
         }
         return lines.joined(separator: "\n")
     }
@@ -1344,7 +1452,7 @@ struct ContentView: View {
             #elseif os(iOS)
             .navigationSplitViewColumnWidth(min: 320, ideal: 420)
             #endif
-            .navigationTitle("Aktien · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .toolbar { aktienToolbarContent }
             .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
                 Button("Löschen und Kursziele merken", role: .destructive) { saveManualKurszieleAndDeleteAll() }
@@ -1471,7 +1579,7 @@ struct ContentView: View {
             #elseif os(iOS)
             .navigationSplitViewColumnWidth(min: 280, ideal: 360)
             #endif
-            .navigationTitle("Aktien · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .toolbar { aktienToolbarContent }
             .confirmationDialog("Alles löschen?", isPresented: $showDeleteConfirmation) {
                 Button("Löschen und Kursziele merken", role: .destructive) { saveManualKurszieleAndDeleteAll() }
@@ -1607,7 +1715,7 @@ struct ContentView: View {
                 #elseif os(iOS)
                 .navigationSplitViewColumnWidth(min: 300, ideal: 400)
                 #endif
-                .navigationTitle("Kursziele · \(BankStore.selectedBank.name)")
+                .navigationTitle("Aktien-Kursziele")
         }
         .navigationSplitViewStyle(.balanced)
     }
@@ -2059,6 +2167,13 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.25), value: showDatumBearbeitetHint)
+        .onChange(of: showSettings) { _, isOpen in
+            if isOpen {
+                apiKeysPresentWhenSettingsOpened = hasAnyKurszielApiKeyConfigured()
+            } else {
+                recalcDemoKurszieleIfKeysWereJustAddedInSettings()
+            }
+        }
         .confirmationDialog(unrealistischConfirm.dialogTitle.isEmpty ? "OpenAI-Ersatz übernehmen?" : unrealistischConfirm.dialogTitle, isPresented: $unrealistischConfirm.isPresented) {
             Button("Ja, übernehmen") { unrealistischConfirm.choose(true) }
             Button("Nein, nicht übernehmen") { unrealistischConfirm.choose(false) }
@@ -2084,7 +2199,7 @@ struct ContentView: View {
                     }
                     // In der Automatik: FMP, OpenAI, KGV (FMP Key-Metrics)
                     VStack(alignment: .leading, spacing: 2) {
-                        Text("Quellen (automatischer Durchlauf):")
+                        Text("Quellen (Import & manueller Abruf):")
                             .font(.caption2)
                             .fontWeight(.medium)
                             .foregroundColor(.secondary)
@@ -2226,7 +2341,7 @@ struct ContentView: View {
         pendingImportURLs = nil
         showFingerprintMismatchAlert = false
         let currentFingerprint = urls.first.flatMap { CSVParser.computeFingerprint(from: $0) }
-        if debugEinlesungNurEinSatz {
+        if debugEinlesungNurEinSatzAktiv {
             print("\n>>> DEBUG EINLESUNG: Schalter an – es wird nur die erste Datei, erste Zeile verarbeitet. Ausgabe folgt unten. <<<\n")
         }
         var alleNeuenAktien: [Aktie] = []
@@ -2245,7 +2360,7 @@ struct ContentView: View {
         var firstFailureDiagnosticAny: String?
         var firstFailureFileAny: String?
         var firstFilePreviewAny: String?
-        let urlsToProcess = debugEinlesungNurEinSatz ? Array(urls.prefix(1)) : urls
+        let urlsToProcess = debugEinlesungNurEinSatzAktiv ? Array(urls.prefix(1)) : urls
         let kontoFilterRaw = BankStore.loadKontoFilter(for: BankStore.selectedBankId)
         let kontoFilterNumbers: [String] = (kontoFilterRaw ?? "")
             .components(separatedBy: CharacterSet(charactersIn: "|,"))
@@ -2253,7 +2368,7 @@ struct ContentView: View {
             .filter { !$0.isEmpty }
         if kontoFilterNumbers.isEmpty {
             clearPendingKurszielAfterImport()
-            importMessage = "Konto-Filter fehlt – unter Einstellungen → \(BankStore.selectedBank.name) → Spalten zuordnen eintragen (z. B. 600252636500|20070000)."
+            importMessage = "Konto-Filter fehlt – unter Einstellungen → \(BankStore.selectedBank.name) → Spalten zuordnen eintragen (z. B. 600 252636500|20070000, kompletter Spalteninhalt)."
             showImportMessage = true
             return
         }
@@ -2298,10 +2413,10 @@ struct ContentView: View {
                     firstFailureFileAny = url.lastPathComponent
                 }
                 if firstFilePreviewAny == nil, let preview = filePreview { firstFilePreviewAny = preview }
-                let neueAktienToInsert = debugEinlesungNurEinSatz ? Array(neueAktien.prefix(1)) : neueAktien
+                let neueAktienToInsert = debugEinlesungNurEinSatzAktiv ? Array(neueAktien.prefix(1)) : neueAktien
                 csvHadKursziele = csvHadKursziele || hadKursziele
-                zeilenVerarbeitet += debugEinlesungNurEinSatz ? neueAktienToInsert.count : zeilenImportiert
-                if zeilenGesamt > zeilenImportiert, !debugEinlesungNurEinSatz {
+                zeilenVerarbeitet += debugEinlesungNurEinSatzAktiv ? neueAktienToInsert.count : zeilenImportiert
+                if zeilenGesamt > zeilenImportiert, !debugEinlesungNurEinSatzAktiv {
                     var hinweis = "\(url.lastPathComponent): \(zeilenGesamt) Zeilen in Datei, \(zeilenImportiert) als Positionen importiert. \(zeilenGesamt - zeilenImportiert) Zeile(n) konnten nicht zugeordnet werden."
                     if let line = firstFailureLine, let diag = firstFailureDiagnostic {
                         hinweis += " Erste fehlgeschlagene Zeile: Zeile \(line) – \(diag)"
@@ -2335,7 +2450,7 @@ struct ContentView: View {
                 errors.append("\(url.lastPathComponent): \(error.localizedDescription)")
             }
         }
-        if debugEinlesungNurEinSatz && alleNeuenAktien.isEmpty {
+        if debugEinlesungNurEinSatzAktiv && alleNeuenAktien.isEmpty {
             print(">>> DEBUG: Keine Zeilen in alleNeuenAktien (Parser lieferte 0 Positionen oder alle waren Watchlist-Treffer). Prüfe CSV-Format und Zuordnung. <<<\n")
         }
         if !hasFixedBL {
@@ -2356,7 +2471,7 @@ struct ContentView: View {
         
         // Feste Werte aus der Zuordnung: Jedes Feld, bei dem „Fester Wert“ (=…) eingetragen ist, wird auf alle Einlesezeilen angewendet (z. B. Bankleistungsnummer). Die BL aus der CSV-Spalte wird dabei überschrieben.
         let aktivesMapping = BankStore.loadCSVColumnMapping(for: BankStore.selectedBankId)
-        if debugEinlesungNurEinSatz, let first = alleNeuenAktien.first {
+        if debugEinlesungNurEinSatzAktiv, let first = alleNeuenAktien.first {
             let aktiveBankName = BankStore.selectedBank.name
             let blMapping = aktivesMapping["bankleistungsnummer"] ?? "nil"
             print("========== Einlesung Debug (1 Zeile) ==========")
@@ -2446,7 +2561,7 @@ struct ContentView: View {
         for aktie in alleNeuenAktien {
             aktie.importDatum = einleseDatum
         }
-        if debugEinlesungNurEinSatz, let first = alleNeuenAktien.first {
+        if debugEinlesungNurEinSatzAktiv, let first = alleNeuenAktien.first {
             print("--- Satz Deutsche Bank (nach Verarbeitung, wird gespeichert) ---")
             print("  BL: \(first.bankleistungsnummer)")
             print("  Bezeichnung: \(first.bezeichnung)")
@@ -2686,13 +2801,10 @@ struct ContentView: View {
         }
         
         // Kurszielermittlung erst nach OK auf dem Import-Alert starten; bei Daten vor Tagesdatum vorher abfragen.
-        let sollAktualisieren: (Aktie) -> Bool = { a in
-            if forceOverwriteAllKursziele || !csvHadKursziele { return !a.kurszielManuellGeaendert }
-            guard !a.kurszielManuellGeaendert else { return false }
-            let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
-            return a.kurszielQuelle != "C" || keinWert
+        let kurszielForceOW = forceOverwriteAllKursziele || !csvHadKursziele
+        let brauchtKursziel = alleNeuenAktien.contains {
+            $0.sollKurszielAutomatischErmitteln(forceOverwrite: kurszielForceOW, erneuerungIntervallTage: kurszielErneuerungIntervallTage)
         }
-        let brauchtKursziel = !csvHadKursziele || !alleNeuenAktien.filter(sollAktualisieren).isEmpty
         let startOfToday = Calendar.current.startOfDay(for: Date())
         let alteDatenMitImport = einleseDatum < startOfToday && !alleNeuenAktien.isEmpty
         let sollAbfragenOderStarten = (brauchtKursziel || alteDatenMitImport)
@@ -2729,14 +2841,9 @@ struct ContentView: View {
     private func startPendingKurszielFetch() {
         KurszielService.clearCachesForApiCalls()
         let forceOverwrite = pendingKurszielForceOverwrite
-        let sollAktualisieren: (Aktie) -> Bool = { a in
-            if forceOverwrite { return !a.kurszielManuellGeaendert }
-            guard !a.kurszielManuellGeaendert else { return false }
-            // Auch aus CSV (C): ermitteln, wenn Kursziel fehlt oder 0 ist
-            let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
-            return a.kurszielQuelle != "C" || keinWert
+        let list = aktien.filter {
+            $0.sollKurszielAutomatischErmitteln(forceOverwrite: forceOverwrite, erneuerungIntervallTage: kurszielErneuerungIntervallTage)
         }
-        let list = aktien.filter(sollAktualisieren)
         let importDate = pendingKurszielImportDatum
         if !list.isEmpty {
             Task { await fetchKurszieleForAktien(list, forceOverwrite: forceOverwrite, snapshotImportDatum: importDate) }
@@ -2744,19 +2851,31 @@ struct ContentView: View {
         pendingKurszielImportDatum = nil
     }
     
+    private func hasAnyKurszielApiKeyConfigured() -> Bool {
+        !fmpAPIKeyStore.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            || !openAIAPIKeyStore.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    
+    /// Nach Schließen der Einstellungen: ersten API-Key eingetragen → Demo-Platzhalter ohne Warten auf die Erneuerungsfrist neu abrufen.
+    private func recalcDemoKurszieleIfKeysWereJustAddedInSettings() {
+        guard !apiKeysPresentWhenSettingsOpened, hasAnyKurszielApiKeyConfigured() else { return }
+        guard !KurszielService.isDemoMode else { return }
+        let hatDemoPlatzhalter = aktien.contains {
+            $0.kurszielQuelle == KurszielQuelle.demo.rawValue && !$0.kurszielManuellGeaendert && !$0.istFonds
+        }
+        guard hatDemoPlatzhalter else { return }
+        startKurszielErmittlungManuell()
+    }
+    
     /// Kurszielermittlung manuell starten (z. B. nach Unterbrechung durch Home-Button). Verwendet dieselbe Logik wie nach Import; Einstellung „Alle Kursziele überschreiben“ wird beachtet.
     private func startKurszielErmittlungManuell() {
         let forceOverwrite = forceOverwriteAllKursziele
-        let sollAktualisieren: (Aktie) -> Bool = { a in
-            if forceOverwrite { return !a.kurszielManuellGeaendert }
-            guard !a.kurszielManuellGeaendert else { return false }
-            let keinWert = a.kursziel == nil || (a.kursziel ?? 0) == 0
-            return a.kurszielQuelle != "C" || keinWert
+        let list = aktien.filter {
+            $0.sollKurszielAutomatischErmitteln(forceOverwrite: forceOverwrite, erneuerungIntervallTage: kurszielErneuerungIntervallTage)
         }
-        let list = aktien.filter(sollAktualisieren)
         let importDate = importSummaries.first?.datumAktuelleEinlesung
         if list.isEmpty {
-            importMessage = "Keine Positionen zum Aktualisieren (alle manuell gesetzt oder bereits mit Kursziel)."
+            importMessage = "Keine Positionen zum Aktualisieren: manuell geschützt, ETFs/Fonds, oder Kursziel noch innerhalb der Erneuerungsfrist (Einstellungen)."
             showImportMessage = true
         } else {
             Task { await fetchKurszieleForAktien(list, forceOverwrite: forceOverwrite, snapshotImportDatum: importDate) }
@@ -2771,8 +2890,9 @@ struct ContentView: View {
         isImportingKurszieleOpenAI = true
         aktuelleKurszielAktie = nil
         Task {
-            let keinKurszielWert: (Aktie) -> Bool = { $0.kursziel == nil || ($0.kursziel ?? 0) == 0 }
-            let zuAktualisieren = aktien.filter { forceOverwriteAllKursziele || (!$0.kurszielManuellGeaendert && ($0.kurszielQuelle != "C" || keinKurszielWert($0))) }
+            let zuAktualisieren = aktien.filter {
+                $0.sollKurszielAutomatischErmitteln(forceOverwrite: forceOverwriteAllKursziele, erneuerungIntervallTage: kurszielErneuerungIntervallTage)
+            }
             for aktie in zuAktualisieren {
                 await MainActor.run {
                     aktuelleKurszielAktie = (bezeichnung: aktie.bezeichnung, wkn: aktie.wkn)
@@ -2811,13 +2931,8 @@ struct ContentView: View {
         // Bei automatischer Einlesung: keinen Dialog anzeigen, OpenAI-Ersatz nicht übernehmen (nur Werte übernehmen, die realistisch sind)
         KurszielService.onUnrealistischErsatzBestätigen = { _, _, _ in false }
         
-        // Nicht überschreiben: manuell geändert; oder aus CSV (C) mit gültigem Wert. Bei Quelle C mit leer/0 trotzdem ermitteln.
         let sollUeberschreiben: (Aktie) -> Bool = { a in
-            if forceOverwrite { return !a.kurszielManuellGeaendert }
-            if a.kurszielManuellGeaendert { return false }
-            if a.kursziel == nil { return true }
-            if (a.kursziel ?? 0) == 0 { return true }  // CSV-Spalte da, aber Wert 0 → trotzdem ermitteln
-            return a.kurszielQuelle != "C"
+            a.sollKurszielAutomatischErmitteln(forceOverwrite: forceOverwrite, erneuerungIntervallTage: kurszielErneuerungIntervallTage)
         }
         let listToProcess = aktienListe.filter(sollUeberschreiben)
         
@@ -3061,7 +3176,7 @@ struct KurszielListenView: View {
             }
         }
         .scrollDismissesKeyboard(.interactively)
-        .navigationTitle("Kursziele · \(BankStore.selectedBank.name)")
+        .navigationTitle("Aktien-Kursziele")
         .toolbar {
             ToolbarItem(placement: .topBarTrailing) {
                 Button(action: { showDebugLog = true }) {
@@ -4125,6 +4240,10 @@ if let high = aktie.kurszielHigh { LabeledContent("Hochziel") { Text("\(formatBe
             let result = await KurszielService.fetchDividendeFromFMP(for: aktie)
             await MainActor.run {
                 dividendeResult = result
+                aktie.dividendeProAktie = result?.dividendeProAktie
+                aktie.dividendeWaehrung = result?.waehrung
+                aktie.dividendePaymentDate = result?.paymentDate
+                try? modelContext.save()
                 isLoadingDividende = false
             }
         }
@@ -4619,6 +4738,14 @@ struct RechtlichesSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("RechtlichesText") private var rechtlichesText = ""
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
+    /// Bearbeitung nur in DEBUG; Release ignoriert gespeicherten Schalter (kein Zugriff für Käufer).
+    private var entwicklermodusAktiv: Bool {
+        #if DEBUG
+        entwicklermodus
+        #else
+        false
+        #endif
+    }
     @State private var editableText = ""
     @State private var hasLoaded = false
     #if os(iOS)
@@ -4635,9 +4762,9 @@ struct RechtlichesSheetView: View {
     private var rechtlichesLinks: some View {
         VStack(alignment: .leading, spacing: 12) {
             rechtlichesLink(title: "Terms of Use (EULA)", systemImage: "doc.plaintext.fill", url: Self.appleEULAURL)
-            rechtlichesLink(title: "Impressum", systemImage: "doc.text.fill", url: URL(string: "https://kisoft4you.com/impressum")!)
-            rechtlichesLink(title: "Datenschutz", systemImage: "lock.shield.fill", url: URL(string: "https://kisoft4you.com/datenschutzerklaerung")!)
-            rechtlichesLink(title: "AGB", systemImage: "list.clipboard.fill", url: URL(string: "https://kisoft4you.com/agb")!)
+            rechtlichesLink(title: "Impressum", systemImage: "doc.text.fill", url: URL(string: "https://axelbehm.github.io/kisoft4you/impressum.html")!)
+            rechtlichesLink(title: "Datenschutz", systemImage: "lock.shield.fill", url: URL(string: "https://axelbehm.github.io/kisoft4you/datenschutz.html")!)
+            rechtlichesLink(title: "AGB", systemImage: "list.clipboard.fill", url: URL(string: "https://axelbehm.github.io/kisoft4you/agb.html")!)
         }
         .padding(.horizontal)
         .padding(.vertical, 12)
@@ -4664,7 +4791,7 @@ struct RechtlichesSheetView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if entwicklermodus {
+                if entwicklermodusAktiv {
                     VStack(spacing: 0) {
                         rechtlichesLinks
                         TextEditor(text: $editableText)
@@ -4690,7 +4817,7 @@ struct RechtlichesSheetView: View {
                     }
                 }
             }
-            .navigationTitle("Rechtliches · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -4698,7 +4825,7 @@ struct RechtlichesSheetView: View {
                         dismiss()
                     }
                 }
-                if entwicklermodus {
+                if entwicklermodusAktiv {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Speichern") {
                             rechtlichesText = editableText
@@ -4714,7 +4841,7 @@ struct RechtlichesSheetView: View {
         }
         #endif
         .onAppear {
-            if entwicklermodus && !hasLoaded {
+            if entwicklermodusAktiv && !hasLoaded {
                 editableText = rechtlichesText.isEmpty ? defaultRechtlichesText : rechtlichesText
                 hasLoaded = true
             }
@@ -4794,6 +4921,14 @@ struct ProgrammBeschreibungSheetView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("ProgrammBeschreibungText") private var programmBeschreibungText = ""
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
+    /// Bearbeitung nur in DEBUG; Release ignoriert gespeicherten Schalter.
+    private var entwicklermodusAktiv: Bool {
+        #if DEBUG
+        entwicklermodus
+        #else
+        false
+        #endif
+    }
     @State private var editableText = ""
     @State private var hasLoaded = false
     @State private var showBundledDocument = false
@@ -4826,7 +4961,7 @@ struct ProgrammBeschreibungSheetView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if entwicklermodus {
+                if entwicklermodusAktiv {
                     VStack(spacing: 0) {
                         Button {
                             #if os(iOS)
@@ -4919,7 +5054,7 @@ struct ProgrammBeschreibungSheetView: View {
                         dismiss()
                     }
                 }
-                if entwicklermodus {
+                if entwicklermodusAktiv {
                     ToolbarItem(placement: .confirmationAction) {
                         Button("Speichern") {
                             programmBeschreibungText = editableText
@@ -4940,7 +5075,7 @@ struct ProgrammBeschreibungSheetView: View {
         }
         #endif
         .onAppear {
-            if entwicklermodus && !hasLoaded {
+            if entwicklermodusAktiv && !hasLoaded {
                 editableText = programmBeschreibungText.isEmpty ? defaultProgrammBeschreibungText : programmBeschreibungText
                 hasLoaded = true
             }
@@ -5113,15 +5248,20 @@ struct CSVSpaltenZuordnungView: View {
                 Text("Spalte A/B/C = aus dieser CSV-Spalte wird der Wert ins App-Feld gelesen. „Fester Wert“ = keine Spalte, gleicher Wert für jede Zeile (z. B. Bankleistungsnummer = Ihre Kontonummer oder 1). Felder, die Sie nicht zuordnen können – leer lassen („—“). Pflicht: Bankleistungsnummer (Spalte oder Fester Wert), Bezeichnung, Bestand, WKN. ISIN optional.\n\nBeim Speichern wird diese Bank ausgewählt – der Import verwendet dann diese Zuordnung.")
             }
             Section {
-                TextField("z. B. 600252636500|20070000", text: $kontoFilterText)
-                    .font(.subheadline)
-                    .textFieldStyle(.roundedBorder)
-                    .autocapitalization(.none)
-                    .autocorrectionDisabled()
+                VStack(alignment: .leading, spacing: 6) {
+                    TextField("z. B. 600 252636500|20070000", text: $kontoFilterText)
+                        .font(.subheadline)
+                        .textFieldStyle(.roundedBorder)
+                        .autocapitalization(.none)
+                        .autocorrectionDisabled()
+                    Text("Kompletter Spalteninhalt (exakt wie in der CSV, z. B. mit Leerzeichen 600 252636500).")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
             } header: {
                 Text("Konto-Filter (Pflicht)")
             } footer: {
-                Text("Mehrere Kontonummern/Bankleistungsnummern mit | oder Komma trennen. Ohne Eintrag wird das Einlesen abgebrochen. Enthält die Datei keine dieser Nummern (in der BL-Spalte bzw. irgendwo im Text bei „Fester Wert“), wird mit „Falsche Bank“ abgebrochen.")
+                Text("Jede Angabe wie der komplette Spalteninhalt in der CSV (z. B. 600 252636500 inkl. Leerzeichen – nicht 600252636500). Mehrere Kontonummern/Bankleistungsnummern mit | oder Komma trennen. Ohne Eintrag wird das Einlesen abgebrochen. Enthält die Datei keine dieser Nummern (in der BL-Spalte bzw. irgendwo im Text bei „Fester Wert“), wird mit „Falsche Bank“ abgebrochen.")
             }
             Section {
                 Picker("Feldtrenner", selection: $fieldSeparator) {
@@ -5309,7 +5449,7 @@ struct WatchlistView: View {
                     Text("Einträge erscheinen in der Aktien-Liste unter Bankleistungsnummer 999999 mit Kennzeichnung „Watchlist“ und werden bei der normalen CSV-Einlesung aktualisiert.")
                 }
             }
-            .navigationTitle("Watchlist · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -5469,7 +5609,7 @@ struct DebugLogSheet: View {
                     }
                 }
             }
-            .navigationTitle("Debug-Log · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .cancellationAction) {
@@ -5810,7 +5950,16 @@ struct SettingsView: View {
         )
     }
     @AppStorage("ForceOverwriteAllKursziele") private var forceOverwriteAllKursziele = false
+    @AppStorage("KurszielErneuerungIntervallTage") private var kurszielErneuerungIntervallTage: Int = 30
     @AppStorage("Entwicklermodus") private var entwicklermodus = false
+    /// Nur DEBUG: Schalter und Trial-Simulation; Release: immer aus (kein UI).
+    private var entwicklermodusAktiv: Bool {
+        #if DEBUG
+        entwicklermodus
+        #else
+        false
+        #endif
+    }
     @AppStorage("DebugEinlesungNurEinSatz") private var debugEinlesungNurEinSatz = false
     @AppStorage("Aktien.SubscriptionManager.simulateTrialExpired") private var simulateTrialExpired = false
     @State private var subscriptionManager = SubscriptionManager.shared
@@ -5875,14 +6024,18 @@ struct SettingsView: View {
                         }
                     }
                     .disabled(subscriptionManager.isPurchasing)
-                    if entwicklermodus {
+                    if entwicklermodusAktiv {
                         Toggle("Trial abgelaufen simulieren", isOn: $simulateTrialExpired)
                             .foregroundStyle(.orange)
                     }
                 } header: {
                     Text("Abo")
                 } footer: {
+                    #if DEBUG
                     Text("Status der kostenlosen Woche bzw. des Abos. „Trial abgelaufen simulieren“ (nur bei Entwicklermodus): zeigt die Paywall beim nächsten Start, ohne 7 Tage zu warten – zum Testen. Abo-Kauf testen: In App Store Connect einen Sandbox-Tester anlegen; auf dem Gerät unter Einstellungen → App Store → Sandbox-Konto abmelden/anmelden. Dann in der App „Kostenlos testen & abonnieren“ – die Abbuchung erfolgt nicht wirklich.")
+                    #else
+                    Text("Status der kostenlosen Woche bzw. des Abos. Abo-Kauf testen: In App Store Connect einen Sandbox-Tester anlegen; auf dem Gerät unter Einstellungen → App Store → Sandbox-Konto abmelden/anmelden. Dann in der App „Kostenlos testen & abonnieren“ – die Abbuchung erfolgt nicht wirklich.")
+                    #endif
                 }
 
                 Section {
@@ -5911,7 +6064,22 @@ struct SettingsView: View {
                 } header: {
                     Text("Kursziel-Überschreiben")
                 } footer: {
-                    Text("Wenn an: Beim nächsten Abruf (z. B. nach CSV-Import oder „Kursziele OpenAI“) werden alle Kursziele neu ermittelt und überschrieben – auch aus CSV oder manuell gesetzte. Wenn aus: Kursziele aus CSV und manuell geänderte werden nicht überschrieben.")
+                    Text("Wenn an: Beim nächsten Abruf werden importierte und ermittelte Kursziele neu geholt (Positionen mit manuell geändertem Kursziel bleiben ausgenommen). Wenn aus: Es gilt die Erneuerungsfrist – kein erneuter API-Abruf, solange das Kursziel-Datum noch innerhalb der Frist liegt (siehe unten).")
+                }
+                
+                Section {
+                    Stepper(value: $kurszielErneuerungIntervallTage, in: 7...365, step: 1) {
+                        HStack {
+                            Text("Erneuerungsfrist")
+                            Spacer()
+                            Text("\(kurszielErneuerungIntervallTage) Tage")
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                } header: {
+                    Text("Kursziel-Abruf (Kosten)")
+                } footer: {
+                    Text("Gilt für den automatischen Durchlauf nach CSV-Import und für „Kursziele ermitteln“: Ohne Kursziel werden nur echte Aktien abgefragt (keine ETFs/Fonds). Mit Kursziel erfolgt keine Neuermittlung, bis das Kursziel-Datum mindestens so viele Tage zurückliegt – spart API-Zugriffe.")
                 }
                 
                 Section {
@@ -5944,16 +6112,16 @@ struct SettingsView: View {
                     Text("Kursziel = Gewinn pro Aktie (EPS) × dieses KGV. Wird genutzt, wenn FMP Key-Metrics verfügbar sind und weder FMP-Analysten noch OpenAI ein Kursziel liefern. Typisch 10–25; Standard 15.")
                 }
                 
+                #if DEBUG
                 Section {
                     Toggle("Entwicklermodus", isOn: $entwicklermodus)
-                    #if DEBUG
                     Toggle("Debug: Nur 1 Zeile einlesen", isOn: $debugEinlesungNurEinSatz)
-                    #endif
                 } header: {
                     Text("Entwickler")
                 } footer: {
-                    Text("Wenn an: Der Text unter „Rechtliches“ kann in der App bearbeitet und gespeichert werden. „Debug: Nur 1 Zeile“: Beim nächsten CSV-Import wird nur die erste Zeile verarbeitet; Einlesewerte und Satz Deutsche Bank erscheinen in der Xcode-Konsole.")
+                    Text("Wenn an: Der Text unter „Rechtliches“ und „Programm-Beschreibung“ kann in der App bearbeitet und gespeichert werden. „Debug: Nur 1 Zeile“: Beim nächsten CSV-Import wird nur die erste Zeile verarbeitet; Einlesewerte und Satz Deutsche Bank erscheinen in der Xcode-Konsole.")
                 }
+                #endif
                 
                 Section {
                     SecureField("Kursziel-API-URL (z. B. FMP)", text: $fmpAPIKey)
@@ -6021,7 +6189,7 @@ struct SettingsView: View {
                 let v = KurszielService.kgvTargetKGV
                 if v > 0 { kgvTargetLocal = v }
             }
-            .navigationTitle("Einstellungen · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Fertig") { dismiss() }

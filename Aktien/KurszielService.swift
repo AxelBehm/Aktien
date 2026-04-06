@@ -1037,7 +1037,8 @@ class KurszielService {
     /// Wechselkurse: direkter Zugriff (fetchAppWechselkurse), keine alte Zwischenspeicherung.
     static func fetchKurszieleBulkFMP(aktien: [Aktie], forceOverwrite: Bool = false) async -> [String: KurszielInfo] {
         if isDemoMode {
-            let toFetch = aktien.filter { forceOverwrite ? !$0.kurszielManuellGeaendert : (!$0.kurszielManuellGeaendert && $0.kursziel == nil) }
+            // Liste ist vom Aufrufer bereits gefiltert (fehlendes/veraltetes Kursziel, keine ETFs/Fonds).
+            let toFetch = aktien.filter { !$0.kurszielManuellGeaendert }
             var result: [String: KurszielInfo] = [:]
             for a in toFetch {
                 let wkn = a.wkn.trimmingCharacters(in: .whitespaces)
@@ -1052,8 +1053,9 @@ class KurszielService {
             debug("   ❌ FMP: FMP-Feld leer (API-Key oder komplette URL eintragen)")
             return [:]
         }
-        let toFetch = aktien.filter { forceOverwrite ? !$0.kurszielManuellGeaendert : (!$0.kurszielManuellGeaendert && $0.kursziel == nil) }
-        debug("   📋 FMP: \(toFetch.count) Aktien ohne Kursziel (von \(aktien.count) gesamt)")
+        // Liste ist vom Aufrufer bereits gefiltert (fehlendes/veraltetes Kursziel, keine ETFs/Fonds).
+        let toFetch = aktien.filter { !$0.kurszielManuellGeaendert }
+        debug("   📋 FMP: \(toFetch.count) Aktien für Bulk (von \(aktien.count) übergeben)")
         var symbolToWKNs: [String: [String]] = [:]
         var symbols: [String] = []
         var isinToSymbolCache: [String: String] = [:]

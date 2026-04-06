@@ -29,7 +29,6 @@ struct BankStartView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: [SortDescriptor<Aktie>(\.bankleistungsnummer), SortDescriptor<Aktie>(\.bezeichnung)]) private var aktien: [Aktie]
     @Query(sort: \ImportSummary.importDatum, order: .reverse) private var importSummaries: [ImportSummary]
-    @AppStorage("Entwicklermodus") private var entwicklermodus = false
     @AppStorage(KurszielService.openAIAPIKeyKey) private var openAIAPIKeyStore: String = ""
     @AppStorage(KurszielService.fmpAPIKeyKey) private var fmpAPIKeyStore: String = ""
     
@@ -211,7 +210,7 @@ struct BankStartView: View {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             .background(.regularMaterial)
-            .navigationTitle("Aktien · \(BankStore.selectedBank.name)")
+            .navigationTitle("Aktien-Kursziele")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {

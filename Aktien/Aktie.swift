@@ -64,6 +64,12 @@ final class Aktie {
     var kommentar: String = ""
     /// Datum der letzten Bearbeitung des Kommentars (z. B. per „Datum setzen“); wird bei Einlesung übernommen
     var kommentarLetzteBearbeitung: Date?
+    /// Erwartete Dividende pro Aktie (aus FMP), falls ermittelt
+    var dividendeProAktie: Double?
+    /// Währung der erwarteten Dividende (z. B. EUR/USD)
+    var dividendeWaehrung: String?
+    /// Zahlungsdatum der erwarteten Dividende
+    var dividendePaymentDate: Date?
     
     init(
         bankleistungsnummer: String,
@@ -102,6 +108,9 @@ final class Aktie {
         isWatchlist: Bool = false,
         kommentar: String = "",
         kommentarLetzteBearbeitung: Date? = nil,
+        dividendeProAktie: Double? = nil,
+        dividendeWaehrung: String? = nil,
+        dividendePaymentDate: Date? = nil,
         startKurs: Double? = nil,
         startKursDatum: Date? = nil
     ) {
@@ -142,6 +151,9 @@ final class Aktie {
         self.isWatchlist = isWatchlist
         self.kommentar = kommentar
         self.kommentarLetzteBearbeitung = kommentarLetzteBearbeitung
+        self.dividendeProAktie = dividendeProAktie
+        self.dividendeWaehrung = dividendeWaehrung
+        self.dividendePaymentDate = dividendePaymentDate
         self.startKurs = startKurs
         self.startKursDatum = startKursDatum
     }

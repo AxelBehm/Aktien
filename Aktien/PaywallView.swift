@@ -17,6 +17,7 @@ import AppKit
 struct PaywallView: View {
     @State private var subscriptionManager = SubscriptionManager.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
+    @State private var showSubscriptionStore = false
     #if os(iOS)
     @State private var safariURL: URL?
     #endif
@@ -24,6 +25,7 @@ struct PaywallView: View {
     var body: some View {
         NavigationStack {
             paywallContent
+                .navigationTitle("Aktien-Kursziele")
                 .navigationBarTitleDisplayMode(.inline)
                 .toolbar {
                     ToolbarItem(placement: .cancellationAction) {
@@ -44,6 +46,11 @@ struct PaywallView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(spacing: 20) {
+                    // Guideline 3.1.2(c): Apple verlangt exakt "Title of publication or service" in der App.
+                    Text("Title of publication or service: Aktien Premium")
+                        .font(.headline)
+                        .foregroundStyle(.primary)
+                        .multilineTextAlignment(.center)
                     Text("Aktien Premium")
                         .font(.largeTitle)
                         .fontWeight(.bold)
@@ -66,7 +73,7 @@ struct PaywallView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
 
-                    // App Store: Auto-renewable subscription – Titel, Laufzeit, Preis, Links zu Datenschutz & EULA (alle in der App)
+                    // Laufzeit, Preis, Links siehe unten und in SubscriptionStoreView.
                     VStack(spacing: 6) {
                         if let product = subscriptionManager.monthlyProduct {
                             Text(product.displayName)
@@ -91,15 +98,6 @@ struct PaywallView: View {
                         }
                     }
                     .padding(.vertical, 4)
-
-                    Text("Wenn zu viele Kursziele nicht ermittelt werden konnten, sollten Sie überlegen, sich API-Keys von OpenAI oder FMP zu besorgen und diese in den Einstellungen einzutragen. Unter Einstellungen können Sie die Verbindung testen; danach „Kursziele ermitteln“ ausführen.")
-                        .font(.caption)
-                        .foregroundStyle(Color(red: 0.72, green: 0.55, blue: 0))
-                        .multilineTextAlignment(.center)
-                        .padding(.horizontal, 20)
-                        .padding(.vertical, 10)
-                        .background(Color.yellow.opacity(0.25))
-                        .cornerRadius(8)
 
                     legalText
                         .font(.caption2)
@@ -141,15 +139,20 @@ struct PaywallView: View {
                     }
                 }
                 Button {
-                    Task { await subscriptionManager.purchase() }
+                    if subscriptionManager.monthlyProduct != nil {
+                        showSubscriptionStore = true
+                    } else {
+                        // Kein Produkt (z. B. Trial ohne Store, Simulator) → Zugriff gewähren und Trial bestätigen, damit Nutzer reinkommt.
+                        Task {
+                            await subscriptionManager.purchase()
+                            if subscriptionManager.isInFreeTrialPeriod {
+                                NotificationCenter.default.post(name: .paywallTrialAcknowledged, object: nil)
+                            }
+                        }
+                    }
                 } label: {
                     HStack {
-                        if subscriptionManager.isPurchasing {
-                            ProgressView()
-                                .tint(.white)
-                        } else {
-                            Text(subscriptionManager.isInFreeTrialPeriod ? "Kostenlos testen" : "Jetzt abonnieren")
-                        }
+                        Text(subscriptionManager.isInFreeTrialPeriod ? "Kostenlos testen" : "Jetzt abonnieren")
                     }
                     .frame(maxWidth: .infinity)
                     .padding()
@@ -157,7 +160,7 @@ struct PaywallView: View {
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
-                .disabled(subscriptionManager.isPurchasing || subscriptionManager.isLoadingProducts)
+                .disabled(subscriptionManager.isLoadingProducts)
                 Button {
                     Task { await subscriptionManager.restore() }
                 } label: {
@@ -182,11 +185,33 @@ struct PaywallView: View {
         .task {
             await subscriptionManager.loadProducts()
         }
+        .sheet(isPresented: $showSubscriptionStore) {
+            subscriptionStoreSheet
+        }
+        .onChange(of: showSubscriptionStore) { _, isVisible in
+            if !isVisible {
+                Task { await subscriptionManager.refresh() }
+            }
+        }
         #if os(iOS)
         .sheet(item: $safariURL) { url in
             SafariView(url: url)
         }
         #endif
+    }
+
+    /// System-Kauf-UI (Guideline 3.1.2(c), 2.1(b)). Nutzt vorab geladenes Produkt, falls vorhanden – vermeidet „nicht in Ladenfront verfügbar“ bei getrennter Ladung im Sheet.
+    @ViewBuilder
+    private var subscriptionStoreSheet: some View {
+        if let product = subscriptionManager.monthlyProduct {
+            SubscriptionStoreView(subscriptions: [product])
+                .subscriptionStorePolicyDestination(url: Self.datenschutzURL, for: .privacyPolicy)
+                .subscriptionStorePolicyDestination(url: Self.nutzungsbedingungenURL, for: .termsOfService)
+        } else {
+            SubscriptionStoreView(productIDs: [SubscriptionManager.premiumMonthlyProductID])
+                .subscriptionStorePolicyDestination(url: Self.datenschutzURL, for: .privacyPolicy)
+                .subscriptionStorePolicyDestination(url: Self.nutzungsbedingungenURL, for: .termsOfService)
+        }
     }
 
     private var legalText: some View {
@@ -197,7 +222,7 @@ struct PaywallView: View {
     }
 
     /// Richtlinie 3.1.2(c): Funktionale Links zu Datenschutzerklärung und EULA im Kaufprozess
-    private static let datenschutzURL = URL(string: "https://kisoft4you.com/datenschutzerklaerung")!
+    private static let datenschutzURL = URL(string: "https://axelbehm.github.io/kisoft4you/datenschutz.html")!
     /// Standard-EULA von Apple (App Store Terms of Use)
     private static let nutzungsbedingungenURL = URL(string: "https://www.apple.com/legal/internet-services/itunes/dev/stdeula/")!
 

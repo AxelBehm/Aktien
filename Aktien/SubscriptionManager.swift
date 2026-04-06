@@ -8,16 +8,15 @@
 import Foundation
 import StoreKit
 
-/// Product-ID des Monats-Abos – muss in App Store Connect exakt so angelegt sein (inkl. 1-Woche-Trial).
-private let premiumMonthlyProductID = "premium_monthly"
-
 private let firstLaunchDateKey = "Aktien.SubscriptionManager.firstLaunchDate"
-/// Nur sichtbar/wirksam bei Entwicklermodus (Einstellungen). Simuliert „Trial abgelaufen“ für Paywall-Tests.
+/// Nur DEBUG-Builds: wirksam bei Entwicklermodus (Einstellungen). Simuliert „Trial abgelaufen“ für Paywall-Tests.
 private let simulateTrialExpiredKey = "Aktien.SubscriptionManager.simulateTrialExpired"
 private let entwicklermodusKey = "Entwicklermodus"
 
 @Observable
 final class SubscriptionManager {
+    /// Product-ID des Monats-Abos – muss in App Store Connect exakt so angelegt sein. Für SubscriptionStoreView(productIDs:).
+    static let premiumMonthlyProductID = "premium_monthly"
     static let shared = SubscriptionManager()
 
     /// Laden der Produkte läuft
@@ -64,14 +63,20 @@ final class SubscriptionManager {
         return hasActiveSubscription
     }
 
-    /// Im Entwicklermodus: Schalter „Trial abgelaufen simulieren“ (nur für Tests)
+    /// Im Entwicklermodus: Schalter „Trial abgelaufen simulieren“ (nur für Tests, nur DEBUG-Builds)
     var simulateTrialExpired: Bool {
         get {
+            #if !DEBUG
+            return false
+            #else
             guard UserDefaults.standard.bool(forKey: entwicklermodusKey) else { return false }
             return UserDefaults.standard.bool(forKey: simulateTrialExpiredKey)
+            #endif
         }
         set {
+            #if DEBUG
             UserDefaults.standard.set(newValue, forKey: simulateTrialExpiredKey)
+            #endif
         }
     }
 
@@ -109,7 +114,7 @@ final class SubscriptionManager {
         defer { isLoadingProducts = false }
 
         do {
-            let products = try await Product.products(for: [premiumMonthlyProductID])
+            let products = try await Product.products(for: [Self.premiumMonthlyProductID])
             await MainActor.run {
                 monthlyProduct = products.first
                 productsLoadAttempted = true
@@ -183,12 +188,12 @@ final class SubscriptionManager {
         }
     }
 
-    /// Abo-Status aus StoreKit lesen
+    /// Abo-Status aus StoreKit lesen (öffentlich für Paywall: nach Schließen der SubscriptionStoreView-Sheet).
     func refreshSubscriptionStatus() async {
         var hasSubscription = false
         for await result in Transaction.currentEntitlements {
             if case .verified(let transaction) = result {
-                if transaction.productID == premiumMonthlyProductID {
+                if transaction.productID == Self.premiumMonthlyProductID {
                     hasSubscription = true
                     break
                 }
@@ -197,6 +202,11 @@ final class SubscriptionManager {
         await MainActor.run {
             hasActiveSubscription = hasSubscription
         }
+    }
+
+    /// Öffentlicher Refresh nach Schließen der Kauf-UI (z. B. SubscriptionStoreView-Sheet).
+    func refresh() async {
+        await refreshSubscriptionStatus()
     }
 
     private func listenForTransactions() -> Task<Void, Never> {

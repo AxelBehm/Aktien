@@ -195,7 +195,7 @@ enum BankStore {
         UserDefaults.standard.set(data, forKey: key)
     }
 
-    /// Konto-Filter pro Bank: Erlaubte Kontonummern/Bankleistungsnummern (z. B. "600252636500|20070000"). Beim Import muss mind. eine vorkommen, sonst "Falsche Bank".
+    /// Konto-Filter pro Bank: Erlaubte Kontonummern/Bankleistungsnummern wie kompletter Spalteninhalt in der CSV (z. B. "600 252636500|20070000"). Beim Import muss mind. eine vorkommen, sonst "Falsche Bank".
     private static func kontoFilterKey(for bankId: UUID) -> String {
         "KontoFilter_\(bankId.uuidString)"
     }

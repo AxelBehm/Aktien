@@ -51,7 +51,7 @@ struct LoginView: View {
                     Text("Normale Nutzer können so direkt in die App. Die Anmeldung dient nur dem Demokonto für die App-Prüfung.")
                 }
             }
-            .navigationTitle("Anmeldung")
+            .navigationTitle("Aktien-Kursziele")
         }
     }
 
