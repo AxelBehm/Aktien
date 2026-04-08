@@ -1133,7 +1133,7 @@ struct ContentView: View {
     
     /// CSV-String aus Rohzeilen bauen (läuft komplett im Hintergrund)
     private static func buildCSVFromExportRows(_ rows: [ExportRow]) -> String {
-        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Hinweis_Einstandskurs;Einstandskurs;Deviseneinstandskurs;Kurs;Kursziel;Abstand_Kursziel;Stop-Kurs_Orderbuch;Devisenkurs;Gewinn_Verlust_EUR;Gewinn_Verlust_Prozent;Marktwert_EUR;Stueckzinsen_EUR;Anteil_Prozent;Datum_letzte_Bewegung;Gattung;Branche;Risikoklasse;Depot_Portfolio_Name;Import_Datum;Kursziel_Datum;Kursziel_Quelle;Kursziel_Waehrung;Kursziel_High;Kursziel_Low;Kursziel_Analysten;Kursziel_Manuell_Geaendert;Start_Kurs;Start_Kurs_Datum;Previous_Marktwert_EUR;Previous_Bestand;Previous_Kurs;IsWatchlist;Kommentar;Kommentar_Letzte_Bearbeitung;Dividende_Pro_Aktie;Dividende_Waehrung;Dividende_Zahltag"
+        let header = "Bankleistungsnummer;Bezeichnung;WKN;ISIN;Bestand;Waehrung;Hinweis_Einstandskurs;Einstandskurs;Deviseneinstandskurs;Kurs;Kursziel;Abstand_Kursziel;Stop-Kurs_Orderbuch;Devisenkurs;Gewinn_Verlust_EUR;Gewinn_Verlust_Prozent;Marktwert_EUR;Stueckzinsen_EUR;Anteil_Prozent;Datum_letzte_Bewegung;Gattung;Branche;Risikoklasse;Depot_Portfolio_Name;Import_Datum;Kursziel_Datum;Kursziel_Quelle;Kursziel_Waehrung;Kursziel_High;Kursziel_Low;Kursziel_Analysten;Kursziel_Manuell_Geaendert;Start_Kurs;Start_Kurs_Datum;Previous_Marktwert_EUR;Previous_Bestand;Previous_Kurs;IsWatchlist;Kommentar;Kommentar_Letzte_Bearbeitung;Dividende_Pro_Aktie;Dividende_Waehrung;Dividende_Zahltag;Marktwert_Veraenderung_Prozent"
         let formatter = NumberFormatter()
         formatter.locale = Locale(identifier: "de_DE")
         formatter.numberStyle = .decimal
@@ -1195,7 +1195,13 @@ struct ContentView: View {
             let dividendeProAktie = a.dividendeProAktie.map { formatter.string(from: NSNumber(value: $0)) ?? "" } ?? ""
             let dividendeWaehrung = Self.csvEscape(a.dividendeWaehrung)
             let dividendeZahltag = a.dividendePaymentDate.map { dateFormatter.string(from: $0) } ?? ""
-            lines.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(hinweisEinstandskurs);\(einstand);\(devisenEinstand);\(kurs);\(kursziel);\(kzAbstand);\(stopKursOrderbuch);\(devisenkurs);\(gewinnVerlustEUR);\(gewinnVerlustProzent);\(marktwert);\(stueckzinsenEUR);\(anteilProzent);\(datumLetzteBewegung);\(gattung);\(branche);\(risikoklasse);\(depotPortfolioName);\(importDatum);\(kzDatum);\(kzQuelle);\(kzW);\(kzHigh);\(kzLow);\(kzAnalysten);\(kzManuell);\(startKurs);\(startKursDatum);\(previousMarktwertEUR);\(previousBestand);\(previousKurs);\(isWatchlist);\(kommentar);\(kommentarLetzteBearbeitung);\(dividendeProAktie);\(dividendeWaehrung);\(dividendeZahltag)")
+            // Wie Listenansicht „Veränd.“: Änderung Marktwert EUR gegenüber Voreinlesung (previousMarktwertEUR)
+            let marktwertVeraenderungProzent: String = {
+                guard let prev = a.previousMarktwertEUR, let curr = a.marktwertEUR, prev > 0 else { return "" }
+                let pct = ((curr - prev) / prev) * 100
+                return formatter.string(from: NSNumber(value: pct)) ?? ""
+            }()
+            lines.append("\(bl);\(bez);\(wkn);\(isin);\(bestand);\(waehrung);\(hinweisEinstandskurs);\(einstand);\(devisenEinstand);\(kurs);\(kursziel);\(kzAbstand);\(stopKursOrderbuch);\(devisenkurs);\(gewinnVerlustEUR);\(gewinnVerlustProzent);\(marktwert);\(stueckzinsenEUR);\(anteilProzent);\(datumLetzteBewegung);\(gattung);\(branche);\(risikoklasse);\(depotPortfolioName);\(importDatum);\(kzDatum);\(kzQuelle);\(kzW);\(kzHigh);\(kzLow);\(kzAnalysten);\(kzManuell);\(startKurs);\(startKursDatum);\(previousMarktwertEUR);\(previousBestand);\(previousKurs);\(isWatchlist);\(kommentar);\(kommentarLetzteBearbeitung);\(dividendeProAktie);\(dividendeWaehrung);\(dividendeZahltag);\(marktwertVeraenderungProzent)")
         }
         return lines.joined(separator: "\n")
     }

@@ -17,7 +17,6 @@ import AppKit
 struct PaywallView: View {
     @State private var subscriptionManager = SubscriptionManager.shared
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
-    @State private var showSubscriptionStore = false
     #if os(iOS)
     @State private var safariURL: URL?
     #endif
@@ -73,7 +72,7 @@ struct PaywallView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
 
-                    // Laufzeit, Preis, Links siehe unten und in SubscriptionStoreView.
+                    // Laufzeit, Preis und Rechtstexte transparent auf der Paywall.
                     VStack(spacing: 6) {
                         if let product = subscriptionManager.monthlyProduct {
                             Text(product.displayName)
@@ -139,17 +138,8 @@ struct PaywallView: View {
                     }
                 }
                 Button {
-                    if subscriptionManager.monthlyProduct != nil {
-                        showSubscriptionStore = true
-                    } else {
-                        // Kein Produkt (z. B. Trial ohne Store, Simulator) → Zugriff gewähren und Trial bestätigen, damit Nutzer reinkommt.
-                        Task {
-                            await subscriptionManager.purchase()
-                            if subscriptionManager.isInFreeTrialPeriod {
-                                NotificationCenter.default.post(name: .paywallTrialAcknowledged, object: nil)
-                            }
-                        }
-                    }
+                    // Direkt den StoreKit-Kaufdialog starten (stabiler im Review als zusätzlicher Zwischen-Sheet-Schritt).
+                    Task { await subscriptionManager.purchase() }
                 } label: {
                     HStack {
                         Text(subscriptionManager.isInFreeTrialPeriod ? "Kostenlos testen" : "Jetzt abonnieren")
@@ -160,7 +150,7 @@ struct PaywallView: View {
                     .foregroundStyle(.white)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
                 }
-                .disabled(subscriptionManager.isLoadingProducts)
+                .disabled(subscriptionManager.isPurchasing)
                 Button {
                     Task { await subscriptionManager.restore() }
                 } label: {
@@ -185,33 +175,11 @@ struct PaywallView: View {
         .task {
             await subscriptionManager.loadProducts()
         }
-        .sheet(isPresented: $showSubscriptionStore) {
-            subscriptionStoreSheet
-        }
-        .onChange(of: showSubscriptionStore) { _, isVisible in
-            if !isVisible {
-                Task { await subscriptionManager.refresh() }
-            }
-        }
         #if os(iOS)
         .sheet(item: $safariURL) { url in
             SafariView(url: url)
         }
         #endif
-    }
-
-    /// System-Kauf-UI (Guideline 3.1.2(c), 2.1(b)). Nutzt vorab geladenes Produkt, falls vorhanden – vermeidet „nicht in Ladenfront verfügbar“ bei getrennter Ladung im Sheet.
-    @ViewBuilder
-    private var subscriptionStoreSheet: some View {
-        if let product = subscriptionManager.monthlyProduct {
-            SubscriptionStoreView(subscriptions: [product])
-                .subscriptionStorePolicyDestination(url: Self.datenschutzURL, for: .privacyPolicy)
-                .subscriptionStorePolicyDestination(url: Self.nutzungsbedingungenURL, for: .termsOfService)
-        } else {
-            SubscriptionStoreView(productIDs: [SubscriptionManager.premiumMonthlyProductID])
-                .subscriptionStorePolicyDestination(url: Self.datenschutzURL, for: .privacyPolicy)
-                .subscriptionStorePolicyDestination(url: Self.nutzungsbedingungenURL, for: .termsOfService)
-        }
     }
 
     private var legalText: some View {
